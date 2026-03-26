@@ -15,7 +15,7 @@ import random
 BASE_CASH_FLOOR = 40.0
 RATCHET_PERCENT = 0.80
 RISK_MULTIPLIER = 0.08
-DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
+DRY_RUN = os.getenv('DRY_RUN', 'true').lower() == 'true'  # PAPER ONLY default
 
 COINS = {
     "BTC":  "KXBTC15M",
