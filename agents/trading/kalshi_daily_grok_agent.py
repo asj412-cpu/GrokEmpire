@@ -13,8 +13,8 @@ from cryptography.hazmat.primitives import serialization
 
 BASE_CASH_FLOOR = 40.0
 RATCHET_PERCENT = 0.80
-DAILY_RISK_PCT = float(os.getenv('DAILY_RISK_PCT', '0.25'))
-DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
+DAILY_RISK_PCT = 0.25
+DRY_RUN = True
 
 class KalshiDailyGrokAgent:
     def __init__(self):
@@ -200,9 +200,7 @@ Return JSON array: [{'ticker': 'TICKER', 'side': 'yes/no', 'contracts': 10, 'con
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ticker, "", side, contracts, price, status,
                     available, risk_per_trade, rationale, ""
                 ])
-            print(f"Placed {side} {contracts} @ {price}c on {ticker}: {status}")
-
-    async def monitor_positions(self):
+            print(f"Paper {side.upper()} {contracts} @ {price}c {ticker}
         while self.running:
             try:
                 if self.client and self.positions:
@@ -237,10 +235,11 @@ Return JSON array: [{'ticker': 'TICKER', 'side': 'yes/no', 'contracts': 10, 'con
         asyncio.create_task(self.monitor_positions())
 
         while self.running:
-            print("🚀 [DAILY GROK] Cycle start...")
+            print(f"[DAILY GROK START] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             markets = await self.aggregate_markets()
             selections = await self.grok_select_trades(markets)
-            print(f"[DAILY GROK] Grok selected {len(selections)} trades: {selections}")
+            print(f"[DAILY GROK] Grok selected {len(selections)} trades")
+            print(f"Grok recommendations:\n{json.dumps(selections, indent=2)}")
             await self.place_trades(selections)
             print("[DAILY GROK] Cycle end, sleep 4h")
             await asyncio.sleep(14400)
