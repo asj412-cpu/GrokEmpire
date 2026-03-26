@@ -9,6 +9,7 @@ from collections import deque
 import time
 import random
 from tools.data_sources import *
+from cryptography.hazmat.primitives import serialization
 
 BASE_CASH_FLOOR = 40.0
 RATCHET_PERCENT = 0.80
@@ -18,10 +19,12 @@ DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 class KalshiDailyGrokAgent:
     def __init__(self):
         key_id = os.getenv("KALSHI_KEY_ID")
-        private_key = os.getenv("KALSHI_PRIVATE_KEY")
+        private_key_path = os.getenv("KALSHI_PRIVATE_KEY")
         self.client = None
-        if key_id and private_key:
+        if key_id and private_key_path:
             try:
+                with open(private_key_path, 'rb') as f:
+                    private_key = serialization.load_pem_private_key(f.read(), password=None)
                 self.client = KalshiClient(key_id=key_id, private_key=private_key)
             except Exception as e:
                 print(f"Kalshi client init failed ({e}) — dry run mode")
