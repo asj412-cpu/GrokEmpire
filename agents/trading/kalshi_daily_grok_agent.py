@@ -151,7 +151,7 @@ Return JSON array: [{'ticker': 'TICKER', 'side': 'yes/no', 'contracts': 10, 'con
 """
         try:
             response = self.grok.chat.completions.create(
-                model="grok-beta",
+                model="grok-1",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=2000
             )
