@@ -39,9 +39,7 @@ class KalshiDailyGrokAgent:
             print("Live Kalshi client ready")
 
         self.grok = OpenAI(
-            api_key=os.getenv('GROK_API_KEY'),
-            base_url="https://api.x.ai/v1"
-        )
+            api_key=os.getenv('GROK_API_KEY') or os.getenv('
         self.running = True
         self.log_file = "daily_trades.csv"
         self.current_cash_floor = BASE_CASH_FLOOR
