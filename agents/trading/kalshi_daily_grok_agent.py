@@ -147,7 +147,7 @@ You are a Kalshi trading expert. Given these markets settling within 48 hours:
 
 Available cash: $49, risk 25% daily ($12.25 total).
 Select top 5 trades: BUY_YES or BUY_NO, contracts (1-100), confidence >60%, rationale.
-Return JSON array: [{"ticker": "TICKER", "side": "yes/no", "contracts": 10, "confidence": 70, "rationale": "why"}]
+Return JSON array: [{'ticker': 'TICKER', 'side': 'yes/no', 'contracts': 10, 'confidence': 70, 'rationale': 'why'}]
 """
         try:
             response = self.grok.chat.completions.create(
