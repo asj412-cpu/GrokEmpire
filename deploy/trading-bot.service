@@ -1,0 +1,15 @@
+[Unit]
+Description=GrokEmpire Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=trader
+WorkingDirectory=/home/trader/grok-empire
+Environment=PATH=/home/trader/grok-empire/.venv/bin
+ExecStart=/home/trader/grok-empire/.venv/bin/python agents/trading/crypto_15m_agent.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

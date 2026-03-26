@@ -1,0 +1,4 @@
+timestamp,coin,ticker,strike,mid,coin_price,decision,contracts,price,client_order_id,status,current_floor,dry_run,signal_id,outcome
+09:00:00,BTC,TICK1,20000,0.30,20000,BUY YES,2,30,ord1,SUCCESS,40.0,False,sig1,YES
+09:15:00,BTC,TICK2,20050,0.62,20050,BUY YES,1,62,ord2,SUCCESS,40.0,False,sig2,NO
+09:30:00,BTC,TICK3,20100,0.10,20100,BUY NO,3,40,ord3,SUCCESS,40.0,False,sig3,NO

@@ -1,0 +1,15 @@
+[Unit]
+Description=GrokEmpire Kalshi Daily Agent
+After=network.target
+
+[Service]
+Type=simple
+User=trader
+WorkingDirectory=/home/trader/grok-empire
+Environment=PATH=/home/trader/grok-empire/.venv/bin
+ExecStart=/home/trader/grok-empire/.venv/bin/python agents/trading/kalshi_daily_grok_agent.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+kalshi_client
+websockets
+cryptography
+ccxt
+pandas
+numpy
+ta-lib
+openai
+requests
+fredapi
+httpx
+python-dateutil
