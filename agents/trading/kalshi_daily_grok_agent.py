@@ -25,7 +25,8 @@ class KalshiDailyGrokAgent:
             try:
                 with open(private_key_path, 'rb') as f:
                     private_key = serialization.load_pem_private_key(f.read(), password=None)
-                self.client = KalshiClient(key_id=key_id, private_key=private_key)
+                self.client = KalshiClient(key_id=key_id, private_key=private_key, exchange_api_base='https://108.139.47.10/trade-api/v2')
+                self.client.session.headers['Host'] = 'api.elections.kalshi.com'
             except Exception as e:
                 print(f"Kalshi client init failed ({e}) — dry run mode")
                 self.client = None
@@ -154,10 +155,8 @@ Return JSON array: [{'ticker': 'TICKER', 'side': 'yes/no', 'contracts': 10, 'con
 """
         try:
             response = self.grok.chat.completions.create(
-                model="grok-1",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=2000
-            )
+                model="grok-beta",
+                messages=[{"role": "user", "content":
             content = response.choices[0].message.content
             print(f"Grok response: {content}")
             selections = json.loads(content)
