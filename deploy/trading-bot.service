@@ -7,7 +7,7 @@ Type=simple
 User=trader
 WorkingDirectory=/home/trader/grok-empire
 Environment=PATH=/home/trader/grok-empire/.venv/bin
-ExecStart=/home/trader/grok-empire/.venv/bin/python agents/trading/crypto_15m_agent.py
+ExecStart=/home/trader/grok-empire/.venv/bin/python agents/trading/supervisor.py
 Restart=always
 RestartSec=10
 

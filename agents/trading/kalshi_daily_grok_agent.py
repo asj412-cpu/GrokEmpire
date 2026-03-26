@@ -42,8 +42,7 @@ class KalshiDailyGrokAgent:
             api_key=os.getenv("XAI_API_KEY") or os.getenv("OPENAI_API_KEY"),
             base_url="https://api.x.ai/v1"
         )
-        GROK_MODEL = "grok-4-1-fast-reasoning"
-        print(f"[{datetime.now()}] [
+        GROK_MODEL = "grok
         self.running = True
         self.log_file = "daily_trades.csv"
         self.current_cash_floor = BASE_CASH_FLOOR
@@ -76,7 +75,7 @@ class KalshiDailyGrokAgent:
             return 'LA'
         return 'NYC'  # default
 
-    async def nightly_aggregate(self):
+    async def aggregate_markets(self):
         if not self.client:
             return []  # dry run
         try:
@@ -157,7 +156,7 @@ Return JSON array: [{'ticker': 'TICKER', 'side': 'yes/no', 'contracts': 10, 'con
 """
         try:
             response = self.grok.chat.completions.create(
-                model="grok-beta",
+                model="grok-4-1-fast-reasoning",
                 messages=[{"role": "user", "content":
             content = response.choices[0].message.content
             print(f"Grok response: {content}")
@@ -230,22 +229,17 @@ Return JSON array: [{'ticker': 'TICKER', 'side': 'yes/no', 'contracts': 10, 'con
             print(f"Reconcile error: {e}")
 
     async def run(self):
-        print("🚀 Kalshi Daily Grok Agent — Starting")
+        print("🚀 [DAILY GROK] Kalshi Daily Agent Starting (4h cycles)")
         asyncio.create_task(self.monitor_positions())
 
         while self.running:
-            now = datetime.now()
-            if now.hour == 22 and 0 <= now.minute < 5:  # 10pm nightly
-                print("Nightly aggregation...")
-                markets = await nightly_aggregate()
-                selections = await grok_select_trades(markets)
-                print(f"Grok selected {len(selections)} trades")
-                # Wait to morning 8am (10 hours)
-                await asyncio.sleep(10 * 3600)
-                await place_trades(selections)
-            elif now.hour == 6:  # 6am reconcile
-                await daily_reconcile()
-            await asyncio.sleep(300)  # check every 5 min
+            print("🚀 [DAILY GROK] Cycle start...")
+            markets = await self.aggregate_markets()
+            selections = await self.grok_select_trades(markets)
+            print(f"[DAILY GROK] Grok selected {len(selections)} trades: {selections}")
+            await self.place_trades(selections)
+            print("[DAILY GROK] Cycle end, sleep 4h")
+            await asyncio.sleep(14400)
 
 async def main():
     agent = KalshiDailyGrokAgent()
