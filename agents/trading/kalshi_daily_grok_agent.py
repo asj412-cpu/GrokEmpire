@@ -42,7 +42,7 @@ class KalshiDailyGrokAgent:
             api_key=os.getenv("XAI_API_KEY") or os.getenv("OPENAI_API_KEY"),
             base_url="https://api.x.ai/v1"
         )
-        GROK_MODEL = "grok
+        GROK_MODEL = "grok-4-1-fast-reasoning"
         self.running = True
         self.log_file = "daily_trades.csv"
         self.current_cash_floor = BASE_CASH_FLOOR
