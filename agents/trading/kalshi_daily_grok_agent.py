@@ -141,9 +141,9 @@ class KalshiDailyGrokAgent:
     async def grok_select_trades(self, markets):
         if not markets:
             return []
-        prompt = f"""
+        prompt = """
 You are a Kalshi trading expert. Given these markets settling within 48 hours:
-{json.dumps(markets[:50], indent=2)}
+""" + json.dumps(markets[:50], indent=2) + """
 
 Available cash: $49, risk 25% daily ($12.25 total).
 Select top 5 trades: BUY_YES or BUY_NO, contracts (1-100), confidence >60%, rationale.
