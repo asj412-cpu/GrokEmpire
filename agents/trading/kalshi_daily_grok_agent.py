@@ -155,9 +155,11 @@ Select top 5 trades: BUY_YES or BUY_NO, contracts (1-100), confidence >60%, rati
 Return JSON array: [{'ticker': 'TICKER', 'side': 'yes/no', 'contracts': 10, 'confidence': 70, 'rationale': 'why'}]
 """
         try:
+            content = prompt
             response = self.grok.chat.completions.create(
                 model="grok-4-1-fast-reasoning",
-                messages=[{"role": "user", "content":
+                messages=[{"role": "user", "content": content}]
+            )
             content = response.choices[0].message.content
             print(f"Grok response: {content}")
             selections = json.loads(content)
