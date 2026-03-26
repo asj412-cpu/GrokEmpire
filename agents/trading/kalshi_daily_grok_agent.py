@@ -18,12 +18,10 @@ DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 class KalshiDailyGrokAgent:
     def __init__(self):
         key_id = os.getenv("KALSHI_KEY_ID")
-        private_key_path = os.getenv("KALSHI_PRIVATE_KEY")
+        private_key = os.getenv("KALSHI_PRIVATE_KEY")
         self.client = None
-        if key_id and private_key_path:
+        if key_id and private_key:
             try:
-                with open(private_key_path, 'r') as f:
-                    private_key = f.read()
                 self.client = KalshiClient(key_id=key_id, private_key=private_key)
             except Exception as e:
                 print(f"Kalshi client init failed ({e}) — dry run mode")
