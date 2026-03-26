@@ -129,6 +129,7 @@ Return JSON array: [{"ticker": "TICKER", "side": "yes/no", "contracts": 10, "con
                 max_tokens=2000
             )
             content = response.choices[0].message.content
+            print(f"Grok response: {content}")
             selections = json.loads(content)
             return selections if isinstance(selections, list) else []
         except Exception as e:
