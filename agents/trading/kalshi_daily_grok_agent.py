@@ -18,6 +18,8 @@ DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 
 class KalshiDailyGrokAgent:
     def __init__(self):
+        print(f"[DEBUG] XAI_API_KEY loaded: {bool(os.getenv('XAI_API_KEY'))} | Value starts with: { (os.getenv('XAI_API_KEY') or '')[0:20] }...")
+
         key_id = os.getenv("KALSHI_KEY_ID")
         private_key_path = os.getenv("KALSHI_PRIVATE_KEY")
         self.client = None
@@ -38,11 +40,11 @@ class KalshiDailyGrokAgent:
         else:
             print("Live Kalshi client ready")
 
-        self.grok = OpenAI(
-            api_key=os.getenv("XAI_API_KEY") or os.getenv("OPENAI_API_KEY"),
+        self.xai_client = OpenAI(
+            api_key=os.getenv("XAI_API_KEY"),
             base_url="https://api.x.ai/v1"
         )
-        GROK_MODEL = "grok-4-1-fast-reasoning"
+        self.model = "grok-4-1-fast-reasoning"
         self.running = True
         self.log_file = "daily_trades.csv"
         self.current_cash_floor = BASE_CASH_FLOOR
@@ -156,8 +158,8 @@ Return JSON array: [{'ticker': 'TICKER', 'side': 'yes/no', 'contracts': 10, 'con
 """
         try:
             content = prompt
-            response = self.grok.chat.completions.create(
-                model="grok-4-1-fast-reasoning",
+            response = self.xai_client.chat.completions.create(
+                model=self.model,
                 messages=[{"role": "user", "content": content}]
             )
             content = response.choices[0].message.content
