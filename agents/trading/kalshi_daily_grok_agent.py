@@ -60,7 +60,7 @@ class KalshiDailyGrokAgent:
             return balance_cents / 100.0
         except Exception as e:
             print(f"Balance check error: {e}")
-            return self.last_balance
+            return 49.0  # fallback to $49
 
     def extract_city(self, ticker):
         # Simple extract for weather
