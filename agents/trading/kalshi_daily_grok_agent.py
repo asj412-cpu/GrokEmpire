@@ -79,7 +79,30 @@ class KalshiDailyGrokAgent:
 
     async def aggregate_markets(self):
         if not self.client:
-            return []  # dry run
+            print("[DAILY GROK] Number of markets aggregated: 2 (mock dry run)")
+            mock_markets = [
+                {
+                    'ticker': 'W-NYCRN-26MAR',
+                    'title': 'Will it rain in NYC tomorrow?',
+                    'yes_bid_dollars': 52,
+                    'yes_ask_dollars': 54,
+                    'settlement_timer_seconds_from_now': 3600 * 24,
+                    'volume_fp': 2500,
+                    'category': 'weather',
+                    'data': {'noaa': '30% chance', 'fear_greed': 45}
+                },
+                {
+                    'ticker': 'C-BTC100K-26APR',
+                    'title': 'BTC > $100k by April?',
+                    'yes_bid_dollars': 62,
+                    'yes_ask_dollars': 64,
+                    'settlement_timer_seconds_from_now': 3600 * 24 * 30,
+                    'volume_fp': 4500,
+                    'category': 'crypto',
+                    'data': {'price': '$98k', 'fear_greed': 65}
+                }
+            ]
+            return mock_markets
         try:
             print("Starting aggregation")
             data = await self.client.get_markets(status="open", limit=1000)
@@ -174,8 +197,11 @@ Return JSON array: [{'ticker': 'TICKER', 'side': 'yes/no', 'contracts': 10, 'con
         balance = await self.get_balance() or 49.0
         available = max(0.0, balance - self.current_cash_floor)
         risk_total = available * DAILY_RISK_PCT
+        print(f"Paper trade summary: Would risk up to 25% of daily capital on these trades (${risk_total:.2f} total)")
+
         risk_per_trade = risk_total / len(selections) if selections else 0
 
+        total_sim_pnl = 0.0
         for sel in selections:
             ticker = sel['ticker']
             side = sel['side']
@@ -200,7 +226,13 @@ Return JSON array: [{'ticker': 'TICKER', 'side': 'yes/no', 'contracts': 10, 'con
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ticker, "", side, contracts, price, status,
                     available, risk_per_trade, rationale, ""
                 ])
-            print(f"Paper {side.upper()} {contracts} @ {price}c {ticker}
+            print(f"Paper {side.upper()} {contracts} @ {price}c {ticker}")
+            sim_return = random.uniform(0.85, 1.15)
+            sim_pnl = (sim_return - 1) * risk_per_trade * contracts / 100
+            total_sim_pnl += sim_pnl
+            print(f"  Sim PnL: ${sim_pnl:.2f} ({(sim_return - 1)*100:.1f}%)")
+            print(f"Paper {side.upper()} {contracts} @ {price}c {ticker}")
+        print(f"Simulated daily result: ${total_sim_pnl:.2f}")
         while self.running:
             try:
                 if self.client and self.positions:
