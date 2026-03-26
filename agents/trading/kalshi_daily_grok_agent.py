@@ -74,8 +74,11 @@ class KalshiDailyGrokAgent:
         if not self.client:
             return []  # dry run
         try:
+            print("Starting aggregation")
             data = await self.client.get_markets(status="open", limit=1000)
-        except:
+            print(f"Data type: {type(data)}, keys: {data.keys() if isinstance(data, dict) else 'not dict'}")
+        except Exception as e:
+            print(f"Get markets error: {e}")
             return []
 
         short_markets = []
