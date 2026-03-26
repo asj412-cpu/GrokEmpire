@@ -2,3 +2,10 @@
 __pycache__/
 *.pyc
 daily_trades.csv
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+daily_trades.csv
+.env
+*.log
