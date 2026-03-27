@@ -53,7 +53,7 @@ class KalshiDailyGrokAgent:
             with open(self.log_file, "w", newline="") as f:
                 csv.writer(f).writerow([
                     "timestamp", "ticker", "title", "side", "contracts", "price", "status",
-                    "available_cash", "risk_per_trade", "grok_rationale", "pnl"
+                    "available_cash", "risk_per_trade", "grok_rationale", "confidence", "pnl"
                 ])
 
     async def get_balance(self):
@@ -245,7 +245,14 @@ Return ONLY valid JSON array: [{{"ticker": "TICKER", "side": "yes/no", "contract
             price = 90 if side == 'yes' else 10  # rough
             rationale = sel.get('rationale', '')
 
+            conf = sel.get('confidence', 70)
+
+            pnl_str = ""
+
             if DRY_RUN:
+                mock_return = (conf / 100.0 - 0.5) * 2 * random.uniform(0.6, 1.4)
+                pnl = contracts * (price / 100.0) * mock_return
+                pnl_str = f"{pnl:.2f}"
                 status = "DRY_RUN_SUCCESS"
                 self.positions[ticker] = {'side': side, 'contracts': contracts, 'entry_price': price/100.0}
             else:
@@ -260,7 +267,7 @@ Return ONLY valid JSON array: [{{"ticker": "TICKER", "side": "yes/no", "contract
             with open(self.log_file, "a", newline="") as f:
                 csv.writer(f).writerow([
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ticker, "", side, contracts, price, status,
-                    available, risk_per_trade, rationale, ""
+                    available, risk_per_trade, rationale, conf, pnl_str
                 ])
             conf = sel.get('confidence', 'N/A')
             print(f"✅ EXECUTED: {ticker} | {side.upper()} | {contracts} contracts @ {price}¢ | Conf: {conf}%")
