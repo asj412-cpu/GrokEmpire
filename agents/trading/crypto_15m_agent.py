@@ -58,6 +58,11 @@ class Crypto15mAgent:
         self.current_cash_floor = BASE_CASH_FLOOR
         self.last_balance = 0.0
         self.positions = {}
+        self.mock_balance = 1000.0
+        self.cycle_momentum_trades = 0
+        self.cycle_value_trades = 0
+        self.cycle_paper_pnl = 0.0
+        self.entries = {}
 
         if not os.path.exists(self.log_file):
             with open(self.log_file, "w", newline="") as f:
@@ -91,6 +96,8 @@ class Crypto15mAgent:
                 print(f"WS error: {e}, reconnecting...")
                 await asyncio.sleep(5)
     async def get_balance(self):
+        if DRY_RUN:
+            return self.mock_balance
         if not self.client:
             return 1000.0  # mock for dry run
         try:
@@ -148,6 +155,7 @@ class Crypto15mAgent:
             ticker = m.get("ticker")
             yes_bid = float(m.get("yes_bid_dollars", 0))
             yes_ask = float(m.get("yes_ask_dollars", 0))
+            volume = float(m.get("volume_fp", 0))
             strike_raw = m.get("floor_strike")
             if not yes_bid or not yes_ask:
                 continue
@@ -157,13 +165,12 @@ class Crypto15mAgent:
             current_price = self.prices.get(coin_name)
 
             th = THRESHOLDS.get(coin_name, THRESHOLDS["BTC"])
+            decision = "HOLD"
+            entry_price = None
+            minutes_remaining = 15 - (datetime.now().minute % 15)
 
-                decision = "HOLD"
-                entry_price = None
-                minutes_remaining = 15 - (datetime.now().minute % 15)
-
-                if current_price is not None:
-                    distance = abs(current_price - strike)
+            if current_price is not None:
+                distance = abs(current_price - strike)
 
                     min_distance_table = {
                         "BTC":  {2: 35,  5: 80,  10: 130, 15: 210},
@@ -223,6 +230,56 @@ class Crypto15mAgent:
                     ])
 
                 # Skip order if HOLD, wrong coin, dry run, low risk, recent trade
+                if decision in ("BUY YES", "BUY NO") and coin_name == "BTC" and riskable > 0 and ticker != self.last_traded_ticker:
+                    side = "yes" if decision == "BUY YES" else "no"
+                    client_order_id = f"cr15m-{side}-{ticker}-{int(time.time())}"
+                    print(f"[MOMENTUM] Triggered on {'YES' if side == 'yes' else 'NO'} at {entry_price}¢ ({ticker})")
+                    print(f"   → {decision} {contracts} @ {entry_price}c ID: {client_order_id}")
+
+                    if self.client and not DRY_RUN:
+                        result = await self.client.place_order(ticker, side, contracts, price=entry_price)
+                        status = "SUCCESS" if result else "FAILED"
+                        self.last_traded_ticker = ticker
+                        self.entries[ticker] = {
+                            'side': side,
+                            'contracts': contracts,
+                            'entry_price': entry_price / 100.0,
+                            'entry_time': time.time()
+                        }
+                    else:
+                        # Paper trade mock
+                        print(f"   📄 PAPER: {decision} {contracts} @ {entry_price}c")
+                        cost = contracts * (entry_price / 100.0)
+                        self.mock_balance -= cost
+                        status = "MOCK_SUCCESS"
+                        self.last_traded_ticker = ticker
+                        self.entries[ticker] = {
+                            'side': side,
+                            'contracts': contracts,
+                            'entry_price': entry_price / 100.0,
+                            'entry_time': time.time()
+                        }
+                        self.cycle_momentum_trades += 1
+
+                    # Log order outcome
+                    with open(self.log_file, "a", newline="") as f:
+                        csv.writer(f).writerow([
+                            timestamp, coin_name, ticker, strike, mid, current_price,
+                            decision, contracts, entry_price, client_order_id, status,
+                            self.current_cash_floor, str(DRY_RUN), signal_id
+                        ])
+
+                # Value Hunter layer (0-5 min entries)
+                if minutes_remaining <= 5:
+                    rsi = await self.get_rsi(coin_name)
+                    vh_type = None
+                    side = None
+                    if ticker in self.entries:
+                        entry = self.entries[ticker]
+                        opp_side = 'no' if entry['side'] == 'yes' else 'yes'
+                        target_decision = 'BU
+
+                # Skip order if HOLD, wrong coin, dry run, low risk, recent trade
                 if decision in ("BUY YES", "BUY NO") and coin_name == "BTC" and not DRY_RUN and riskable > 0 and ticker != self.last_traded_ticker:
                     side = "yes" if decision == "BUY YES" else "no"
                     client_order_id = f"cr15m-{side}-{ticker}-{int(time.time())}"
@@ -255,18 +312,8 @@ class Crypto15mAgent:
                             decision, contracts, entry_price, client_order_id, status,
                             self.current_cash_floor, str(DRY_RUN), signal_id
                         ])
-                self.last_traded_ticker = ticker
-
-                with open(self.log_file, "a", newline="") as f:
-                    csv.writer(f).writerow([
-                        timestamp, coin_name, ticker, strike, mid, current_price,
-                        decision, contracts, entry_price, client_order_id, status, self.current_cash_floor, "false", signal_id
-                    ])
-
-                self.positions[ticker] = {'side': side, 'contracts': contracts, 'entry_price': entry_price}
-
-            except Exception as e:
-                print(f"Error processing {coin_name}: {e}")
+                # Cycle summary
+                if self.cycle_momentum
 
     async def get_rsi(self, coin, period=14):
         ohlcv = await self.exchange.fetch_ohlcv(COINBASE_PRODUCTS[coin], '1m', limit=period+1)
