@@ -13,13 +13,11 @@ from cryptography.hazmat.primitives import serialization
 
 BASE_CASH_FLOOR = 40.0
 RATCHET_PERCENT = 0.80
-DAILY_RISK_PCT = 0.25
-DRY_RUN = True
+DAILY_RISK_PCT = float(os.getenv('DAILY_RISK_PCT', '0.25'))
+DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 
 class KalshiDailyGrokAgent:
     def __init__(self):
-        print(f"[DEBUG] XAI_API_KEY loaded: {bool(os.getenv('XAI_API_KEY'))} | Value starts with: { (os.getenv('XAI_API_KEY') or '')[0:20] }...")
-
         key_id = os.getenv("KALSHI_KEY_ID")
         private_key_path = os.getenv("KALSHI_PRIVATE_KEY")
         self.client = None
@@ -40,11 +38,11 @@ class KalshiDailyGrokAgent:
         else:
             print("Live Kalshi client ready")
 
-        self.xai_client = OpenAI(
-            api_key=os.getenv("XAI_API_KEY"),
+        self.grok = OpenAI(
+            api_key=os.getenv("XAI_API_KEY") or os.getenv("OPENAI_API_KEY"),
             base_url="https://api.x.ai/v1"
         )
-        self.model = "grok-4-1-fast-reasoning"
+        GROK_MODEL = "grok-4-1-fast-reasoning"
         self.running = True
         self.log_file = "daily_trades.csv"
         self.current_cash_floor = BASE_CASH_FLOOR
@@ -79,60 +77,58 @@ class KalshiDailyGrokAgent:
 
     async def aggregate_markets(self):
         if not self.client:
-            print("[DAILY GROK] Number of markets aggregated: 2 (mock dry run)")
+            from tools.data_sources import get_econ_summary, get_crypto_prices, get_fear_greed
+            econ = get_econ_summary()
+            crypto = get_crypto_prices()
+            fg = get_fear_greed()
+            # Rich mocks for DRY_RUN demo
             mock_markets = [
                 {
-                    'ticker': 'W-NYCRN-26MAR',
-                    'title': 'Will it rain in NYC tomorrow?',
-                    'yes_bid_dollars': 52,
-                    'yes_ask_dollars': 54,
-                    'settlement_timer_seconds_from_now': 3600 * 24,
-                    'volume_fp': 2500,
-                    'category': 'weather',
-                    'data': {'noaa': '30% chance', 'fear_greed': 45}
+                    'ticker': 'CPI-M0.2-ABOVE',
+                    'title': 'CPI MoM > 0.2% next release?',
+                    'yes_bid': 45,
+                    'yes_ask': 48,
+                    'mid': 46.5,
+                    'settle_hours': 24,
+                    'volume': 5000,
+                    'category': 'econ',
+                    'data': {'econ': econ}
                 },
                 {
-                    'ticker': 'C-BTC100K-26APR',
-                    'title': 'BTC > $100k by April?',
-                    'yes_bid_dollars': 62,
-                    'yes_ask_dollars': 64,
-                    'settlement_timer_seconds_from_now': 3600 * 24 * 30,
-                    'volume_fp': 4500,
+                    'ticker': 'BTC-100K-EOW',
+                    'title': 'BTC > $100k by EOW?',
+                    'yes_bid': 55,
+                    'yes_ask': 58,
+                    'mid': 56.5,
+                    'settle_hours': 36,
+                    'volume': 8000,
                     'category': 'crypto',
-                    'data': {'price': '$98k', 'fear_greed': 65}
+                    'data': {'crypto': crypto}
+                },
+                {
+                    'ticker': 'VIX-20-ABOVE',
+                    'title': 'VIX closes above 20 tomorrow?',
+                    'yes_bid': 62,
+                    'yes_ask': 65,
+                    'mid': 63.5,
+                    'settle_hours': 28,
+                    'volume': 3000,
+                    'category': 'volatility',
+                    'data': {'fear_greed': fg}
                 }
             ]
+            print("DRY_RUN: Using rich mock markets with live data")
             return mock_markets
+
         try:
             print("Starting aggregation")
             data = await self.client.get_markets(status="open", limit=1000)
             print(f"Data type: {type(data)}, keys: {data.keys() if isinstance(data, dict) else 'not dict'}")
         except Exception as e:
             print(f"Get markets error: {e}")
-            # Mock markets for testing
-            mock_markets = [
-                {
-                    'ticker': 'TEST1',
-                    'title': 'Will it rain in NYC tomorrow?',
-                    'yes_bid_dollars': 50,
-                    'yes_ask_dollars': 55,
-                    'settlement_timer_seconds_from_now': 3600 * 24,
-                    'volume_fp': 2000,
-                    'category': 'weather',
-                    'data': {'noaa': 'Sunny', 'news': 'Market news', 'fear_greed': 50}
-                },
-                {
-                    'ticker': 'TEST2',
-                    'title': 'BTC above $100k by end of year?',
-                    'yes_bid_dollars': 60,
-                    'yes_ask_dollars': 65,
-                    'settlement_timer_seconds_from_now': 3600 * 48,
-                    'volume_fp': 3000,
-                    'category': 'crypto',
-                    'data': {'crypto': 'BTC at $95k', 'news': 'Crypto news', 'fear_greed': 60}
-                }
-            ]
-            print("Using mock markets for testing")
+            # Fallback mock
+            mock_markets = []
+            print("Using fallback mocks")
             return mock_markets
 
         short_markets = []
@@ -158,7 +154,7 @@ class KalshiDailyGrokAgent:
                     city = self.extract_city(m['ticker'])
                     enriched['data']['noaa'] = get_noaa_forecast(city)
                 if 'fed' in title_lower or 'cpi' in title_lower or 'inflation' in title_lower:
-                    enriched['data']['fred'] = get_fred_econ_data()
+                    enriched['data']['econ'] = get_econ_summary()
                 if 'crypto' in title_lower or 'btc' in title_lower:
                     enriched['data']['crypto'] = get_crypto_prices()
                 # General
@@ -171,37 +167,77 @@ class KalshiDailyGrokAgent:
     async def grok_select_trades(self, markets):
         if not markets:
             return []
-        prompt = """
-You are a Kalshi trading expert. Given these markets settling within 48 hours:
-""" + json.dumps(markets[:50], indent=2) + """
+
+        # Global real-time data snapshot
+        from tools.data_sources import get_econ_summary, get_crypto_prices, get_fear_greed, get_vix
+        global_data = {
+            'econ': get_econ_summary(),
+            'crypto': get_crypto_prices(),
+            'fear_greed': get_fear_greed(),
+            'vix': get_vix()
+        }
+
+        prompt = f"""
+You are a Kalshi trading expert. Use the provided real-time data including current FRED CPI, Fear & Greed index, VIX, BLS CPI, crypto prices, Truflation, Cleveland nowcasts. 
+
+GLOBAL DATA:
+{json.dumps(global_data, indent=2)}
+
+MARKETS (48h settle):
+{json.dumps(markets[:50], indent=2)}
 
 Available cash: $49, risk 25% daily ($12.25 total).
-Select top 5 trades: BUY_YES or BUY_NO, contracts (1-100), confidence >60%, rationale.
-Return JSON array: [{'ticker': 'TICKER', 'side': 'yes/no', 'contracts': 10, 'confidence': 70, 'rationale': 'why'}]
+Select top 3-5 trades: ticker, side ('yes'/'no'), contracts (1-100), confidence (60-100), rationale.
+Calculate true edge: market-implied prob vs your data-driven prob.
+
+Return ONLY valid JSON array: [{{"ticker": "TICKER", "side": "yes/no", "contracts": 10, "confidence": 75, "rationale": "Detailed why + edge calc"}}]
 """
         try:
             content = prompt
-            response = self.xai_client.chat.completions.create(
-                model=self.model,
+            response = self.grok.chat.completions.create(
+                model="grok-4-1-fast-reasoning",
                 messages=[{"role": "user", "content": content}]
             )
             content = response.choices[0].message.content
             print(f"Grok response: {content}")
             selections = json.loads(content)
+            if isinstance(selections, list):
+                print("\n🧠 GROK RECOMMENDATIONS:")
+                for i, sel in enumerate(selections, 1):
+                    conf = sel.get('confidence', 'N/A')
+                    print(f"  {i}. {sel['ticker']} | {sel['side'].upper()} | {sel['contracts']} contracts | Conf: {conf}%")
+                    print(f"     Rationale: {sel['rationale']}")
+                print()
             return selections if isinstance(selections, list) else []
         except Exception as e:
             print(f"Grok error: {e}")
             return []
 
+    def get_cumulative_pnl(self):
+        total = 0.0
+        if os.path.exists(self.log_file):
+            with open(self.log_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    pnl_str = row.get('pnl', '0')
+                    try:
+                        total += float(pnl_str)
+                    except ValueError:
+                        pass
+        print(f"💰 CUMULATIVE PAPER PnL: ${total:.2f}")
+        return total
+
     async def place_trades(self, selections):
         balance = await self.get_balance() or 49.0
         available = max(0.0, balance - self.current_cash_floor)
         risk_total = available * DAILY_RISK_PCT
-        print(f"Paper trade summary: Would risk up to 25% of daily capital on these trades (${risk_total:.2f} total)")
-
         risk_per_trade = risk_total / len(selections) if selections else 0
 
-        total_sim_pnl = 0.0
+        print(f"📊 DAILY RISK ALLOCATION (25% budget):")
+        print(f"   Available: ${available:.2f} | Total risk: ${risk_total:.2f} ({DAILY_RISK_PCT*100}%)")
+        print(f"   Per trade ({len(selections)}): ${risk_per_trade:.2f}")
+        print()
+
         for sel in selections:
             ticker = sel['ticker']
             side = sel['side']
@@ -226,13 +262,12 @@ Return JSON array: [{'ticker': 'TICKER', 'side': 'yes/no', 'contracts': 10, 'con
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ticker, "", side, contracts, price, status,
                     available, risk_per_trade, rationale, ""
                 ])
-            print(f"Paper {side.upper()} {contracts} @ {price}c {ticker}")
-            sim_return = random.uniform(0.85, 1.15)
-            sim_pnl = (sim_return - 1) * risk_per_trade * contracts / 100
-            total_sim_pnl += sim_pnl
-            print(f"  Sim PnL: ${sim_pnl:.2f} ({(sim_return - 1)*100:.1f}%)")
-            print(f"Paper {side.upper()} {contracts} @ {price}c {ticker}")
-        print(f"Simulated daily result: ${total_sim_pnl:.2f}")
+            conf = sel.get('confidence', 'N/A')
+            print(f"✅ EXECUTED: {ticker} | {side.upper()} | {contracts} contracts @ {price}¢ | Conf: {conf}%")
+            print(f"   Risk: ${risk_per_trade:.2f} | Rationale: {rationale}")
+            print()
+
+    async def monitor_positions(self):
         while self.running:
             try:
                 if self.client and self.positions:
@@ -267,12 +302,12 @@ Return JSON array: [{'ticker': 'TICKER', 'side': 'yes/no', 'contracts': 10, 'con
         asyncio.create_task(self.monitor_positions())
 
         while self.running:
-            print(f"[DAILY GROK START] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print("🚀 [DAILY GROK] Cycle start...")
             markets = await self.aggregate_markets()
             selections = await self.grok_select_trades(markets)
-            print(f"[DAILY GROK] Grok selected {len(selections)} trades")
-            print(f"Grok recommendations:\n{json.dumps(selections, indent=2)}")
+            print(f"[DAILY GROK] Grok selected {len(selections)} trades: {selections}")
             await self.place_trades(selections)
+            self.get_cumulative_pnl()
             print("[DAILY GROK] Cycle end, sleep 4h")
             await asyncio.sleep(14400)
 
