@@ -2,9 +2,15 @@
 
 Grok-powered trading agents for Kalshi prediction markets.
 
-## Agents
-- `crypto_15m_agent.py` → 15m crypto binaries (paused)
-- `kalshi_daily_grok_agent.py` → Daily batch trades on short-settle markets
+## Agents (Paper Trading Active - DRY_RUN=true)
+- `crypto_15m_agent.py` → 15m crypto binaries (BTC momentum/value signals)
+  - Single cycle: `python one_time_15m.py`
+  - Continuous: `python agents/trading/crypto_15m_agent.py`
+  - Shell: `./run_15m_bot.sh`
+- `kalshi_daily_grok_agent.py` → Daily batch trades on short-settle markets (Grok-powered)
+  - Single cycle: `python one_time.py`
+  - Continuous: `python agents/trading/kalshi_daily_grok_agent.py`
+  - Shell: `./run_kalshi_bot.sh`
 
 ## Setup
 1. Set API keys:
@@ -13,7 +19,9 @@ Grok-powered trading agents for Kalshi prediction markets.
    - `export KALSHI_PRIVATE_KEY=...`
    - `export DAILY_RISK_PCT=0.25` (optional, default 0.25)
 2. Install deps: `pip install -r requirements.txt`
-3. Run daily agent: `python agents/trading/kalshi_daily_grok_agent.py`
+3. Run agents (paper trading - check CSVs):
+   - Daily: `python one_time.py` or `./run_kalshi_bot.sh`
+   - 15m: `python one_time_15m.py` or `./run_15m_bot.sh`
 
 ## Files
 - `daily_trades.csv` → Trade log with Grok rationales

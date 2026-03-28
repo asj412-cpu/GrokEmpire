@@ -43,3 +43,18 @@ def get_google_news():
 def get_fear_greed():
     # Mock
     return {'index': 65, 'classification': 'Greed'}
+
+# VIX
+def get_vix():
+    # Mock
+    return {'vix': 20.5, 'change': '+0.3'}
+
+# Econ Summary (CPI, Fed, nowcasts)
+def get_econ_summary():
+    fred = get_fred_econ_data()
+    nowcast = get_cleveland_nowcast()
+    return {
+        **fred,
+        **nowcast,
+        'timestamp': datetime.now().isoformat()
+    }

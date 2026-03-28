@@ -172,42 +172,42 @@ class Crypto15mAgent:
             if current_price is not None:
                 distance = abs(current_price - strike)
 
-                    min_distance_table = {
-                        "BTC":  {2: 35,  5: 80,  10: 130, 15: 210},
-                    }
+                min_distance_table = {
+                    "BTC":  {2: 35,  5: 80,  10: 130, 15: 210},
+                }
 
-                    table = min_distance_table.get(coin_name, min_distance_table["BTC"])
+                table = min_distance_table.get(coin_name, min_distance_table["BTC"])
 
-                    if minutes_remaining <= 2:
-                        min_distance = table[2]
-                    elif minutes_remaining <= 5:
-                        min_distance = table[5]
-                    elif minutes_remaining <= 10:
-                        min_distance = table[10]
-                    else:
-                        min_distance = table[15]
+                if minutes_remaining <= 2:
+                    min_distance = table[2]
+                elif minutes_remaining <= 5:
+                    min_distance = table[5]
+                elif minutes_remaining <= 10:
+                    min_distance = table[10]
+                else:
+                    min_distance = table[15]
 
-                    if mid >= 0.88:
-                        print(f"   PRICE GUARD: rejected BUY YES on {coin_name} at mid {mid:.4f}")
-                        decision = "HOLD"
-                    elif mid <= 0.12:
-                        print(f"   PRICE GUARD: rejected BUY NO on {coin_name} at mid {mid:.4f}")
-                        decision = "HOLD"
-
-                    if mid <= th["no"] and volume >= th["min_vol"]:
-                        decision = "BUY NO"
-                        entry_price = int(round((1.0 - yes_bid) * 100))
-                        entry_price = max(1, min(90, entry_price))
-                    elif mid >= th["yes"] and distance > min_distance:
-                        decision = "BUY YES"
-                        entry_price = int(round(yes_ask * 100))
-                        entry_price = max(1, min(90, entry_price))
-
-                rsi = await self.get_rsi(coin_name)
-                if decision == "BUY YES" and rsi < 60:
+                if mid >= 0.88:
+                    print(f"   PRICE GUARD: rejected BUY YES on {coin_name} at mid {mid:.4f}")
                     decision = "HOLD"
-                elif decision == "BUY NO" and rsi > 40:
+                elif mid <= 0.12:
+                    print(f"   PRICE GUARD: rejected BUY NO on {coin_name} at mid {mid:.4f}")
                     decision = "HOLD"
+
+                if mid <= th["no"] and volume >= th["min_vol"]:
+                    decision = "BUY NO"
+                    entry_price = int(round((1.0 - yes_bid) * 100))
+                    entry_price = max(1, min(90, entry_price))
+                elif mid >= th["yes"] and distance > min_distance:
+                    decision = "BUY YES"
+                    entry_price = int(round(yes_ask * 100))
+                    entry_price = max(1, min(90, entry_price))
+
+            rsi = await self.get_rsi(coin_name)
+            if decision == "BUY YES" and rsi < 60:
+                decision = "HOLD"
+            elif decision == "BUY NO" and rsi > 40:
+                decision = "HOLD"
 
                 # Kelly
                 WIN_RATE = 0.55
@@ -269,51 +269,14 @@ class Crypto15mAgent:
                             self.current_cash_floor, str(DRY_RUN), signal_id
                         ])
 
-                # Value Hunter layer (0-5 min entries)
+                # Value Hunter layer (0-5 min entries) - TODO: implement value trading logic
                 if minutes_remaining <= 5:
-                    rsi = await self.get_rsi(coin_name)
-                    vh_type = None
-                    side = None
-                    if ticker in self.entries:
-                        entry = self.entries[ticker]
-                        opp_side = 'no' if entry['side'] == 'yes' else 'yes'
-                        target_decision = 'BU
+                    pass  # incomplete value hunter logic
 
-                # Skip order if HOLD, wrong coin, dry run, low risk, recent trade
-                if decision in ("BUY YES", "BUY NO") and coin_name == "BTC" and not DRY_RUN and riskable > 0 and ticker != self.last_traded_ticker:
-                    side = "yes" if decision == "BUY YES" else "no"
-                    client_order_id = f"cr15m-{side}-{ticker}-{int(time.time())}"
-                    print(f"   → {decision} {contracts} @ {entry_price}c ID: {client_order_id}")
-
-                    if self.client:
-                        result = await self.client.place_order(ticker, side, contracts, price=entry_price)
-                        status = "SUCCESS" if result else "FAILED"
-                        self.last_traded_ticker = ticker
-                        self.positions[ticker] = {
-                            'side': side,
-                            'contracts': contracts,
-                            'entry_price': entry_price / 100.0
-                        }
-                    else:
-                        # Paper trade mock
-                        print(f"   📄 PAPER: {decision} {contracts} @ {entry_price}c")
-                        status = "MOCK_SUCCESS"
-                        self.last_traded_ticker = ticker
-                        self.positions[ticker] = {
-                            'side': side,
-                            'contracts': contracts,
-                            'entry_price': entry_price / 100.0
-                        }
-
-                    # Log order outcome
-                    with open(self.log_file, "a", newline="") as f:
-                        csv.writer(f).writerow([
-                            timestamp, coin_name, ticker, strike, mid, current_price,
-                            decision, contracts, entry_price, client_order_id, status,
-                            self.current_cash_floor, str(DRY_RUN), signal_id
-                        ])
                 # Cycle summary
-                if self.cycle_momentum
+                if self.cycle_momentum_trades > 0 or self.cycle_value_trades > 0:
+                    print(f"   Cycle summary: momentum={self.cycle_momentum_trades}, value={self.cycle_value_trades}, paper_pnl={self.cycle_paper_pnl}")
+
 
     async def get_rsi(self, coin, period=14):
         ohlcv = await self.exchange.fetch_ohlcv(COINBASE_PRODUCTS[coin], '1m', limit=period+1)
