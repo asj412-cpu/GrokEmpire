@@ -140,12 +140,24 @@ class Crypto15mAgent:
             return
         try:
             positions = self.client.get_positions()
-            for p in positions.get("market_positions", []):
-                ticker = p.get("ticker", "")
-                count = abs(int(p.get("position", 0)))
-                if ticker and count > 0:
-                    self.ticker_contracts[ticker] = count
-                    print(f"  📌 Existing position: {ticker} = {count} contracts")
+            for p in positions.get("event_positions", []):
+                event_ticker = p.get("event_ticker", "")
+                count = int(float(p.get("total_cost_shares_fp", 0)))
+                if count <= 0:
+                    continue
+                # Match any 15m crypto event — store all market tickers for this event
+                for series in COINS.values():
+                    if event_ticker.startswith(series):
+                        try:
+                            mkts = self.client.get_markets(event_ticker=event_ticker, limit=5)
+                            for m in mkts.get("markets", []):
+                                t = m.get("ticker", "")
+                                if t:
+                                    self.ticker_contracts[t] = count
+                            print(f"  📌 {event_ticker}: {count} contracts (blocked)")
+                        except Exception:
+                            pass
+                        break
         except Exception as e:
             print(f"  Position seed error: {e}")
 
