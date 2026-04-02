@@ -79,7 +79,7 @@ class Crypto15mAgent:
                 self.client = KalshiClient(
                     key_id=key_id, 
                     private_key=priv_obj,
-                    exchange_api_base='https://trading-api.kalshi.com/trade-api/v2'
+                    exchange_api_base='https://api.elections.kalshi.com/trade-api/v2'
                 )
                 print("🔥 LIVE Kalshi client ready – REAL orders enabled")
             except Exception as e:
