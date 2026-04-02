@@ -98,6 +98,15 @@ def print_cycle_summary(cycle, data_by_coin):
 async def monitor():
     global cycle_num, last_minute_mark
 
+    # Wait for next cycle boundary first
+    now = datetime.now(timezone.utc)
+    min_in_cycle = now.minute % 15
+    if min_in_cycle > 0:
+        wait_secs = (15 - min_in_cycle) * 60 - now.second
+        print(f"Waiting {wait_secs}s for next cycle boundary...")
+        await asyncio.sleep(wait_secs + 2)
+
+    # Generate auth AFTER wait (signatures expire quickly)
     ts_ms = int(time.time() * 1000)
     sig = generate_signature(ts_ms)
     headers = {
@@ -105,17 +114,6 @@ async def monitor():
         "KALSHI-ACCESS-SIGNATURE": sig,
         "KALSHI-ACCESS-TIMESTAMP": str(ts_ms),
     }
-
-    current_tickers = get_open_tickers()
-    ticker_to_coin = {v: k for k, v in current_tickers.items()}
-
-    # Wait for next cycle boundary
-    now = datetime.now(timezone.utc)
-    min_in_cycle = now.minute % 15
-    if min_in_cycle > 0:
-        wait_secs = (15 - min_in_cycle) * 60 - now.second
-        print(f"Waiting {wait_secs}s for next cycle boundary...")
-        await asyncio.sleep(wait_secs + 2)
 
     current_tickers = get_open_tickers()
     ticker_to_coin = {v: k for k, v in current_tickers.items()}
