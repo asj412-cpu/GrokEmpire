@@ -35,7 +35,7 @@ ENTRY_HIGH = 30  # max entry price in cents
 EXIT_MULTIPLIER = 2  # resting sell at 2x entry price
 FADE_THRESHOLD = 6  # out of 10 rolling cycles
 FADE_WINDOW = 10
-MAX_CONTRACTS_PER_MARKET = 2
+MAX_CONTRACTS_PER_MARKET = 3
 VALUE_HUNTER_WINDOW_MINUTES = 8
 
 COINS = {
