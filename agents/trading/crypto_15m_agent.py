@@ -253,9 +253,9 @@ class Crypto15mAgent:
         if not coin:
             return
 
-        # Time window check
+        # Time window: start at min 2 (13 left), stop at min 8 (7 left)
         minutes_remaining = 15 - (datetime.now().minute % 15)
-        in_window = minutes_remaining >= (15 - VALUE_HUNTER_WINDOW_MINUTES)
+        in_window = 7 <= minutes_remaining <= 13
 
         # Contract count check
         existing = self.ticker_contracts.get(ticker, 0)
