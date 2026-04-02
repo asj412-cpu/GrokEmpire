@@ -87,13 +87,16 @@ class Crypto15mAgent:
         self.last_settled_ticker: Dict[str, str] = {}
         self.history_seeded = False
 
-        # Per-ticker contract count (max 2)
+        # Per-ticker contract count (max 3)
         self.ticker_contracts: Dict[str, int] = {}
 
         # Per-ticker: held contracts and resting sell orders
-        # {ticker: [{side, entry_price, sell_order_id, sell_posted}]}
         self.positions: Dict[str, list] = defaultdict(list)
         self.resting_sells: Dict[str, int] = {}  # ticker -> count of resting sell orders
+
+        # Resting buy orders — drift with market
+        # {ticker: {order_id, side, price, coin}}
+        self.resting_buys: Dict[str, dict] = {}
 
         # Current open market tickers per coin
         self.current_tickers: Dict[str, str] = {}
@@ -208,13 +211,31 @@ class Crypto15mAgent:
             action = msg.get("action", "")
             price = msg.get("yes_price", 0)
             count = msg.get("count", 0)
-            print(f"  💰 FILL: {action.upper()} {side.upper()} {ticker} {count}x @ {price}c")
+            coin = None
+            for c, t in self.current_tickers.items():
+                if t == ticker:
+                    coin = c
+                    break
 
-            # Track sell fills — decrement resting sells and positions
-            if action == "sell" and ticker in self.resting_sells:
+            print(f"  💰 FILL: {action.upper()} {side.upper()} {coin or ticker} {count}x @ {price}c")
+
+            if action == "buy":
+                # Buy filled — increment position, clear resting buy, post resting sell
+                self.ticker_contracts[ticker] = self.ticker_contracts.get(ticker, 0) + 1
+                entry_price = price
+                self.positions[ticker].append({"side": side, "entry_price": entry_price})
+                if ticker in self.resting_buys:
+                    del self.resting_buys[ticker]
+                print(f"  ✅ Bought! Now {self.ticker_contracts[ticker]}/{MAX_CONTRACTS_PER_MARKET} contracts")
+                # Post resting sell
+                if self.client and not DRY_RUN and coin:
+                    self._post_resting_sell(ticker, coin, side, entry_price)
+
+            elif action == "sell":
+                # Sell filled — decrement resting sells and positions
                 self.resting_sells[ticker] = max(0, self.resting_sells.get(ticker, 0) - 1)
                 if self.positions.get(ticker):
-                    self.positions[ticker].pop(0)  # remove oldest position
+                    self.positions[ticker].pop(0)
                 print(f"  ✅ Exit filled! Resting sells remaining: {self.resting_sells.get(ticker, 0)}")
 
         elif msg_type == "subscribed":
@@ -222,7 +243,7 @@ class Crypto15mAgent:
             print(f"  WS subscribed: {channel}")
 
     async def _evaluate_trade(self, ticker):
-        """Called on every WS price update — check if we should buy."""
+        """Called on every WS price update — manage resting buys that drift with market."""
         # Find which coin this ticker belongs to
         coin = None
         for c, t in self.current_tickers.items():
@@ -234,57 +255,78 @@ class Crypto15mAgent:
 
         # Time window check
         minutes_remaining = 15 - (datetime.now().minute % 15)
-        if minutes_remaining < (15 - VALUE_HUNTER_WINDOW_MINUTES):
-            return
+        in_window = minutes_remaining >= (15 - VALUE_HUNTER_WINDOW_MINUTES)
 
         # Contract count check
         existing = self.ticker_contracts.get(ticker, 0)
-        if existing >= MAX_CONTRACTS_PER_MARKET:
-            return
+        at_max = existing >= MAX_CONTRACTS_PER_MARKET
 
         # Fade signal check
         fade_signal = self.get_fade_signal(self.settlement_history[coin])
-        if not fade_signal:
-            return
 
         # Price check from WS cache
         prices = self.ws_prices.get(ticker)
         if not prices:
             return
-
         yes_ask = prices.get("yes_ask")
         yes_bid = prices.get("yes_bid")
         if yes_ask is None or yes_bid is None:
             return
-
-        yes_cost = yes_ask  # cents
+        yes_cost = yes_ask
         no_cost = 100 - yes_bid if yes_bid else None
         if no_cost is None:
             return
 
-        decision = None
-        entry_price = None
+        # Determine target side and current market price
+        target_side = None
+        market_price = None
+        if fade_signal == "buy_yes":
+            target_side = "yes"
+            market_price = yes_cost
+        elif fade_signal == "buy_no":
+            target_side = "no"
+            market_price = no_cost
 
-        if fade_signal == "buy_yes" and ENTRY_LOW <= yes_cost <= ENTRY_HIGH:
-            decision = "BUY YES"
-            entry_price = yes_cost
-        elif fade_signal == "buy_no" and ENTRY_LOW <= no_cost <= ENTRY_HIGH:
-            decision = "BUY NO"
-            entry_price = no_cost
+        # Check if we have a resting buy for this ticker
+        resting = self.resting_buys.get(ticker)
 
-        if not decision:
+        # Cancel resting buy if outside window, at max, or no fade signal
+        if resting and (not in_window or at_max or not fade_signal):
+            self._cancel_order(resting["order_id"], ticker, "buy window closed")
+            del self.resting_buys[ticker]
             return
 
-        # Execute
-        side = "yes" if decision == "BUY YES" else "no"
+        # No signal or outside window — nothing to do
+        if not fade_signal or not in_window or at_max or not target_side:
+            return
+
+        in_range = ENTRY_LOW <= market_price <= ENTRY_HIGH
+
+        if resting:
+            # Already have a resting buy — drift it down if market dropped
+            if in_range and market_price < resting["price"]:
+                # Market dropped — cancel old, post new at lower price
+                self._cancel_order(resting["order_id"], ticker, f"drift {resting['price']}c→{market_price}c")
+                self._post_buy(ticker, coin, target_side, market_price)
+            elif not in_range:
+                # Price left our range — cancel
+                self._cancel_order(resting["order_id"], ticker, "left range")
+                del self.resting_buys[ticker]
+        else:
+            # No resting buy — post one if in range
+            if in_range:
+                self._post_buy(ticker, coin, target_side, market_price)
+
+    def _post_buy(self, ticker, coin, side, price):
+        """Post a resting limit buy order."""
         client_order_id = f"fade-{side}-{ticker}-{int(time.time())}"
-        hist = self.settlement_history[coin][-FADE_WINDOW:]
+        hist = self.settlement_history.get(coin, [])[-FADE_WINDOW:]
         yes_ct = sum(1 for r in hist if r == "yes")
         fade_str = f"{yes_ct}Y/{FADE_WINDOW - yes_ct}N"
+        decision = f"BUY {side.upper()}"
 
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {coin} | {decision} 1 @ {entry_price}c | Fade: {fade_str} | {ticker}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {coin} | {decision} 1 @ {price}c | Fade: {fade_str} | {ticker}")
 
-        status = "NONE"
         if self.client and not DRY_RUN:
             try:
                 result = self.client.create_order(
@@ -294,36 +336,36 @@ class Crypto15mAgent:
                     action="buy",
                     count=1,
                     type="limit",
-                    yes_price=entry_price if side == "yes" else None,
-                    no_price=entry_price if side == "no" else None,
+                    yes_price=price if side == "yes" else None,
+                    no_price=price if side == "no" else None,
                 )
-                status = "SUCCESS" if result else "FAILED"
-                print(f"  → Buy placed: {status}")
-
-                # Post resting sell at 2x entry if buy succeeded
-                if status == "SUCCESS":
-                    self.positions[ticker].append({"side": side, "entry_price": entry_price})
-                    self._post_resting_sell(ticker, coin, side, entry_price)
-
+                self.resting_buys[ticker] = {"order_id": client_order_id, "side": side, "price": price, "coin": coin}
+                print(f"  → Resting buy posted: {price}c")
             except Exception as e:
-                print(f"  → Order error: {e}")
-                status = "ERROR"
+                print(f"  → Buy error: {e}")
         elif DRY_RUN:
-            self.mock_balance -= entry_price / 100.0
-            status = "MOCK"
-            mult = 3 if entry_price < 20 else EXIT_MULTIPLIER
-            print(f"  📄 PAPER: {decision} 1 @ {entry_price}c → resting sell @ {min(entry_price * mult, 95)}c ({mult}x)")
-            self.positions[ticker].append({"side": side, "entry_price": entry_price})
-        else:
-            status = "NO_CLIENT"
-
-        self.ticker_contracts[ticker] = existing + 1
+            self.resting_buys[ticker] = {"order_id": client_order_id, "side": side, "price": price, "coin": coin}
+            mult = 3 if price < 20 else EXIT_MULTIPLIER
+            print(f"  📄 PAPER: {decision} 1 @ {price}c → sell @ {min(price * mult, 95)}c ({mult}x)")
 
         with open(self.log_file, "a", newline="") as f:
             csv.writer(f).writerow([
                 datetime.now().strftime("%H:%M:%S"), coin, ticker,
-                yes_cost, no_cost, decision, entry_price, fade_str, status
+                "—", "—", decision, price, fade_str, "RESTING"
             ])
+
+    def _cancel_order(self, order_id, ticker, reason=""):
+        """Cancel a resting order."""
+        if self.client and not DRY_RUN:
+            try:
+                self.client.cancel_order(order_id)
+                print(f"  ✗ Cancelled {order_id[:20]}... ({reason})")
+            except Exception as e:
+                print(f"  ✗ Cancel error: {e}")
+        else:
+            print(f"  ✗ PAPER cancel {order_id[:20]}... ({reason})")
+        if ticker in self.resting_buys:
+            del self.resting_buys[ticker]
 
     def _post_resting_sell(self, ticker, coin, side, entry_price):
         """Post a resting sell order at 2x (or 3x if <20c). Never sell more than held."""
