@@ -311,7 +311,8 @@ class Crypto15mAgent:
         elif DRY_RUN:
             self.mock_balance -= entry_price / 100.0
             status = "MOCK"
-            print(f"  📄 PAPER: {decision} 1 @ {entry_price}c → resting sell @ {min(entry_price * EXIT_MULTIPLIER, 95)}c")
+            mult = 3 if entry_price < 20 else EXIT_MULTIPLIER
+            print(f"  📄 PAPER: {decision} 1 @ {entry_price}c → resting sell @ {min(entry_price * mult, 95)}c ({mult}x)")
             self.positions[ticker].append({"side": side, "entry_price": entry_price})
         else:
             status = "NO_CLIENT"
@@ -325,8 +326,9 @@ class Crypto15mAgent:
             ])
 
     def _post_resting_sell(self, ticker, coin, side, entry_price):
-        """Post a resting sell order at 2x entry. Never sell more than held."""
-        sell_price = min(entry_price * EXIT_MULTIPLIER, 95)  # cap at 95c
+        """Post a resting sell order at 2x (or 3x if <20c). Never sell more than held."""
+        multiplier = 3 if entry_price < 20 else EXIT_MULTIPLIER
+        sell_price = min(entry_price * multiplier, 95)  # cap at 95c
 
         # Safety: never post more sells than contracts held
         held = len(self.positions.get(ticker, []))
