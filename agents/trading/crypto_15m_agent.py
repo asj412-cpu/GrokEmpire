@@ -241,26 +241,22 @@ class Crypto15mAgent:
                 else:
                     min_distance = current_price * BASE_DIST_PCT[15] * scale
 
-                # === VALUE HUNTER LAYER (first 0-5 minutes of cycle ONLY) ===
+                # === VALUE HUNTER LAYER (first 8 minutes of cycle ONLY) ===
+                # Buy the CHEAP contract on the side that momentum favors
+                # Price > strike → momentum up → buy YES while YES is still cheap
+                # Price < strike → momentum down → buy NO while NO is still cheap
                 if minutes_remaining >= (15 - VALUE_HUNTER_WINDOW_MINUTES):
-                    if VALUE_LOW <= mid <= VALUE_HIGH:
-                        # Buy the cheap side that aligns with current price action vs strike
-                        if current_price > strike and mid <= VALUE_HIGH:   # YES is undervalued while price is already above strike
-                            decision = "BUY YES"
-                            decision_type = "VALUE"
-                        elif current_price < strike and mid <= VALUE_HIGH:  # NO is undervalued while price is below strike
-                            decision = "BUY NO"
-                            decision_type = "VALUE"
-                        elif mid < 0.33:  # fallback – buy the cheaper contract in value zone
-                            decision = "BUY NO"
-                            decision_type = "VALUE"
-                        else:
-                            decision = "BUY YES"
-                            decision_type = "VALUE"
+                    yes_cost = int(round(yes_ask * 100))
+                    no_cost = int(round((1.0 - yes_bid) * 100))
 
-                        # Set entry price
-                        entry_price = int(round(yes_ask * 100)) if decision == "BUY YES" else int(round((1.0 - yes_bid) * 100))
-                        entry_price = max(1, min(90, entry_price))
+                    if current_price > strike and VALUE_LOW * 100 <= yes_cost <= VALUE_HIGH * 100:
+                        decision = "BUY YES"
+                        decision_type = "VALUE"
+                        entry_price = yes_cost
+                    elif current_price < strike and VALUE_LOW * 100 <= no_cost <= VALUE_HIGH * 100:
+                        decision = "BUY NO"
+                        decision_type = "VALUE"
+                        entry_price = no_cost
 
                 # Price guards (real-money safety – never removed)
                 if mid >= 0.88:
@@ -292,7 +288,7 @@ class Crypto15mAgent:
             AVG_WIN = 40
             AVG_LOSS = 25
             kelly = (WIN_RATE * AVG_WIN - (1 - WIN_RATE) * AVG_LOSS) / AVG_WIN * 0.25
-            contracts = max(1, int(riskable * risk_mult * kelly)) if riskable > 0 else 0
+            contracts = 1  # capped at 1 per trade while monitoring
 
             full_decision = f"{decision_type} {decision}" if decision != "HOLD" else "HOLD"
 
@@ -309,8 +305,8 @@ class Crypto15mAgent:
                     benchmark, strike_vs_benchmark, cycle_profitable
                 ])
 
-            # REAL TRADE TRIGGER – all coins, no gates
-            if decision in ("BUY YES", "BUY NO") and riskable > 0:
+            # REAL TRADE TRIGGER – 1 contract per ticker per cycle, skip if already traded
+            if decision in ("BUY YES", "BUY NO") and riskable > 0 and ticker not in self.entries:
                 side = "yes" if decision == "BUY YES" else "no"
                 client_order_id = f"cr15m-{side}-{ticker}-{int(time.time())}"
 
