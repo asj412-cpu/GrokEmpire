@@ -241,18 +241,8 @@ class Crypto15mAgent:
                 else:
                     min_distance = current_price * BASE_DIST_PCT[15] * scale
 
-                # === MOMENTUM LAYER (any time in cycle) ===
-                if mid <= th["no"] and volume >= th["min_vol"]:
-                    decision = "BUY NO"
-                    entry_price = int(round((1.0 - yes_bid) * 100))
-                    entry_price = max(1, min(90, entry_price))
-                elif mid >= th["yes"] and distance > min_distance:
-                    decision = "BUY YES"
-                    entry_price = int(round(yes_ask * 100))
-                    entry_price = max(1, min(90, entry_price))
-
                 # === VALUE HUNTER LAYER (first 0-5 minutes of cycle ONLY) ===
-                if decision == "HOLD" and minutes_remaining >= (15 - VALUE_HUNTER_WINDOW_MINUTES):
+                if minutes_remaining >= (15 - VALUE_HUNTER_WINDOW_MINUTES):
                     if VALUE_LOW <= mid <= VALUE_HIGH:
                         # Buy the cheap side that aligns with current price action vs strike
                         if current_price > strike and mid <= VALUE_HIGH:   # YES is undervalued while price is already above strike
@@ -327,7 +317,16 @@ class Crypto15mAgent:
                 print(f"[LIVE] {full_decision} {contracts} @ {entry_price}¢ on {coin_name} | ID: {client_order_id}")
 
                 if self.client and not DRY_RUN:
-                    result = self.client.place_order(ticker, side, contracts, price=entry_price)
+                    result = self.client.create_order(
+                        ticker=ticker,
+                        client_order_id=client_order_id,
+                        side=side,
+                        action="buy",
+                        count=contracts,
+                        type="limit",
+                        yes_price=entry_price if side == "yes" else None,
+                        no_price=entry_price if side == "no" else None,
+                    )
                     status = "SUCCESS" if result else "FAILED"
                 elif DRY_RUN:
                     print(f"   📄 PAPER: {full_decision} {contracts} @ {entry_price}c")
