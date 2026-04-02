@@ -10,3 +10,7 @@ requests
 fredapi
 httpx
 python-dateutil
+yfinance
+duckduckgo-search
+beautifulsoup4
+lxml
