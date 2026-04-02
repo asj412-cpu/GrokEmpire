@@ -182,18 +182,16 @@ class Crypto15mAgent:
             msg = data.get("msg", {})
             ticker = msg.get("market_ticker")
             if ticker:
+                # WS sends dollar strings like "0.5500" — convert to cents
+                try:
+                    yes_bid = int(float(msg.get("yes_bid_dollars", "0")) * 100)
+                    yes_ask = int(float(msg.get("yes_ask_dollars", "0")) * 100)
+                except (ValueError, TypeError):
+                    yes_bid = yes_ask = 0
                 self.ws_prices[ticker] = {
-                    "yes_bid": msg.get("yes_bid"),
-                    "yes_ask": msg.get("yes_ask"),
-                    "no_bid": msg.get("no_bid"),
-                    "no_ask": msg.get("no_ask"),
+                    "yes_bid": yes_bid,
+                    "yes_ask": yes_ask,
                 }
-                # Log first update per ticker to verify data format
-                if not hasattr(self, '_debug_logged'):
-                    self._debug_logged = set()
-                if ticker not in self._debug_logged:
-                    self._debug_logged.add(ticker)
-                    print(f"  🔍 WS RAW: {ticker} → {msg}")
                 # Evaluate trade on every price update
                 await self._evaluate_trade(ticker)
 
