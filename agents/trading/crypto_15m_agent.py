@@ -87,8 +87,10 @@ class Crypto15mAgent:
         self.last_balance = 0.0
         self.mock_balance = 1000.0
 
-        # Per-coin rolling settlement history (deque of "yes"/"no")
+        # Per-coin rolling settlement history (list of "yes"/"no")
         self.settlement_history = {coin: [] for coin in COINS}
+        self.last_settled_ticker = {coin: None for coin in COINS}
+        self.history_seeded = False
         # Per-ticker: how many contracts already placed this market
         self.ticker_contracts = {}
 
@@ -132,16 +134,48 @@ class Crypto15mAgent:
             print(f"Balance error: {e}")
             return self.last_balance
 
-    def fetch_settlement_history(self, series):
-        """Fetch last FADE_WINDOW settled markets for rolling history."""
+    def seed_settlement_history(self):
+        """One-time: fetch last FADE_WINDOW settled markets per coin at startup."""
+        if not self.client:
+            self.history_seeded = True
+            return
+        for coin_name, series in COINS.items():
+            try:
+                data = self.client.get_markets(series_ticker=series, status="settled", limit=FADE_WINDOW)
+                markets = data.get("markets", [])
+                markets.sort(key=lambda m: m.get("close_time", ""))
+                self.settlement_history[coin_name] = [m.get("result", "") for m in markets]
+                if markets:
+                    self.last_settled_ticker[coin_name] = markets[-1].get("ticker")
+                print(f"  {coin_name}: seeded {len(self.settlement_history[coin_name])} settlements → {self.settlement_history[coin_name]}")
+            except Exception as e:
+                print(f"  {coin_name}: seed error ({e})")
+        self.history_seeded = True
+
+    def check_new_settlement(self, coin_name, series):
+        """Check if a new market settled since last check. If so, append to history."""
+        if not self.client:
+            return
         try:
-            data = self.client.get_markets(series_ticker=series, status="settled", limit=FADE_WINDOW)
+            data = self.client.get_markets(series_ticker=series, status="settled", limit=1)
             markets = data.get("markets", [])
-            markets.sort(key=lambda m: m.get("close_time", ""))
-            return [m.get("result", "") for m in markets]
-        except Exception as e:
-            print(f"Settlement history error: {e}")
-            return []
+            if not markets:
+                return
+            latest = markets[0]
+            latest_ticker = latest.get("ticker")
+            if latest_ticker and latest_ticker != self.last_settled_ticker.get(coin_name):
+                result = latest.get("result", "")
+                if result:
+                    self.settlement_history[coin_name].append(result)
+                    # Keep only last FADE_WINDOW * 2 to avoid unbounded growth
+                    if len(self.settlement_history[coin_name]) > FADE_WINDOW * 2:
+                        self.settlement_history[coin_name] = self.settlement_history[coin_name][-FADE_WINDOW * 2:]
+                    self.last_settled_ticker[coin_name] = latest_ticker
+                    hist = self.settlement_history[coin_name][-FADE_WINDOW:]
+                    yes_ct = sum(1 for r in hist if r == "yes")
+                    print(f"  📊 {coin_name} settled {result.upper()} → rolling: {yes_ct}Y/{FADE_WINDOW - yes_ct}N")
+        except Exception:
+            pass
 
     def get_fade_signal(self, history):
         """
@@ -162,6 +196,11 @@ class Crypto15mAgent:
         return None
 
     async def kalshi_discovery(self):
+        # Seed settlement history once at startup
+        if not self.history_seeded:
+            print("Seeding settlement history...")
+            self.seed_settlement_history()
+
         balance = self.get_balance() or self.last_balance
         if balance > self.current_cash_floor:
             new_floor = balance * RATCHET_PERCENT
@@ -209,10 +248,8 @@ class Crypto15mAgent:
             no_cost = int(round((1.0 - yes_bid) * 100))
             minutes_remaining = 15 - (datetime.now().minute % 15)
 
-            # Fetch settlement history for this coin
-            if self.client:
-                history = self.fetch_settlement_history(series)
-                self.settlement_history[coin_name] = history
+            # Check for new settlement (1 API call, not full history)
+            self.check_new_settlement(coin_name, series)
 
             fade_signal = self.get_fade_signal(self.settlement_history[coin_name])
 
