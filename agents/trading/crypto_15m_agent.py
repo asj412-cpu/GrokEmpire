@@ -1,21 +1,26 @@
 """
-Crypto 15m Agent — Mean-Reversion Fade Strategy
-================================================
-8/10 rolling settlement fade + cheap contract entry (12-54c).
-Hold to settlement. Max 2 contracts per market (average down once).
+Crypto 15m Agent — Mean-Reversion Fade + Kalshi WebSocket
+=========================================================
+6/10 rolling settlement fade + cheap contract entry (5-40c).
+Uses Kalshi WebSocket for real-time prices — reacts instantly to dips.
+Max 2 contracts per market. Hold to settlement.
 """
 
 import asyncio
 import os
 import csv
 import time
-import random
-from datetime import datetime
-import websockets
 import json
-import ccxt
+import base64
+from datetime import datetime
+from typing import Dict, Optional, Set
+from collections import defaultdict
+
+import websockets
 from kalshi_client.client import KalshiClient
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.backends import default_backend
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -30,7 +35,7 @@ ENTRY_HIGH = 40  # max entry price in cents
 FADE_THRESHOLD = 6  # out of 10 rolling cycles
 FADE_WINDOW = 10
 MAX_CONTRACTS_PER_MARKET = 2
-VALUE_HUNTER_WINDOW_MINUTES = 8  # first 8 min of cycle
+VALUE_HUNTER_WINDOW_MINUTES = 8
 
 COINS = {
     "BTC": "KXBTC15M",
@@ -42,100 +47,261 @@ COINS = {
     "DOGE": "KXDOGE15M",
 }
 
-COINBASE_PRODUCTS = {
-    "BTC": "BTC-USD",
-    "ETH": "ETH-USD",
-    "SOL": "SOL-USD",
-    "XRP": "XRP-USD",
-    "BNB": "BNB-USD",
-    "HYPE": "HYPE-USD",
-    "DOGE": "DOGE-USD",
-}
-
-EXCHANGE = ccxt.coinbase()
+KALSHI_WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
 
 class Crypto15mAgent:
     def __init__(self):
-        key_id = os.getenv("KALSHI_KEY_ID")
-        private_key_env = os.getenv("KALSHI_PRIVATE_KEY")
+        self.key_id = os.getenv("KALSHI_KEY_ID")
+        self.private_key_path = os.getenv("KALSHI_PRIVATE_KEY")
         self.client = None
-        if key_id and private_key_env and not DRY_RUN:
+
+        if self.key_id and self.private_key_path and not DRY_RUN:
             try:
                 from kalshi_client.utils import load_private_key_from_file
-                if os.path.exists(private_key_env):
-                    priv_obj = load_private_key_from_file(private_key_env)
+                if os.path.exists(self.private_key_path):
+                    priv_obj = load_private_key_from_file(self.private_key_path)
                 else:
-                    priv_obj = private_key_env
+                    priv_obj = self.private_key_path
                 self.client = KalshiClient(
-                    key_id=key_id,
+                    key_id=self.key_id,
                     private_key=priv_obj,
-                    exchange_api_base='https://api.elections.kalshi.com/trade-api/v2'
+                    exchange_api_base=KALSHI_API_BASE
                 )
                 print("🔥 LIVE Kalshi client ready")
             except Exception as e:
                 print(f"Kalshi client init failed ({e}) – dry-run mode")
-                self.client = None
         else:
             print("DRY_RUN or missing keys – paper mode")
 
         self.running = True
-        self.exchange = ccxt.coinbase()
-        self.prices = {coin: None for coin in COINS}
         self.log_file = "15m_signals.csv"
         self.current_cash_floor = BASE_CASH_FLOOR
         self.last_balance = 0.0
         self.mock_balance = 1000.0
 
-        # Per-coin rolling settlement history (list of "yes"/"no")
-        self.settlement_history = {coin: [] for coin in COINS}
-        self.last_settled_ticker = {coin: None for coin in COINS}
+        # Settlement history per coin
+        self.settlement_history: Dict[str, list] = {coin: [] for coin in COINS}
+        self.last_settled_ticker: Dict[str, str] = {}
         self.history_seeded = False
-        # Per-ticker: how many contracts already placed this market
-        self.ticker_contracts = {}
+
+        # Per-ticker contract count (max 2)
+        self.ticker_contracts: Dict[str, int] = {}
+
+        # Current open market tickers per coin
+        self.current_tickers: Dict[str, str] = {}
+
+        # Kalshi WS ticker cache: ticker -> {yes_bid, yes_ask, ...}
+        self.ws_prices: Dict[str, dict] = {}
+        self.ws_connected = False
 
         if not os.path.exists(self.log_file):
             with open(self.log_file, "w", newline="") as f:
                 csv.writer(f).writerow([
-                    "timestamp", "coin", "ticker", "mid", "decision",
-                    "entry_price", "contracts", "fade_signal", "status"
+                    "timestamp", "coin", "ticker", "yes_cost", "no_cost",
+                    "decision", "entry_price", "fade_signal", "status"
                 ])
 
-    async def coinbase_websocket(self):
+    # ─── Kalshi WebSocket ─────────────────────────────────────
+
+    def _generate_ws_signature(self, timestamp_ms: int) -> str:
+        with open(self.private_key_path, 'rb') as f:
+            private_key = serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
+        message = f"{timestamp_ms}GET/trade-api/ws/v2"
+        signature = private_key.sign(
+            message.encode('utf-8'),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            hashes.SHA256()
+        )
+        return base64.b64encode(signature).decode('utf-8')
+
+    async def kalshi_websocket(self):
+        """Connect to Kalshi WS, subscribe to open 15m markets, react to price updates."""
         while self.running:
             try:
-                async with websockets.connect("wss://ws-feed.exchange.coinbase.com") as ws:
-                    await ws.send(json.dumps({
-                        "type": "subscribe",
-                        "product_ids": list(COINBASE_PRODUCTS.values()),
-                        "channels": ["ticker"],
-                    }))
-                    print("✅ Coinbase WS connected")
+                timestamp_ms = int(time.time() * 1000)
+                sig = self._generate_ws_signature(timestamp_ms)
+                headers = {
+                    "KALSHI-ACCESS-KEY": self.key_id,
+                    "KALSHI-ACCESS-SIGNATURE": sig,
+                    "KALSHI-ACCESS-TIMESTAMP": str(timestamp_ms),
+                }
+
+                async with websockets.connect(KALSHI_WS_URL, additional_headers=headers, ping_interval=30, ping_timeout=10) as ws:
+                    self.ws_connected = True
+                    self.ws = ws
+                    print("✅ Kalshi WS connected")
+
+                    # Subscribe to fills
+                    await ws.send(json.dumps({"id": 1, "cmd": "subscribe", "params": {"channels": ["fill"]}}))
+
+                    # Subscribe to current open market tickers
+                    await self._subscribe_open_markets()
+
                     async for msg in ws:
-                        data = json.loads(msg)
-                        if data.get("type") == "ticker":
-                            product = data.get("product_id")
-                            price = data.get("price")
-                            if price:
-                                for coin, prod in COINBASE_PRODUCTS.items():
-                                    if prod == product:
-                                        self.prices[coin] = float(price)
+                        try:
+                            data = json.loads(msg)
+                            await self._handle_ws_message(data)
+                        except Exception as e:
+                            print(f"WS msg error: {e}")
+
             except Exception as e:
-                print(f"WS error: {e}, reconnecting...")
+                print(f"Kalshi WS error: {e}, reconnecting...")
+                self.ws_connected = False
                 await asyncio.sleep(5)
 
-    def get_balance(self):
+    async def _subscribe_open_markets(self):
+        """Find open markets for all coins and subscribe to their tickers."""
         if not self.client:
-            return self.mock_balance if DRY_RUN else 0.0
-        try:
-            data = self.client.get_balance()
-            return data.get("balance", 0) / 100.0
-        except Exception as e:
-            print(f"Balance error: {e}")
-            return self.last_balance
+            return
+        tickers = []
+        for coin, series in COINS.items():
+            try:
+                data = self.client.get_markets(series_ticker=series, status="open", limit=1)
+                for m in data.get("markets", []):
+                    ticker = m.get("ticker")
+                    if ticker:
+                        self.current_tickers[coin] = ticker
+                        tickers.append(ticker)
+            except Exception as e:
+                print(f"  Open market lookup error {coin}: {e}")
+
+        if tickers and self.ws_connected:
+            await self.ws.send(json.dumps({
+                "id": 2,
+                "cmd": "subscribe",
+                "params": {"channels": ["ticker"], "market_tickers": tickers}
+            }))
+            print(f"📡 Subscribed to {len(tickers)} market tickers: {', '.join(tickers[-3:])}")
+
+    async def _handle_ws_message(self, data):
+        msg_type = data.get("type")
+
+        if msg_type == "ticker":
+            msg = data.get("msg", {})
+            ticker = msg.get("market_ticker")
+            if ticker:
+                self.ws_prices[ticker] = {
+                    "yes_bid": msg.get("yes_bid"),
+                    "yes_ask": msg.get("yes_ask"),
+                    "no_bid": msg.get("no_bid"),
+                    "no_ask": msg.get("no_ask"),
+                }
+                # Evaluate trade on every price update
+                await self._evaluate_trade(ticker)
+
+        elif msg_type == "fill":
+            msg = data.get("msg", {})
+            ticker = msg.get("market_ticker", "")
+            side = msg.get("side", "")
+            price = msg.get("yes_price", 0)
+            count = msg.get("count", 0)
+            print(f"  💰 FILL: {ticker} {side} {count}x @ {price}c")
+
+        elif msg_type == "subscribed":
+            channel = data.get("msg", {}).get("channel", "")
+            print(f"  WS subscribed: {channel}")
+
+    async def _evaluate_trade(self, ticker):
+        """Called on every WS price update — check if we should buy."""
+        # Find which coin this ticker belongs to
+        coin = None
+        for c, t in self.current_tickers.items():
+            if t == ticker:
+                coin = c
+                break
+        if not coin:
+            return
+
+        # Time window check
+        minutes_remaining = 15 - (datetime.now().minute % 15)
+        if minutes_remaining < (15 - VALUE_HUNTER_WINDOW_MINUTES):
+            return
+
+        # Contract count check
+        existing = self.ticker_contracts.get(ticker, 0)
+        if existing >= MAX_CONTRACTS_PER_MARKET:
+            return
+
+        # Fade signal check
+        fade_signal = self.get_fade_signal(self.settlement_history[coin])
+        if not fade_signal:
+            return
+
+        # Price check from WS cache
+        prices = self.ws_prices.get(ticker)
+        if not prices:
+            return
+
+        yes_ask = prices.get("yes_ask")
+        yes_bid = prices.get("yes_bid")
+        if yes_ask is None or yes_bid is None:
+            return
+
+        yes_cost = yes_ask  # cents
+        no_cost = 100 - yes_bid if yes_bid else None
+        if no_cost is None:
+            return
+
+        decision = None
+        entry_price = None
+
+        if fade_signal == "buy_yes" and ENTRY_LOW <= yes_cost <= ENTRY_HIGH:
+            decision = "BUY YES"
+            entry_price = yes_cost
+        elif fade_signal == "buy_no" and ENTRY_LOW <= no_cost <= ENTRY_HIGH:
+            decision = "BUY NO"
+            entry_price = no_cost
+
+        if not decision:
+            return
+
+        # Execute
+        side = "yes" if decision == "BUY YES" else "no"
+        client_order_id = f"fade-{side}-{ticker}-{int(time.time())}"
+        hist = self.settlement_history[coin][-FADE_WINDOW:]
+        yes_ct = sum(1 for r in hist if r == "yes")
+        fade_str = f"{yes_ct}Y/{FADE_WINDOW - yes_ct}N"
+
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {coin} | {decision} 1 @ {entry_price}c | Fade: {fade_str} | {ticker}")
+
+        status = "NONE"
+        if self.client and not DRY_RUN:
+            try:
+                result = self.client.create_order(
+                    ticker=ticker,
+                    client_order_id=client_order_id,
+                    side=side,
+                    action="buy",
+                    count=1,
+                    type="limit",
+                    yes_price=entry_price if side == "yes" else None,
+                    no_price=entry_price if side == "no" else None,
+                )
+                status = "SUCCESS" if result else "FAILED"
+                print(f"  → Order placed: {status}")
+            except Exception as e:
+                print(f"  → Order error: {e}")
+                status = "ERROR"
+        elif DRY_RUN:
+            self.mock_balance -= entry_price / 100.0
+            status = "MOCK"
+            print(f"  📄 PAPER: {decision} 1 @ {entry_price}c")
+        else:
+            status = "NO_CLIENT"
+
+        self.ticker_contracts[ticker] = existing + 1
+
+        with open(self.log_file, "a", newline="") as f:
+            csv.writer(f).writerow([
+                datetime.now().strftime("%H:%M:%S"), coin, ticker,
+                yes_cost, no_cost, decision, entry_price, fade_str, status
+            ])
+
+    # ─── Settlement History ───────────────────────────────────
 
     def seed_open_positions(self):
-        """Seed ticker_contracts from existing Kalshi positions to survive restarts."""
         if not self.client:
             return
         try:
@@ -145,7 +311,6 @@ class Crypto15mAgent:
                 count = int(float(p.get("total_cost_shares_fp", 0)))
                 if count <= 0:
                     continue
-                # Match any 15m crypto event — store all market tickers for this event
                 for series in COINS.values():
                     if event_ticker.startswith(series):
                         try:
@@ -162,7 +327,6 @@ class Crypto15mAgent:
             print(f"  Position seed error: {e}")
 
     def seed_settlement_history(self):
-        """One-time: fetch last FADE_WINDOW settled markets per coin at startup."""
         self.seed_open_positions()
         if not self.client:
             self.history_seeded = True
@@ -175,13 +339,12 @@ class Crypto15mAgent:
                 self.settlement_history[coin_name] = [m.get("result", "") for m in markets]
                 if markets:
                     self.last_settled_ticker[coin_name] = markets[-1].get("ticker")
-                print(f"  {coin_name}: seeded {len(self.settlement_history[coin_name])} settlements → {self.settlement_history[coin_name]}")
+                print(f"  {coin_name}: seeded {len(self.settlement_history[coin_name])} → {self.settlement_history[coin_name]}")
             except Exception as e:
                 print(f"  {coin_name}: seed error ({e})")
         self.history_seeded = True
 
     def check_new_settlement(self, coin_name, series):
-        """Check if a new market settled since last check. If so, append to history."""
         if not self.client:
             return
         try:
@@ -195,170 +358,95 @@ class Crypto15mAgent:
                 result = latest.get("result", "")
                 if result:
                     self.settlement_history[coin_name].append(result)
-                    # Keep only last FADE_WINDOW * 2 to avoid unbounded growth
                     if len(self.settlement_history[coin_name]) > FADE_WINDOW * 2:
                         self.settlement_history[coin_name] = self.settlement_history[coin_name][-FADE_WINDOW * 2:]
                     self.last_settled_ticker[coin_name] = latest_ticker
                     hist = self.settlement_history[coin_name][-FADE_WINDOW:]
                     yes_ct = sum(1 for r in hist if r == "yes")
-                    print(f"  📊 {coin_name} settled {result.upper()} → rolling: {yes_ct}Y/{FADE_WINDOW - yes_ct}N")
+                    print(f"  📊 {coin_name} settled {result.upper()} → {yes_ct}Y/{FADE_WINDOW - yes_ct}N")
         except Exception:
             pass
 
     def get_fade_signal(self, history):
-        """
-        Returns 'buy_yes', 'buy_no', or None.
-        8/10 NO → fade → buy YES
-        8/10 YES → fade → buy NO
-        """
         if len(history) < FADE_WINDOW:
             return None
         recent = history[-FADE_WINDOW:]
         yes_count = sum(1 for r in recent if r == "yes")
         no_count = FADE_WINDOW - yes_count
-
         if no_count >= FADE_THRESHOLD:
             return "buy_yes"
         elif yes_count >= FADE_THRESHOLD:
             return "buy_no"
         return None
 
-    async def kalshi_discovery(self):
-        # Seed settlement history once at startup
-        if not self.history_seeded:
-            print("Seeding settlement history...")
-            self.seed_settlement_history()
+    # ─── Periodic Tasks ───────────────────────────────────────
 
-        balance = self.get_balance() or self.last_balance
-        if balance > self.current_cash_floor:
-            new_floor = balance * RATCHET_PERCENT
-            if new_floor > self.current_cash_floor:
-                self.current_cash_floor = new_floor
-        self.last_balance = balance
+    async def settlement_check_loop(self):
+        """Every 30s: check for new settlements and refresh open market subscriptions."""
+        while self.running:
+            try:
+                for coin, series in COINS.items():
+                    self.check_new_settlement(coin, series)
 
-        # Ensure live prices if WS not yet connected
-        if not any(self.prices.values()):
-            for coin in COINS:
-                try:
-                    self.prices[coin] = self.exchange.fetch_ticker(COINBASE_PRODUCTS[coin])['last']
-                except Exception:
-                    pass
+                # Re-subscribe if markets rotated (new 15-min window)
+                if self.ws_connected:
+                    await self._subscribe_open_markets()
 
-        for coin_name, series in COINS.items():
-            if not self.prices.get(coin_name):
-                continue
+                # Balance ratchet
+                balance = self.get_balance() or self.last_balance
+                if balance > self.current_cash_floor:
+                    new_floor = balance * RATCHET_PERCENT
+                    if new_floor > self.current_cash_floor:
+                        self.current_cash_floor = new_floor
+                self.last_balance = balance
 
-            # Get open market
-            if self.client:
-                try:
-                    data = self.client.get_markets(series_ticker=series, status="open", limit=1)
-                except Exception as e:
-                    print(f"Error {coin_name}: {e}")
-                    continue
-            else:
-                data = {"markets": [{"ticker": f"{series}-MOCK",
-                    "yes_bid_dollars": random.uniform(0.15, 0.85),
-                    "yes_ask_dollars": random.uniform(0.15, 0.85) + 0.01,
-                    "volume_fp": 50000}]}
+                # Log status every cycle
+                minutes_remaining = 15 - (datetime.now().minute % 15)
+                active_fades = []
+                for coin in COINS:
+                    sig = self.get_fade_signal(self.settlement_history[coin])
+                    if sig:
+                        hist = self.settlement_history[coin][-FADE_WINDOW:]
+                        yes_ct = sum(1 for r in hist if r == "yes")
+                        active_fades.append(f"{coin}:{sig.replace('buy_','').upper()}({yes_ct}Y/{FADE_WINDOW-yes_ct}N)")
 
-            if not data.get("markets"):
-                continue
+                fades_str = " | ".join(active_fades) if active_fades else "none"
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Min left: {minutes_remaining} | Fades: {fades_str} | WS: {'✓' if self.ws_connected else '✗'}")
 
-            m = data["markets"][0]
-            ticker = m.get("ticker")
-            yes_bid = float(m.get("yes_bid_dollars", 0))
-            yes_ask = float(m.get("yes_ask_dollars", 0))
-            if not yes_bid or not yes_ask:
-                continue
+            except Exception as e:
+                print(f"Settlement check error: {e}")
 
-            mid = (yes_bid + yes_ask) / 2
-            yes_cost = int(round(yes_ask * 100))
-            no_cost = int(round((1.0 - yes_bid) * 100))
-            minutes_remaining = 15 - (datetime.now().minute % 15)
+            await asyncio.sleep(30)
 
-            # Check for new settlement (1 API call, not full history)
-            self.check_new_settlement(coin_name, series)
+    def get_balance(self):
+        if not self.client:
+            return self.mock_balance if DRY_RUN else 0.0
+        try:
+            data = self.client.get_balance()
+            return data.get("balance", 0) / 100.0
+        except Exception as e:
+            print(f"Balance error: {e}")
+            return self.last_balance
 
-            fade_signal = self.get_fade_signal(self.settlement_history[coin_name])
-
-            # Only trade in first 8 minutes of cycle
-            if minutes_remaining < (15 - VALUE_HUNTER_WINDOW_MINUTES):
-                fade_signal = None
-
-            # Check how many contracts already on this ticker
-            existing = self.ticker_contracts.get(ticker, 0)
-            if existing >= MAX_CONTRACTS_PER_MARKET:
-                fade_signal = None
-
-            decision = "HOLD"
-            entry_price = None
-
-            if fade_signal == "buy_yes" and ENTRY_LOW <= yes_cost <= ENTRY_HIGH:
-                decision = "BUY YES"
-                entry_price = yes_cost
-            elif fade_signal == "buy_no" and ENTRY_LOW <= no_cost <= ENTRY_HIGH:
-                decision = "BUY NO"
-                entry_price = no_cost
-
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            hist_summary = ""
-            if len(self.settlement_history[coin_name]) >= FADE_WINDOW:
-                recent = self.settlement_history[coin_name][-FADE_WINDOW:]
-                yes_ct = sum(1 for r in recent if r == "yes")
-                hist_summary = f"{yes_ct}Y/{FADE_WINDOW - yes_ct}N"
-
-            print(f"[{timestamp}] {coin_name} | Mid: {mid:.4f} | YES:{yes_cost}c NO:{no_cost}c | Min left: {minutes_remaining} | Fade: {hist_summary} | Decision: {decision}")
-
-            if decision in ("BUY YES", "BUY NO"):
-                side = "yes" if decision == "BUY YES" else "no"
-                client_order_id = f"fade-{side}-{ticker}-{int(time.time())}"
-
-                print(f"  → {decision} 1 @ {entry_price}c | ID: {client_order_id}")
-
-                if self.client and not DRY_RUN:
-                    try:
-                        result = self.client.create_order(
-                            ticker=ticker,
-                            client_order_id=client_order_id,
-                            side=side,
-                            action="buy",
-                            count=1,
-                            type="limit",
-                            yes_price=entry_price if side == "yes" else None,
-                            no_price=entry_price if side == "no" else None,
-                        )
-                        status = "SUCCESS" if result else "FAILED"
-                    except Exception as e:
-                        print(f"  Order error: {e}")
-                        status = "ERROR"
-                elif DRY_RUN:
-                    print(f"  📄 PAPER: {decision} 1 @ {entry_price}c")
-                    self.mock_balance -= entry_price / 100.0
-                    status = "MOCK"
-                else:
-                    status = "NO_CLIENT"
-
-                self.ticker_contracts[ticker] = existing + 1
-
-                with open(self.log_file, "a", newline="") as f:
-                    csv.writer(f).writerow([
-                        timestamp, coin_name, ticker, f"{mid:.4f}", decision,
-                        entry_price, 1, hist_summary, status
-                    ])
+    # ─── Main ─────────────────────────────────────────────────
 
     async def run(self):
         coins_str = ", ".join(COINS.keys())
         print(f"🚀 Crypto 15m Fade Agent — {coins_str}")
         print(f"   Fade: {FADE_THRESHOLD}/{FADE_WINDOW} | Entry: {ENTRY_LOW}-{ENTRY_HIGH}c | Max: {MAX_CONTRACTS_PER_MARKET}/mkt | Window: {VALUE_HUNTER_WINDOW_MINUTES}min")
-        print(f"   DRY_RUN: {DRY_RUN}")
-        asyncio.create_task(self.coinbase_websocket())
+        print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
 
+        print("Seeding settlement history...")
+        self.seed_settlement_history()
+
+        # Launch WS and settlement check as parallel tasks
+        if self.client and self.key_id and self.private_key_path:
+            asyncio.create_task(self.kalshi_websocket())
+        asyncio.create_task(self.settlement_check_loop())
+
+        # Keep main alive
         while self.running:
-            try:
-                await self.kalshi_discovery()
-            except Exception as e:
-                print(f"Cycle error: {e}")
-            await asyncio.sleep(30)
+            await asyncio.sleep(60)
 
 
 async def main():
