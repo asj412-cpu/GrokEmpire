@@ -21,7 +21,7 @@ RISK_MULTIPLIER = 0.08          # base – dynamic engine boosts on value plays
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'  # PRODUCTION DEFAULT = false
 
 # Value Hunter (early-cycle only – first 5 minutes)
-VALUE_HUNTER_WINDOW_MINUTES = 5
+VALUE_HUNTER_WINDOW_MINUTES = 8
 VALUE_LOW = 0.15
 VALUE_HIGH = 0.54
 MAX_RISK_MULTIPLIER = 0.18
