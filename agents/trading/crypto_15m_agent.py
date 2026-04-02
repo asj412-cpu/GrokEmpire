@@ -97,6 +97,7 @@ class Crypto15mAgent:
         self.running = True
         self.exchange = ccxt.coinbase()
         self.prices = {coin: None for coin in COINS}
+        self.prev_result = {}  # per-coin: "yes" or "no" from last settled market
         self.log_file = "15m_signals.csv"
         self.last_traded_ticker = None
         self.current_cash_floor = BASE_CASH_FLOOR
@@ -208,6 +209,15 @@ class Crypto15mAgent:
             if not data.get("markets"):
                 continue
 
+            # Fetch previous cycle settlement for momentum signal
+            if self.client:
+                try:
+                    settled = self.client.get_markets(series_ticker=series, status="settled", limit=1)
+                    if settled.get("markets"):
+                        self.prev_result[coin_name] = settled["markets"][0].get("result", "")
+                except Exception:
+                    pass  # keep last known result
+
             m = data["markets"][0]
             ticker = m.get("ticker")
             yes_bid = float(m.get("yes_bid_dollars", 0))
@@ -242,18 +252,18 @@ class Crypto15mAgent:
                     min_distance = current_price * BASE_DIST_PCT[15] * scale
 
                 # === VALUE HUNTER LAYER (first 8 minutes of cycle ONLY) ===
-                # Buy the CHEAP contract on the side that momentum favors
-                # Price > strike → momentum up → buy YES while YES is still cheap
-                # Price < strike → momentum down → buy NO while NO is still cheap
-                if minutes_remaining >= (15 - VALUE_HUNTER_WINDOW_MINUTES):
+                # Previous cycle settled YES → momentum up → BUY YES if cheap (15-54c)
+                # Previous cycle settled NO → momentum down → BUY NO if cheap (15-54c)
+                prev = self.prev_result.get(coin_name, "")
+                if minutes_remaining >= (15 - VALUE_HUNTER_WINDOW_MINUTES) and prev:
                     yes_cost = int(round(yes_ask * 100))
                     no_cost = int(round((1.0 - yes_bid) * 100))
 
-                    if current_price > strike and VALUE_LOW * 100 <= yes_cost <= VALUE_HIGH * 100:
+                    if prev == "yes" and VALUE_LOW * 100 <= yes_cost <= VALUE_HIGH * 100:
                         decision = "BUY YES"
                         decision_type = "VALUE"
                         entry_price = yes_cost
-                    elif current_price < strike and VALUE_LOW * 100 <= no_cost <= VALUE_HIGH * 100:
+                    elif prev == "no" and VALUE_LOW * 100 <= no_cost <= VALUE_HIGH * 100:
                         decision = "BUY NO"
                         decision_type = "VALUE"
                         entry_price = no_cost
