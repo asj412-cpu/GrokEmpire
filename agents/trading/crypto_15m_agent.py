@@ -147,7 +147,7 @@ class Crypto15mAgent:
                 print("ERROR: No Kalshi client in production mode (DRY_RUN=false)")
                 return 0.0
         try:
-            data = await self.client.get_balance()
+            data = self.client.get_balance()
             balance_cents = data.get("balance", 0) if isinstance(data, dict) else 0
             return balance_cents / 100.0
         except Exception as e:
@@ -184,7 +184,7 @@ class Crypto15mAgent:
 
             if self.client:
                 try:
-                    data = await self.client.get_markets(series_ticker=series, status="open", limit=2)
+                    data = self.client.get_markets(series_ticker=series, status="open", limit=2)
                 except Exception as e:
                     print(f"Error processing {coin_name}: {e}")
                     continue
@@ -327,7 +327,7 @@ class Crypto15mAgent:
                 print(f"[LIVE] {full_decision} {contracts} @ {entry_price}¢ on {coin_name} | ID: {client_order_id}")
 
                 if self.client and not DRY_RUN:
-                    result = await self.client.place_order(ticker, side, contracts, price=entry_price)
+                    result = self.client.place_order(ticker, side, contracts, price=entry_price)
                     status = "SUCCESS" if result else "FAILED"
                 elif DRY_RUN:
                     print(f"   📄 PAPER: {full_decision} {contracts} @ {entry_price}c")
