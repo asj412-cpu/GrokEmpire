@@ -188,6 +188,12 @@ class Crypto15mAgent:
                     "no_bid": msg.get("no_bid"),
                     "no_ask": msg.get("no_ask"),
                 }
+                # Log first update per ticker to verify data format
+                if not hasattr(self, '_debug_logged'):
+                    self._debug_logged = set()
+                if ticker not in self._debug_logged:
+                    self._debug_logged.add(ticker)
+                    print(f"  🔍 WS ticker data: {ticker} yes_bid={msg.get('yes_bid')} yes_ask={msg.get('yes_ask')} no_bid={msg.get('no_bid')} no_ask={msg.get('no_ask')}")
                 # Evaluate trade on every price update
                 await self._evaluate_trade(ticker)
 
