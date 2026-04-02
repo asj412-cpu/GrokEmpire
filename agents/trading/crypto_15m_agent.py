@@ -31,7 +31,7 @@ RATCHET_PERCENT = 0.80
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 
 ENTRY_LOW = 5    # min entry price in cents
-ENTRY_HIGH = 30  # max entry price in cents
+ENTRY_HIGH = 45  # max entry price in cents
 EXIT_MULTIPLIER = 2  # resting sell at 2x entry price
 FADE_THRESHOLD = 6  # out of 10 rolling cycles
 FADE_WINDOW = 10
@@ -345,7 +345,7 @@ class Crypto15mAgent:
                 print(f"  → Buy error: {e}")
         elif DRY_RUN:
             self.resting_buys[ticker] = {"order_id": client_order_id, "side": side, "price": price, "coin": coin}
-            mult = 3 if price < 20 else EXIT_MULTIPLIER
+            mult = 3 if price <= 20 else EXIT_MULTIPLIER
             print(f"  📄 PAPER: {decision} 1 @ {price}c → sell @ {min(price * mult, 95)}c ({mult}x)")
 
         with open(self.log_file, "a", newline="") as f:
@@ -369,7 +369,7 @@ class Crypto15mAgent:
 
     def _post_resting_sell(self, ticker, coin, side, entry_price):
         """Post a resting sell order at 2x (or 3x if <20c). Never sell more than held."""
-        multiplier = 3 if entry_price < 20 else EXIT_MULTIPLIER
+        multiplier = 3 if entry_price <= 20 else EXIT_MULTIPLIER
         sell_price = min(entry_price * multiplier, 95)  # cap at 95c
 
         # Safety: never post more sells than contracts held
