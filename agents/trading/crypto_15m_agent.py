@@ -25,9 +25,9 @@ BASE_CASH_FLOOR = 40.0
 RATCHET_PERCENT = 0.80
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 
-ENTRY_LOW = 12   # min entry price in cents
-ENTRY_HIGH = 54  # max entry price in cents
-FADE_THRESHOLD = 8  # out of 10 rolling cycles
+ENTRY_LOW = 5    # min entry price in cents
+ENTRY_HIGH = 40  # max entry price in cents
+FADE_THRESHOLD = 6  # out of 10 rolling cycles
 FADE_WINDOW = 10
 MAX_CONTRACTS_PER_MARKET = 2
 VALUE_HUNTER_WINDOW_MINUTES = 8  # first 8 min of cycle
