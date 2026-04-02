@@ -31,7 +31,7 @@ RATCHET_PERCENT = 0.80
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 
 ENTRY_LOW = 5    # min entry price in cents
-ENTRY_HIGH = 40  # max entry price in cents
+ENTRY_HIGH = 30  # max entry price in cents
 EXIT_MULTIPLIER = 2  # resting sell at 2x entry price
 FADE_THRESHOLD = 6  # out of 10 rolling cycles
 FADE_WINDOW = 10
