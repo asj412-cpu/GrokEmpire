@@ -134,8 +134,24 @@ class Crypto15mAgent:
             print(f"Balance error: {e}")
             return self.last_balance
 
+    def seed_open_positions(self):
+        """Seed ticker_contracts from existing Kalshi positions to survive restarts."""
+        if not self.client:
+            return
+        try:
+            positions = self.client.get_positions()
+            for p in positions.get("market_positions", []):
+                ticker = p.get("ticker", "")
+                count = abs(int(p.get("position", 0)))
+                if ticker and count > 0:
+                    self.ticker_contracts[ticker] = count
+                    print(f"  📌 Existing position: {ticker} = {count} contracts")
+        except Exception as e:
+            print(f"  Position seed error: {e}")
+
     def seed_settlement_history(self):
         """One-time: fetch last FADE_WINDOW settled markets per coin at startup."""
+        self.seed_open_positions()
         if not self.client:
             self.history_seeded = True
             return
