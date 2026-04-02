@@ -32,6 +32,7 @@ DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 
 ENTRY_LOW = 5    # min entry price in cents
 ENTRY_HIGH = 40  # max entry price in cents
+EXIT_MULTIPLIER = 2  # resting sell at 2x entry price
 FADE_THRESHOLD = 6  # out of 10 rolling cycles
 FADE_WINDOW = 10
 MAX_CONTRACTS_PER_MARKET = 2
@@ -88,6 +89,11 @@ class Crypto15mAgent:
 
         # Per-ticker contract count (max 2)
         self.ticker_contracts: Dict[str, int] = {}
+
+        # Per-ticker: held contracts and resting sell orders
+        # {ticker: [{side, entry_price, sell_order_id, sell_posted}]}
+        self.positions: Dict[str, list] = defaultdict(list)
+        self.resting_sells: Dict[str, int] = {}  # ticker -> count of resting sell orders
 
         # Current open market tickers per coin
         self.current_tickers: Dict[str, str] = {}
@@ -199,9 +205,17 @@ class Crypto15mAgent:
             msg = data.get("msg", {})
             ticker = msg.get("market_ticker", "")
             side = msg.get("side", "")
+            action = msg.get("action", "")
             price = msg.get("yes_price", 0)
             count = msg.get("count", 0)
-            print(f"  💰 FILL: {ticker} {side} {count}x @ {price}c")
+            print(f"  💰 FILL: {action.upper()} {side.upper()} {ticker} {count}x @ {price}c")
+
+            # Track sell fills — decrement resting sells and positions
+            if action == "sell" and ticker in self.resting_sells:
+                self.resting_sells[ticker] = max(0, self.resting_sells.get(ticker, 0) - 1)
+                if self.positions.get(ticker):
+                    self.positions[ticker].pop(0)  # remove oldest position
+                print(f"  ✅ Exit filled! Resting sells remaining: {self.resting_sells.get(ticker, 0)}")
 
         elif msg_type == "subscribed":
             channel = data.get("msg", {}).get("channel", "")
@@ -284,14 +298,21 @@ class Crypto15mAgent:
                     no_price=entry_price if side == "no" else None,
                 )
                 status = "SUCCESS" if result else "FAILED"
-                print(f"  → Order placed: {status}")
+                print(f"  → Buy placed: {status}")
+
+                # Post resting sell at 2x entry if buy succeeded
+                if status == "SUCCESS":
+                    self.positions[ticker].append({"side": side, "entry_price": entry_price})
+                    self._post_resting_sell(ticker, coin, side, entry_price)
+
             except Exception as e:
                 print(f"  → Order error: {e}")
                 status = "ERROR"
         elif DRY_RUN:
             self.mock_balance -= entry_price / 100.0
             status = "MOCK"
-            print(f"  📄 PAPER: {decision} 1 @ {entry_price}c")
+            print(f"  📄 PAPER: {decision} 1 @ {entry_price}c → resting sell @ {min(entry_price * EXIT_MULTIPLIER, 95)}c")
+            self.positions[ticker].append({"side": side, "entry_price": entry_price})
         else:
             status = "NO_CLIENT"
 
@@ -302,6 +323,34 @@ class Crypto15mAgent:
                 datetime.now().strftime("%H:%M:%S"), coin, ticker,
                 yes_cost, no_cost, decision, entry_price, fade_str, status
             ])
+
+    def _post_resting_sell(self, ticker, coin, side, entry_price):
+        """Post a resting sell order at 2x entry. Never sell more than held."""
+        sell_price = min(entry_price * EXIT_MULTIPLIER, 95)  # cap at 95c
+
+        # Safety: never post more sells than contracts held
+        held = len(self.positions.get(ticker, []))
+        existing_sells = self.resting_sells.get(ticker, 0)
+        if existing_sells >= held:
+            print(f"  ⚠ Skip sell — already {existing_sells} resting sells for {held} held")
+            return
+
+        sell_order_id = f"exit-{side}-{ticker}-{int(time.time())}"
+        try:
+            result = self.client.create_order(
+                ticker=ticker,
+                client_order_id=sell_order_id,
+                side=side,
+                action="sell",
+                count=1,
+                type="limit",
+                yes_price=sell_price if side == "yes" else None,
+                no_price=sell_price if side == "no" else None,
+            )
+            self.resting_sells[ticker] = existing_sells + 1
+            print(f"  → Resting SELL {side.upper()} 1 @ {sell_price}c (2x of {entry_price}c) | {sell_order_id}")
+        except Exception as e:
+            print(f"  → Sell order error: {e}")
 
     # ─── Settlement History ───────────────────────────────────
 
