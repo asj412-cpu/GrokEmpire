@@ -523,11 +523,12 @@ class Crypto15mAgent:
                 minutes_remaining = 15 - (datetime.now().minute % 15)
                 active_fades = []
                 for coin in COINS:
-                    sig = self.get_fade_signal(self.settlement_history[coin])
+                    sig, n = self.get_fade_signal(self.settlement_history[coin])
                     if sig:
                         hist = self.settlement_history[coin][-FADE_WINDOW:]
                         yes_ct = sum(1 for r in hist if r == "yes")
-                        active_fades.append(f"{coin}:{sig.replace('buy_','').upper()}({yes_ct}Y/{FADE_WINDOW-yes_ct}N)")
+                        bonus = "+1" if n > BASE_CONTRACTS else ""
+                        active_fades.append(f"{coin}:{sig.replace('buy_','').upper()}{bonus}({yes_ct}Y/{FADE_WINDOW-yes_ct}N)")
 
                 fades_str = " | ".join(active_fades) if active_fades else "none"
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Min left: {minutes_remaining} | Fades: {fades_str} | WS: {'✓' if self.ws_connected else '✗'}")
