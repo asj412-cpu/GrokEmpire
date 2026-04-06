@@ -31,11 +31,14 @@ RATCHET_PERCENT = 0.80
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 
 ENTRY_LOW = 5    # min entry price in cents
-ENTRY_HIGH = 45  # max entry price in cents
-EXIT_MULTIPLIER = 2  # resting sell at 2x entry price
-FADE_THRESHOLD = 6  # out of 10 rolling cycles
+ENTRY_HIGH = 15   # max entry price in cents
+EXIT_MULTIPLIER = 2  # resting sell at 2x entry price (3x if entry <=20c)
+FADE_THRESHOLD = 8  # out of 10 rolling cycles (high-confidence)
 FADE_WINDOW = 10
-MAX_CONTRACTS_PER_MARKET = 3
+STREAK_BONUS_LEN = 5  # 5-in-a-row streak adds +1 contract
+BASE_CONTRACTS = 2   # base contracts per market
+MAX_CONTRACTS_PER_MARKET = 3  # max with streak bonus
+DRIFT_MIN_DELTA = 2  # minimum price drop (cents) before cancel/repost
 VALUE_HUNTER_WINDOW_MINUTES = 8
 
 COINS = {
@@ -209,34 +212,41 @@ class Crypto15mAgent:
             ticker = msg.get("market_ticker", "")
             side = msg.get("side", "")
             action = msg.get("action", "")
-            price = msg.get("yes_price", 0)
-            count = msg.get("count", 0)
+            # Try multiple field names — Kalshi WS field names vary
+            price_dollars = msg.get("yes_price_dollars") or msg.get("price_dollars") or msg.get("no_price_dollars")
+            if price_dollars:
+                try:
+                    price = int(float(price_dollars) * 100)
+                except (ValueError, TypeError):
+                    price = msg.get("yes_price", 0) or msg.get("price", 0) or 0
+            else:
+                price = msg.get("yes_price", 0) or msg.get("price", 0) or 0
+            count = int(float(msg.get("count_fp") or msg.get("count") or 0))
             coin = None
             for c, t in self.current_tickers.items():
                 if t == ticker:
                     coin = c
                     break
 
-            print(f"  💰 FILL: {action.upper()} {side.upper()} {coin or ticker} {count}x @ {price}c")
+            print(f"  💰 FILL: {action.upper()} {side.upper()} {coin or ticker} {count}x @ {price}c | raw={msg}")
 
             if action == "buy":
-                # Buy filled — increment position, clear resting buy, post resting sell
-                self.ticker_contracts[ticker] = self.ticker_contracts.get(ticker, 0) + 1
-                entry_price = price
-                self.positions[ticker].append({"side": side, "entry_price": entry_price})
+                self.ticker_contracts[ticker] = self.ticker_contracts.get(ticker, 0) + count
+                self.positions[ticker].append({"side": side, "entry_price": price, "count": count})
                 if ticker in self.resting_buys:
                     del self.resting_buys[ticker]
-                print(f"  ✅ Bought! Now {self.ticker_contracts[ticker]}/{MAX_CONTRACTS_PER_MARKET} contracts")
-                # Post resting sell
-                if self.client and not DRY_RUN and coin:
-                    self._post_resting_sell(ticker, coin, side, entry_price)
+                print(f"  ✅ Bought! Now {self.ticker_contracts[ticker]} contracts")
+                # Post resting sell ONLY for what we just bought
+                if self.client and not DRY_RUN and coin and price > 0:
+                    self._post_resting_sell(ticker, coin, side, price)
 
             elif action == "sell":
-                # Sell filled — decrement resting sells and positions
-                self.resting_sells[ticker] = max(0, self.resting_sells.get(ticker, 0) - 1)
+                self.resting_sells[ticker] = max(0, self.resting_sells.get(ticker, 0) - count)
                 if self.positions.get(ticker):
-                    self.positions[ticker].pop(0)
-                print(f"  ✅ Exit filled! Resting sells remaining: {self.resting_sells.get(ticker, 0)}")
+                    for _ in range(min(count, len(self.positions[ticker]))):
+                        self.positions[ticker].pop(0)
+                self.ticker_contracts[ticker] = max(0, self.ticker_contracts.get(ticker, 0) - count)
+                print(f"  ✅ Exit filled! Held: {self.ticker_contracts[ticker]} | Resting sells: {self.resting_sells.get(ticker, 0)}")
 
         elif msg_type == "subscribed":
             channel = data.get("msg", {}).get("channel", "")
@@ -244,7 +254,6 @@ class Crypto15mAgent:
 
     async def _evaluate_trade(self, ticker):
         """Called on every WS price update — manage resting buys that drift with market."""
-        # Find which coin this ticker belongs to
         coin = None
         for c, t in self.current_tickers.items():
             if t == ticker:
@@ -253,16 +262,16 @@ class Crypto15mAgent:
         if not coin:
             return
 
-        # Time window: start at min 2 (13 left), stop at min 8 (7 left)
+        # Time window: min 2-8 of cycle (13-7 minutes remaining)
         minutes_remaining = 15 - (datetime.now().minute % 15)
         in_window = 7 <= minutes_remaining <= 13
 
-        # Contract count check
-        existing = self.ticker_contracts.get(ticker, 0)
-        at_max = existing >= MAX_CONTRACTS_PER_MARKET
+        # Get target contract count from signal (BASE or BASE+1 with streak bonus)
+        fade_signal, target_contracts = self.get_fade_signal(self.settlement_history[coin])
 
-        # Fade signal check
-        fade_signal = self.get_fade_signal(self.settlement_history[coin])
+        existing = self.ticker_contracts.get(ticker, 0)
+        # Already have enough — no need to buy more
+        at_target = existing >= target_contracts
 
         # Price check from WS cache
         prices = self.ws_prices.get(ticker)
@@ -273,11 +282,10 @@ class Crypto15mAgent:
         if yes_ask is None or yes_bid is None:
             return
         yes_cost = yes_ask
-        no_cost = 100 - yes_bid if yes_bid else None
+        no_cost = 100 - yes_bid if yes_bid is not None else None
         if no_cost is None:
             return
 
-        # Determine target side and current market price
         target_side = None
         market_price = None
         if fade_signal == "buy_yes":
@@ -287,49 +295,44 @@ class Crypto15mAgent:
             target_side = "no"
             market_price = no_cost
 
-        # Check if we have a resting buy for this ticker
         resting = self.resting_buys.get(ticker)
 
-        # Cancel resting buy if outside window, at max, or no fade signal
-        if resting and (not in_window or at_max or not fade_signal):
-            self._cancel_order(resting["order_id"], ticker, "buy window closed")
-            del self.resting_buys[ticker]
+        # Cancel resting buy if conditions changed (out of window, target reached, signal gone)
+        if resting and (not in_window or at_target or not fade_signal):
+            reason = "window closed" if not in_window else ("target reached" if at_target else "no signal")
+            self._cancel_order(resting["order_id"], ticker, reason)
             return
 
-        # No signal or outside window — nothing to do
-        if not fade_signal or not in_window or at_max or not target_side:
+        if not fade_signal or not in_window or at_target or not target_side:
             return
 
         in_range = ENTRY_LOW <= market_price <= ENTRY_HIGH
 
         if resting:
-            # Already have a resting buy — drift it down if market dropped
-            if in_range and market_price < resting["price"]:
-                # Market dropped — cancel old, post new at lower price
+            # Drift only if market dropped by DRIFT_MIN_DELTA cents (avoid spam)
+            if in_range and (resting["price"] - market_price) >= DRIFT_MIN_DELTA:
                 self._cancel_order(resting["order_id"], ticker, f"drift {resting['price']}c→{market_price}c")
-                self._post_buy(ticker, coin, target_side, market_price)
+                self._post_buy(ticker, coin, target_side, market_price, target_contracts)
             elif not in_range:
-                # Price left our range — cancel
                 self._cancel_order(resting["order_id"], ticker, "left range")
-                del self.resting_buys[ticker]
         else:
-            # No resting buy — post one if in range
             if in_range:
-                self._post_buy(ticker, coin, target_side, market_price)
+                self._post_buy(ticker, coin, target_side, market_price, target_contracts)
 
-    def _post_buy(self, ticker, coin, side, price):
-        """Post a resting limit buy order."""
+    def _post_buy(self, ticker, coin, side, price, target_contracts):
+        """Post a single resting limit buy order. Only 1 contract at a time."""
         client_order_id = f"fade-{side}-{ticker}-{int(time.time())}"
         hist = self.settlement_history.get(coin, [])[-FADE_WINDOW:]
         yes_ct = sum(1 for r in hist if r == "yes")
         fade_str = f"{yes_ct}Y/{FADE_WINDOW - yes_ct}N"
         decision = f"BUY {side.upper()}"
+        existing = self.ticker_contracts.get(ticker, 0)
 
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {coin} | {decision} 1 @ {price}c | Fade: {fade_str} | {ticker}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {coin} | {decision} 1 @ {price}c | held:{existing}/{target_contracts} | Fade: {fade_str}")
 
         if self.client and not DRY_RUN:
             try:
-                result = self.client.create_order(
+                self.client.create_order(
                     ticker=ticker,
                     client_order_id=client_order_id,
                     side=side,
@@ -340,13 +343,12 @@ class Crypto15mAgent:
                     no_price=price if side == "no" else None,
                 )
                 self.resting_buys[ticker] = {"order_id": client_order_id, "side": side, "price": price, "coin": coin}
-                print(f"  → Resting buy posted: {price}c")
             except Exception as e:
                 print(f"  → Buy error: {e}")
         elif DRY_RUN:
             self.resting_buys[ticker] = {"order_id": client_order_id, "side": side, "price": price, "coin": coin}
             mult = 3 if price <= 20 else EXIT_MULTIPLIER
-            print(f"  📄 PAPER: {decision} 1 @ {price}c → sell @ {min(price * mult, 95)}c ({mult}x)")
+            print(f"  📄 PAPER: → sell @ {min(price * mult, 95)}c ({mult}x)")
 
         with open(self.log_file, "a", newline="") as f:
             csv.writer(f).writerow([
@@ -372,8 +374,8 @@ class Crypto15mAgent:
         multiplier = 3 if entry_price <= 20 else EXIT_MULTIPLIER
         sell_price = min(entry_price * multiplier, 95)  # cap at 95c
 
-        # Safety: never post more sells than contracts held
-        held = len(self.positions.get(ticker, []))
+        # Safety: never post more sells than contracts held (use ticker_contracts as truth)
+        held = self.ticker_contracts.get(ticker, 0)
         existing_sells = self.resting_sells.get(ticker, 0)
         if existing_sells >= held:
             print(f"  ⚠ Skip sell — already {existing_sells} resting sells for {held} held")
@@ -381,7 +383,7 @@ class Crypto15mAgent:
 
         sell_order_id = f"exit-{side}-{ticker}-{int(time.time())}"
         try:
-            result = self.client.create_order(
+            self.client.create_order(
                 ticker=ticker,
                 client_order_id=sell_order_id,
                 side=side,
@@ -392,7 +394,7 @@ class Crypto15mAgent:
                 no_price=sell_price if side == "no" else None,
             )
             self.resting_sells[ticker] = existing_sells + 1
-            print(f"  → Resting SELL {side.upper()} 1 @ {sell_price}c (2x of {entry_price}c) | {sell_order_id}")
+            print(f"  → Resting SELL {side.upper()} 1 @ {sell_price}c ({multiplier}x of {entry_price}c)")
         except Exception as e:
             print(f"  → Sell order error: {e}")
 
@@ -465,16 +467,36 @@ class Crypto15mAgent:
             pass
 
     def get_fade_signal(self, history):
+        """Returns (signal, num_contracts).
+        signal: 'buy_yes' / 'buy_no' / None
+        num_contracts: BASE_CONTRACTS, +1 if 5-streak aligns with 8/10 fade
+        """
         if len(history) < FADE_WINDOW:
-            return None
+            return None, 0
         recent = history[-FADE_WINDOW:]
         yes_count = sum(1 for r in recent if r == "yes")
         no_count = FADE_WINDOW - yes_count
+
+        signal = None
         if no_count >= FADE_THRESHOLD:
-            return "buy_yes"
+            signal = "buy_yes"
         elif yes_count >= FADE_THRESHOLD:
-            return "buy_no"
-        return None
+            signal = "buy_no"
+        if not signal:
+            return None, 0
+
+        # Streak bonus check
+        if len(history) >= STREAK_BONUS_LEN:
+            last_n = history[-STREAK_BONUS_LEN:]
+            streak_side = None
+            if all(r == "no" for r in last_n):
+                streak_side = "buy_yes"
+            elif all(r == "yes" for r in last_n):
+                streak_side = "buy_no"
+            if streak_side == signal:
+                return signal, min(BASE_CONTRACTS + 1, MAX_CONTRACTS_PER_MARKET)
+
+        return signal, BASE_CONTRACTS
 
     # ─── Periodic Tasks ───────────────────────────────────────
 
@@ -530,7 +552,8 @@ class Crypto15mAgent:
     async def run(self):
         coins_str = ", ".join(COINS.keys())
         print(f"🚀 Crypto 15m Fade Agent — {coins_str}")
-        print(f"   Fade: {FADE_THRESHOLD}/{FADE_WINDOW} | Entry: {ENTRY_LOW}-{ENTRY_HIGH}c | Max: {MAX_CONTRACTS_PER_MARKET}/mkt | Window: {VALUE_HUNTER_WINDOW_MINUTES}min")
+        print(f"   Fade: {FADE_THRESHOLD}/{FADE_WINDOW} | Entry: {ENTRY_LOW}-{ENTRY_HIGH}c | Base: {BASE_CONTRACTS}/mkt (+1 on {STREAK_BONUS_LEN}-streak, max {MAX_CONTRACTS_PER_MARKET})")
+        print(f"   Sells: 3x if entry≤20c else 2x | Window: min 2-8 of cycle | Drift Δ: {DRIFT_MIN_DELTA}c")
         print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
 
         print("Seeding settlement history...")
