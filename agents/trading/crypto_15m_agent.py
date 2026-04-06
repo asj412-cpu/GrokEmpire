@@ -262,9 +262,9 @@ class Crypto15mAgent:
         if not coin:
             return
 
-        # Time window: min 2-8 of cycle (13-7 minutes remaining)
+        # Time window: min 0-8 of cycle (15-7 minutes remaining)
         minutes_remaining = 15 - (datetime.now().minute % 15)
-        in_window = 7 <= minutes_remaining <= 13
+        in_window = 7 <= minutes_remaining <= 15
 
         # Get target contract count from signal (BASE or BASE+1 with streak bonus)
         fade_signal, target_contracts = self.get_fade_signal(self.settlement_history[coin])
@@ -554,7 +554,7 @@ class Crypto15mAgent:
         coins_str = ", ".join(COINS.keys())
         print(f"🚀 Crypto 15m Fade Agent — {coins_str}")
         print(f"   Fade: {FADE_THRESHOLD}/{FADE_WINDOW} | Entry: {ENTRY_LOW}-{ENTRY_HIGH}c | Base: {BASE_CONTRACTS}/mkt (+1 on {STREAK_BONUS_LEN}-streak, max {MAX_CONTRACTS_PER_MARKET})")
-        print(f"   Sells: 3x if entry≤20c else 2x | Window: min 2-8 of cycle | Drift Δ: {DRIFT_MIN_DELTA}c")
+        print(f"   Sells: 3x if entry≤20c else 2x | Window: min 0-8 of cycle | Drift Δ: {DRIFT_MIN_DELTA}c")
         print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
 
         print("Seeding settlement history...")
