@@ -73,8 +73,23 @@ kalshi_ticker_to_coin = {}
 
 
 async def kalshi_loop():
-    """Subscribe to Kalshi WS and record every ticker update."""
+    """Subscribe to Kalshi orderbook_delta and maintain local order book per ticker."""
     global cycles_done
+    # Local order books: ticker -> {"yes": {price: qty}, "no": {price: qty}}
+    books = {}
+
+    def best_bid_ask(ticker):
+        """Returns (yes_bid, yes_ask) in cents from local book."""
+        b = books.get(ticker, {})
+        yes_levels = b.get("yes", {})
+        no_levels = b.get("no", {})
+        # YES bid = highest yes price with qty>0
+        yes_bid = max((p for p, q in yes_levels.items() if q > 0), default=0)
+        # YES ask = lowest no price flipped (100 - highest no bid)
+        no_bid = max((p for p, q in no_levels.items() if q > 0), default=0)
+        yes_ask = (100 - no_bid) if no_bid > 0 else 100
+        return yes_bid, yes_ask
+
     while cycles_done < TARGET_CYCLES:
         try:
             ts_ms = int(time.time() * 1000)
@@ -89,26 +104,60 @@ async def kalshi_loop():
             async with websockets.connect(KALSHI_WS, additional_headers=headers, ping_interval=30) as ws:
                 await ws.send(json.dumps({
                     "id": 1, "cmd": "subscribe",
-                    "params": {"channels": ["ticker"], "market_tickers": tickers}
+                    "params": {"channels": ["orderbook_delta"], "market_tickers": tickers}
                 }))
-                print(f"[Kalshi] Connected, subscribed to {len(tickers)} tickers")
+                print(f"[Kalshi] Connected, subscribed to orderbook_delta for {len(tickers)} tickers")
 
                 async for msg in ws:
                     if cycles_done >= TARGET_CYCLES:
                         return
                     data = json.loads(msg)
-                    if data.get("type") != "ticker":
-                        continue
-                    m = data.get("msg", {})
-                    ticker = m.get("market_ticker", "")
+                    msg_type = data.get("type", "")
+
+                    if msg_type == "orderbook_snapshot":
+                        m = data.get("msg", {})
+                        ticker = m.get("market_ticker", "")
+                        if not ticker:
+                            continue
+                        books[ticker] = {"yes": {}, "no": {}}
+                        for price_str, qty_str in m.get("yes", []) or m.get("yes_dollars_fp", []):
+                            try:
+                                p = int(float(price_str) * 100) if "." in str(price_str) else int(price_str)
+                                q = float(qty_str)
+                                books[ticker]["yes"][p] = q
+                            except (ValueError, TypeError):
+                                pass
+                        for price_str, qty_str in m.get("no", []) or m.get("no_dollars_fp", []):
+                            try:
+                                p = int(float(price_str) * 100) if "." in str(price_str) else int(price_str)
+                                q = float(qty_str)
+                                books[ticker]["no"][p] = q
+                            except (ValueError, TypeError):
+                                pass
+
+                    elif msg_type == "orderbook_delta":
+                        m = data.get("msg", {})
+                        ticker = m.get("market_ticker", "")
+                        if not ticker or ticker not in books:
+                            continue
+                        side = m.get("side", "")
+                        # price could be in cents or dollars
+                        price_raw = m.get("price") if "price" in m else m.get("price_dollars", "0")
+                        try:
+                            price = int(float(price_raw) * 100) if "." in str(price_raw) else int(price_raw)
+                        except (ValueError, TypeError):
+                            continue
+                        delta = float(m.get("delta") or m.get("delta_fp", 0))
+                        current = books[ticker].get(side, {}).get(price, 0)
+                        books[ticker][side][price] = max(0, current + delta)
+                    else:
+                        continue  # skip subscribe confirmations etc
+
                     coin = kalshi_ticker_to_coin.get(ticker)
                     if not coin:
                         continue
-                    try:
-                        yes_bid = int(float(m.get("yes_bid_dollars", "0")) * 100)
-                        yes_ask = int(float(m.get("yes_ask_dollars", "0")) * 100)
-                    except (ValueError, TypeError):
-                        continue
+
+                    yes_bid, yes_ask = best_bid_ask(ticker)
                     now = datetime.now(timezone.utc)
                     ts = now.strftime("%H:%M:%S.%f")[:-3]
                     minute_in_cycle = now.minute % 15
@@ -184,25 +233,29 @@ async def coinbase_loop():
 
 
 async def cycle_watcher():
-    """Detect cycle boundaries and rotate Kalshi tickers."""
+    """Detect cycle boundaries and rotate Kalshi tickers. Save CSV every 15s."""
     global cycles_done, kalshi_ticker_to_coin
     last_min = None
+    save_counter = 0
     while cycles_done < TARGET_CYCLES:
         now = datetime.now(timezone.utc)
         min_in_cycle = now.minute % 15
         if last_min is not None and last_min == 14 and min_in_cycle == 0:
             cycles_done += 1
             print(f"\n=== CYCLE {cycles_done}/{TARGET_CYCLES} BOUNDARY ===")
-            # Rotate kalshi tickers
             new_tickers = get_open_kalshi_tickers()
             kalshi_ticker_to_coin = {v: k for k, v in new_tickers.items()}
             print(f"  New tickers: {list(new_tickers.values())[:3]}...")
-
-            # Save partial CSV
             save_csv()
 
+        # Flush every 15s for live analysis
+        save_counter += 1
+        if save_counter >= 5:
+            save_csv()
+            save_counter = 0
+
         last_min = min_in_cycle
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
 
 
 def save_csv():
