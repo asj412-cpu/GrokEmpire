@@ -31,7 +31,7 @@ RATCHET_PERCENT = 0.80
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 
 ENTRY_LOW = 5    # min entry price in cents
-ENTRY_HIGH = 30   # max entry price in cents
+ENTRY_HIGH = 35   # max entry price in cents
 HOLD_TO_SETTLEMENT = True  # do NOT post resting sells - let positions ride to settlement
 EXIT_MULTIPLIER = 2  # unused when HOLD_TO_SETTLEMENT=True
 FADE_THRESHOLD = 6  # out of 10 rolling cycles
