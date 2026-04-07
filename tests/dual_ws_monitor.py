@@ -92,6 +92,7 @@ async def kalshi_loop():
         yes_ask = (100 - no_bid) if no_bid > 0 else 100
         return yes_bid, yes_ask
 
+    msg_count = {"snapshot": 0, "delta": 0, "delta_processed": 0, "delta_skipped_no_book": 0, "delta_skipped_no_coin": 0, "other": 0}
     while cycles_done < TARGET_CYCLES:
         try:
             ts_ms = int(time.time() * 1000)
@@ -126,6 +127,7 @@ async def kalshi_loop():
                     msg_type = data.get("type", "")
 
                     if msg_type == "orderbook_snapshot":
+                        msg_count["snapshot"] += 1
                         m = data.get("msg", {})
                         ticker = m.get("market_ticker", "")
                         if not ticker:
@@ -147,9 +149,13 @@ async def kalshi_loop():
                                 pass
 
                     elif msg_type == "orderbook_delta":
+                        msg_count["delta"] += 1
+                        if msg_count["delta"] % 100 == 0:
+                            print(f"[Kalshi] msg_count: {msg_count}")
                         m = data.get("msg", {})
                         ticker = m.get("market_ticker", "")
                         if not ticker or ticker not in books:
+                            msg_count["delta_skipped_no_book"] += 1
                             continue
                         side = m.get("side", "")
                         # Field is price_dollars (string like "0.9520")
@@ -163,11 +169,15 @@ async def kalshi_loop():
                         delta = float(m.get("delta_fp", 0))
                         current = books[ticker].get(side, {}).get(price, 0)
                         books[ticker][side][price] = max(0, current + delta)
+                        msg_count["delta_processed"] += 1
                     else:
+                        msg_count["other"] += 1
                         continue  # skip subscribe confirmations etc
 
                     coin = kalshi_ticker_to_coin.get(ticker)
                     if not coin:
+                        if msg_type == "orderbook_delta":
+                            msg_count["delta_skipped_no_coin"] += 1
                         continue
 
                     yes_bid, yes_ask = best_bid_ask(ticker)
