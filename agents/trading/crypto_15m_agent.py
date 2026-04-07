@@ -30,16 +30,19 @@ BASE_CASH_FLOOR = 40.0
 RATCHET_PERCENT = 0.80
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 
-ENTRY_LOW = 18   # min entry price in cents
-ENTRY_HIGH = 49   # max entry price in cents
-EXIT_MULTIPLIER = 2  # resting sell at 2x entry price (3x if entry <=20c)
-FADE_THRESHOLD = 8  # out of 10 rolling cycles (high-confidence)
+ENTRY_LOW = 5    # min entry price in cents
+ENTRY_HIGH = 30   # max entry price in cents
+HOLD_TO_SETTLEMENT = True  # do NOT post resting sells - let positions ride to settlement
+EXIT_MULTIPLIER = 2  # unused when HOLD_TO_SETTLEMENT=True
+FADE_THRESHOLD = 6  # out of 10 rolling cycles
 FADE_WINDOW = 10
 STREAK_BONUS_LEN = 5  # 5-in-a-row streak adds +1 contract
 BASE_CONTRACTS = 2   # base contracts per market
 MAX_CONTRACTS_PER_MARKET = 3  # max with streak bonus
 DRIFT_MIN_DELTA = 2  # minimum price drop (cents) before cancel/repost
-VALUE_HUNTER_WINDOW_MINUTES = 8
+# Buy window: first 5 min of cycle (10-15 minutes remaining)
+BUY_WINDOW_MIN_REMAINING = 10
+BUY_WINDOW_MAX_REMAINING = 15
 
 COINS = {
     "BTC": "KXBTC15M",
@@ -235,9 +238,10 @@ class Crypto15mAgent:
                 self.positions[ticker].append({"side": side, "entry_price": price, "count": count})
                 if ticker in self.resting_buys:
                     del self.resting_buys[ticker]
-                print(f"  ✅ Bought! Now {self.ticker_contracts[ticker]} contracts")
-                # Post resting sell ONLY for what we just bought
-                if self.client and not DRY_RUN and coin and price > 0:
+                print(f"  ✅ Bought! Now {self.ticker_contracts[ticker]} contracts (HOLD to settlement)")
+                # NOTE: Resting sells disabled — backtesting showed hold-to-settlement
+                # makes 5-60x more PnL than +5c or 2x exits at 5-30c entries
+                if not HOLD_TO_SETTLEMENT and self.client and not DRY_RUN and coin and price > 0:
                     self._post_resting_sell(ticker, coin, side, price)
 
             elif action == "sell":
@@ -262,9 +266,9 @@ class Crypto15mAgent:
         if not coin:
             return
 
-        # Time window: min 0-8 of cycle (15-7 minutes remaining)
+        # Time window: first 5 min of cycle (10-15 minutes remaining)
         minutes_remaining = 15 - (datetime.now().minute % 15)
-        in_window = 7 <= minutes_remaining <= 15
+        in_window = BUY_WINDOW_MIN_REMAINING <= minutes_remaining <= BUY_WINDOW_MAX_REMAINING
 
         # Get target contract count from signal (BASE or BASE+1 with streak bonus)
         fade_signal, target_contracts = self.get_fade_signal(self.settlement_history[coin])
@@ -554,7 +558,7 @@ class Crypto15mAgent:
         coins_str = ", ".join(COINS.keys())
         print(f"🚀 Crypto 15m Fade Agent — {coins_str}")
         print(f"   Fade: {FADE_THRESHOLD}/{FADE_WINDOW} | Entry: {ENTRY_LOW}-{ENTRY_HIGH}c | Base: {BASE_CONTRACTS}/mkt (+1 on {STREAK_BONUS_LEN}-streak, max {MAX_CONTRACTS_PER_MARKET})")
-        print(f"   Sells: 3x if entry≤20c else 2x | Window: min 0-8 of cycle | Drift Δ: {DRIFT_MIN_DELTA}c")
+        print(f"   Exit: HOLD TO SETTLEMENT | Buy window: first 5 min of cycle | Drift Δ: {DRIFT_MIN_DELTA}c")
         print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
 
         print("Seeding settlement history...")
