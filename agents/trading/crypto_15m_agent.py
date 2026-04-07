@@ -515,10 +515,10 @@ class Crypto15mAgent:
                 if self.ws_connected:
                     await self._subscribe_open_markets()
 
-                # FLIP SELL CHECK at minute 11 (4 minutes remaining)
-                # If we hold a YES position and YES ask < 50c → flip to NO
-                # If we hold a NO position and NO ask < 50c → flip to YES
-                self._check_flip_sell_window()
+                # FLIP SELL DISABLED — live test revealed math flaw:
+                # When held side bid < 50c, opp ask > 50c (always sums to ~100)
+                # so flip-buying opp has minimal upside. Was burning capital.
+                # self._check_flip_sell_window()
 
                 # Balance ratchet
                 balance = self.get_balance() or self.last_balance
@@ -599,9 +599,14 @@ class Crypto15mAgent:
                 opp_side = "yes"
                 opp_ask = yes_ask
 
-            # Only flip if our held side is still <50c (likely losing)
-            if our_ask >= 50:
-                continue
+            # Flip only when:
+            # 1. Our held side's value (bid) is LOW (<50c) → we're losing on this position
+            # 2. AND the opposite side has room to grow (opp_ask <50c) → flip can profit
+            # If opp_ask is >=50c, the flip doesn't have enough upside to be worth it
+            if our_bid >= 50:
+                continue  # we're not losing — keep the position
+            if opp_ask >= 50:
+                continue  # opposite side too expensive — no upside in flipping
 
             print(f"[FLIP @ min 11] {ticker} | held {count}x {held_side.upper()} | our ask {our_ask}c | flipping to {opp_side.upper()}")
 
