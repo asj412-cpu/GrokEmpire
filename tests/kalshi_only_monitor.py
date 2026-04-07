@@ -12,7 +12,7 @@ KEY_ID = os.getenv("KALSHI_KEY_ID")
 KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY")
 COINS = ["BTC","ETH","SOL","XRP","BNB","HYPE","DOGE"]
 OUT_CSV = "/tmp/kalshi_ticks.csv"
-TARGET_CYCLES = 2
+TARGET_CYCLES = 8
 
 def sig(ts):
     with open(KEY_PATH,'rb') as f:

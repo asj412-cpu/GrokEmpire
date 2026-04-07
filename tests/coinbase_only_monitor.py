@@ -5,7 +5,7 @@ import websockets
 
 OUT_CSV = "/tmp/coinbase_ticks.csv"
 COINS = {"BTC":"BTC-USD","ETH":"ETH-USD","SOL":"SOL-USD","XRP":"XRP-USD","BNB":"BNB-USD","HYPE":"HYPE-USD","DOGE":"DOGE-USD"}
-DURATION_SEC = 35 * 60  # 35 min covers waiting + 2 cycles
+DURATION_SEC = 140 * 60  # 8 cycles + buffer (~2h20m)
 
 async def main():
     # Wait for cycle boundary
