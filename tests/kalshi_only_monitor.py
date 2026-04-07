@@ -117,7 +117,7 @@ async def main():
                         if cycles >= TARGET_CYCLES:
                             csv_file.close()
                             return
-                        # Re-fetch tickers and re-subscribe
+                        last_min = None  # reset to avoid false boundary
                         break
                     last_min = cur_min
         except Exception as e:
