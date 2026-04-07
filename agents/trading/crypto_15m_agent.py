@@ -515,6 +515,11 @@ class Crypto15mAgent:
                 if self.ws_connected:
                     await self._subscribe_open_markets()
 
+                # FLIP SELL CHECK at minute 11 (4 minutes remaining)
+                # If we hold a YES position and YES ask < 50c → flip to NO
+                # If we hold a NO position and NO ask < 50c → flip to YES
+                self._check_flip_sell_window()
+
                 # Balance ratchet
                 balance = self.get_balance() or self.last_balance
                 if balance > self.current_cash_floor:
@@ -541,6 +546,97 @@ class Crypto15mAgent:
                 print(f"Settlement check error: {e}")
 
             await asyncio.sleep(30)
+
+    def _check_flip_sell_window(self):
+        """At minute 11 (4 min remaining), flip held positions if losing.
+
+        Backtest showed: if held YES is still <50c at min 11, contract has 59-100%
+        chance of settling NO. Flipping to NO converts likely loss into likely win.
+
+        Logic:
+        - Only fires once per ticker (tracked via self.flipped_tickers)
+        - Only fires when minutes_remaining == 4 (min 11 of cycle)
+        - For each held position, check current ask. If ask < 50c → flip via two orders:
+          1. Sell our held position (close)
+          2. Buy opposite side at current ask
+        """
+        minutes_remaining = 15 - (datetime.now().minute % 15)
+        if minutes_remaining != 4:
+            return
+        if not self.client or DRY_RUN:
+            return
+
+        if not hasattr(self, 'flipped_tickers'):
+            self.flipped_tickers = set()
+
+        for ticker, count in list(self.ticker_contracts.items()):
+            if count <= 0 or ticker in self.flipped_tickers:
+                continue
+            # Get current prices from WS cache
+            prices = self.ws_prices.get(ticker)
+            if not prices:
+                continue
+            yes_ask = prices.get("yes_ask")
+            yes_bid = prices.get("yes_bid")
+            if yes_ask is None or yes_bid is None:
+                continue
+
+            # Determine our position side from positions dict
+            position = self.positions.get(ticker, [])
+            if not position:
+                continue
+            held_side = position[0].get("side", "yes")
+
+            # Compute the cost of our held side at current bid (what we'd recover by selling)
+            if held_side == "yes":
+                our_ask = yes_ask  # cost of buying more YES
+                our_bid = yes_bid  # what we'd get for selling YES
+                opp_side = "no"
+                opp_ask = 100 - yes_bid  # cost of buying NO
+            else:
+                our_ask = 100 - yes_bid  # cost of buying more NO
+                our_bid = 100 - yes_ask  # what we'd get for selling NO
+                opp_side = "yes"
+                opp_ask = yes_ask
+
+            # Only flip if our held side is still <50c (likely losing)
+            if our_ask >= 50:
+                continue
+
+            print(f"[FLIP @ min 11] {ticker} | held {count}x {held_side.upper()} | our ask {our_ask}c | flipping to {opp_side.upper()}")
+
+            try:
+                # Step 1: Sell our held position
+                sell_id = f"flip-sell-{ticker}-{int(time.time())}"
+                self.client.create_order(
+                    ticker=ticker,
+                    client_order_id=sell_id,
+                    side=held_side,
+                    action="sell",
+                    count=count,
+                    type="limit",
+                    yes_price=our_bid if held_side == "yes" else None,
+                    no_price=our_bid if held_side == "no" else None,
+                )
+                print(f"  → Sold {count}x {held_side.upper()} @ {our_bid}c")
+
+                # Step 2: Buy opposite side
+                buy_id = f"flip-buy-{ticker}-{int(time.time())}"
+                self.client.create_order(
+                    ticker=ticker,
+                    client_order_id=buy_id,
+                    side=opp_side,
+                    action="buy",
+                    count=count,
+                    type="limit",
+                    yes_price=opp_ask if opp_side == "yes" else None,
+                    no_price=opp_ask if opp_side == "no" else None,
+                )
+                print(f"  → Bought {count}x {opp_side.upper()} @ {opp_ask}c")
+
+                self.flipped_tickers.add(ticker)
+            except Exception as e:
+                print(f"  → Flip error: {e}")
 
     def get_balance(self):
         if not self.client:
