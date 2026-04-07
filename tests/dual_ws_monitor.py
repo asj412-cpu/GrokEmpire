@@ -43,7 +43,7 @@ COINS = {
 OUT_CSV = "/tmp/dual_ws_data.csv"
 all_rows = []
 cycles_done = 0
-TARGET_CYCLES = 4
+TARGET_CYCLES = 2
 start_time = None
 
 
@@ -54,6 +54,8 @@ def generate_signature(timestamp_ms):
     sig = pk.sign(msg.encode(), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
     return base64.b64encode(sig).decode()
 
+
+resubscribe_needed = False
 
 def get_open_kalshi_tickers():
     tickers = {}
@@ -74,7 +76,7 @@ kalshi_ticker_to_coin = {}
 
 async def kalshi_loop():
     """Subscribe to Kalshi orderbook_delta and maintain local order book per ticker."""
-    global cycles_done
+    global cycles_done, resubscribe_needed
     # Local order books: ticker -> {"yes": {price: qty}, "no": {price: qty}}
     books = {}
 
@@ -111,6 +113,15 @@ async def kalshi_loop():
                 async for msg in ws:
                     if cycles_done >= TARGET_CYCLES:
                         return
+                    if resubscribe_needed:
+                        resubscribe_needed = False
+                        new_tickers = list(kalshi_ticker_to_coin.keys())
+                        await ws.send(json.dumps({
+                            "id": 99, "cmd": "subscribe",
+                            "params": {"channels": ["orderbook_delta"], "market_tickers": new_tickers}
+                        }))
+                        books.clear()
+                        print(f"[Kalshi] Re-subscribed to {len(new_tickers)} new tickers")
                     data = json.loads(msg)
                     msg_type = data.get("type", "")
 
@@ -141,13 +152,15 @@ async def kalshi_loop():
                         if not ticker or ticker not in books:
                             continue
                         side = m.get("side", "")
-                        # price could be in cents or dollars
-                        price_raw = m.get("price") if "price" in m else m.get("price_dollars", "0")
+                        # Field is price_dollars (string like "0.9520")
+                        price_raw = m.get("price_dollars")
+                        if price_raw is None:
+                            continue
                         try:
-                            price = int(float(price_raw) * 100) if "." in str(price_raw) else int(price_raw)
+                            price = int(round(float(price_raw) * 100))
                         except (ValueError, TypeError):
                             continue
-                        delta = float(m.get("delta") or m.get("delta_fp", 0))
+                        delta = float(m.get("delta_fp", 0))
                         current = books[ticker].get(side, {}).get(price, 0)
                         books[ticker][side][price] = max(0, current + delta)
                     else:
@@ -234,7 +247,7 @@ async def coinbase_loop():
 
 async def cycle_watcher():
     """Detect cycle boundaries and rotate Kalshi tickers. Save CSV every 15s."""
-    global cycles_done, kalshi_ticker_to_coin
+    global cycles_done, kalshi_ticker_to_coin, resubscribe_needed
     last_min = None
     save_counter = 0
     while cycles_done < TARGET_CYCLES:
@@ -245,7 +258,8 @@ async def cycle_watcher():
             print(f"\n=== CYCLE {cycles_done}/{TARGET_CYCLES} BOUNDARY ===")
             new_tickers = get_open_kalshi_tickers()
             kalshi_ticker_to_coin = {v: k for k, v in new_tickers.items()}
-            print(f"  New tickers: {list(new_tickers.values())[:3]}...")
+            resubscribe_needed = True
+            print(f"  New tickers: {list(new_tickers.values())[:3]}... (resub flag set)")
             save_csv()
 
         # Flush every 15s for live analysis
