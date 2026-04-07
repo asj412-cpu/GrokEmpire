@@ -111,7 +111,11 @@ async def kalshi_loop():
                 }))
                 print(f"[Kalshi] Connected, subscribed to orderbook_delta for {len(tickers)} tickers")
 
+                first_msgs_logged = 0
                 async for msg in ws:
+                    if first_msgs_logged < 5:
+                        first_msgs_logged += 1
+                        print(f"[Kalshi] DEBUG msg #{first_msgs_logged}: {msg[:200]}")
                     if cycles_done >= TARGET_CYCLES:
                         return
                     if resubscribe_needed:
