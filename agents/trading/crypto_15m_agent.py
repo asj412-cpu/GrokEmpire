@@ -225,17 +225,26 @@ class Crypto15mAgent:
                 data = self.client.get_markets(series_ticker=series, status="open", limit=1)
                 for m in data.get("markets", []):
                     ticker = m.get("ticker")
-                    close_ts = m.get("close_ts") or m.get("expiration_ts") or 0
-                    if ticker and close_ts and close_ts > min_close_ts:
-                        if self.current_tickers.get(coin) != ticker:
-                            rotated = True
-                            # Drop stale price cache for the old ticker
-                            old = self.current_tickers.get(coin)
-                            if old:
-                                self.ws_prices.pop(old, None)
-                        self.current_tickers[coin] = ticker
-                        self.ticker_refreshed_ts[ticker] = now_ms
-                        tickers.append(ticker)
+                    if not ticker:
+                        continue
+                    # Kalshi returns close_time as ISO string ("2026-04-08T20:15:00Z")
+                    close_time_str = m.get("close_time", "")
+                    try:
+                        close_dt = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
+                        close_ts = int(close_dt.timestamp())
+                    except (ValueError, AttributeError):
+                        close_ts = 0
+                    if close_ts and close_ts <= min_close_ts:
+                        continue  # market about to settle — skip
+                    if self.current_tickers.get(coin) != ticker:
+                        rotated = True
+                        # Drop stale price cache for the old ticker
+                        old = self.current_tickers.get(coin)
+                        if old:
+                            self.ws_prices.pop(old, None)
+                    self.current_tickers[coin] = ticker
+                    self.ticker_refreshed_ts[ticker] = now_ms
+                    tickers.append(ticker)
             except Exception as e:
                 print(f"  Open market lookup error {coin}: {e}")
 
