@@ -117,6 +117,8 @@ class Crypto15mAgent:
 
         # Cooldown tracking: ticker -> last buy fill timestamp (ms)
         self.last_buy_ts: Dict[str, int] = {}
+        # Last fill price per ticker (for averaging-down enforcement)
+        self.last_buy_price: Dict[str, int] = {}
 
         # Current open market tickers per coin
         self.current_tickers: Dict[str, str] = {}
@@ -199,9 +201,10 @@ class Crypto15mAgent:
             except Exception as e:
                 print(f"  Open market lookup error {coin}: {e}")
 
-        # Reset cooldowns on cycle rotation (cooldowns are within-cycle only)
+        # Reset cooldowns and avg-down state on cycle rotation
         if rotated:
             self.last_buy_ts.clear()
+            self.last_buy_price.clear()
 
         if tickers and self.ws_connected:
             await self.ws.send(json.dumps({
@@ -259,9 +262,10 @@ class Crypto15mAgent:
                 self.positions[ticker].append({"side": side, "entry_price": price, "count": count})
                 if ticker in self.resting_buys:
                     del self.resting_buys[ticker]
-                # Start cooldown
+                # Start cooldown + track fill price for averaging-down enforcement
                 self.last_buy_ts[ticker] = int(datetime.now().timestamp() * 1000)
-                print(f"  ✅ Bought! Now {self.ticker_contracts[ticker]} contracts (HOLD to settlement) | cooldown {COOLDOWN_SEC}s")
+                self.last_buy_price[ticker] = price
+                print(f"  ✅ Bought! Now {self.ticker_contracts[ticker]} contracts @ {price}c (HOLD to settlement) | cooldown {COOLDOWN_SEC}s")
                 # NOTE: Resting sells disabled — backtesting showed hold-to-settlement
                 # makes 5-60x more PnL than +5c or 2x exits at 5-30c entries
                 if not HOLD_TO_SETTLEMENT and self.client and not DRY_RUN and coin and price > 0:
@@ -358,6 +362,14 @@ class Crypto15mAgent:
             return
 
         in_range = tier_low <= market_price <= tier_high
+
+        # Average-down enforcement: subsequent buys must be at or below the last fill price
+        last_fill_price = self.last_buy_price.get(ticker)
+        if last_fill_price is not None and market_price > last_fill_price:
+            # Cancel any resting buy that would chase price up
+            if resting:
+                self._cancel_order(resting["order_id"], ticker, f"price climbed above last fill ({market_price}c > {last_fill_price}c)")
+            return
 
         if resting:
             if in_range and (resting["price"] - market_price) >= DRIFT_MIN_DELTA:
