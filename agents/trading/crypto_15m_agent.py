@@ -73,8 +73,8 @@ COIN_FADE_CONFIG = {
     "DOGE": {"thresh": 5, "window": 7},
 }
 
-SETTLEMENT_GUARD_SEC = 30  # last 30s of each 15m cycle: no new buys (extra safety on top of T2 cutoff)
 ROLLOVER_GUARD_SEC = 5     # first 5s of each new cycle: skip evals until tickers refresh
+MIN_TICKER_LIFE_SEC = 60   # only subscribe to markets with >60s until close (avoid about-to-settle)
 FADE_THRESHOLD = 6  # out of 10 rolling cycles
 FADE_WINDOW = 10
 STREAK_BONUS_LEN = 5  # 5-in-a-row streak adds +1 contract
@@ -219,7 +219,7 @@ class Crypto15mAgent:
         rotated = False
         now_ms = int(datetime.now().timestamp() * 1000)
         # Only accept markets whose close_ts is far enough in the future to actually trade
-        min_close_ts = int(datetime.now().timestamp()) + SETTLEMENT_GUARD_SEC
+        min_close_ts = int(datetime.now().timestamp()) + MIN_TICKER_LIFE_SEC
         for coin, series in COINS.items():
             try:
                 data = self.client.get_markets(series_ticker=series, status="open", limit=1)
@@ -348,10 +348,6 @@ class Crypto15mAgent:
             in_window = True
         else:
             tier_low, tier_high, tier_label = 0, 0, "OUT"
-            in_window = False
-
-        # Settlement guard: no new buys in the last SETTLEMENT_GUARD_SEC of the cycle
-        if cycle_sec >= (900 - SETTLEMENT_GUARD_SEC):
             in_window = False
 
         # Rollover guard: skip first ROLLOVER_GUARD_SEC of new cycle until ticker is refreshed
