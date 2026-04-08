@@ -282,17 +282,21 @@ class Crypto15mAgent:
                     coin = c
                     break
 
-            print(f"  💰 FILL: {action.upper()} {side.upper()} {coin or ticker} {count}x @ {price}c | raw={msg}")
+            # Convert raw yes_price into side-relative cost (what we actually paid)
+            purchased_side = (msg.get("purchased_side") or side or "").lower()
+            cost_price = price if purchased_side == "yes" else (100 - price)
+
+            print(f"  💰 FILL: {action.upper()} {side.upper()} {coin or ticker} {count}x @ {cost_price}c (yes_px={price}c) | raw={msg}")
 
             if action == "buy":
                 self.ticker_contracts[ticker] = self.ticker_contracts.get(ticker, 0) + count
-                self.positions[ticker].append({"side": side, "entry_price": price, "count": count})
+                self.positions[ticker].append({"side": side, "entry_price": cost_price, "count": count})
                 if ticker in self.resting_buys:
                     del self.resting_buys[ticker]
-                # Start cooldown + track fill price for averaging-down enforcement
+                # Start cooldown + track fill price (side-relative) for averaging-down enforcement
                 self.last_buy_ts[ticker] = int(datetime.now().timestamp() * 1000)
-                self.last_buy_price[ticker] = price
-                print(f"  ✅ Bought! Now {self.ticker_contracts[ticker]} contracts @ {price}c (HOLD to settlement) | cooldown {COOLDOWN_SEC}s")
+                self.last_buy_price[ticker] = cost_price
+                print(f"  ✅ Bought! Now {self.ticker_contracts[ticker]} contracts @ {cost_price}c (HOLD to settlement) | cooldown {COOLDOWN_SEC}s")
                 # NOTE: Resting sells disabled — backtesting showed hold-to-settlement
                 # makes 5-60x more PnL than +5c or 2x exits at 5-30c entries
                 if not HOLD_TO_SETTLEMENT and self.client and not DRY_RUN and coin and price > 0:
