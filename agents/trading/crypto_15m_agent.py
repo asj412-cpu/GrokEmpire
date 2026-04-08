@@ -46,6 +46,18 @@ ENTRY_HIGH = TIER2_ENTRY_HIGH
 
 COOLDOWN_SEC = 60  # cooldown between fills per ticker (resets at cycle boundary)
 
+# Per-coin signal direction. "fade" = mean-reversion (default), "trend" = follow majority.
+# HYPE flipped to trend on 2026-04-06 — backtest shows trend WR 51.9% vs fade 48.1% over last 5 days
+COIN_SIGNAL_MODE = {
+    "BTC": "fade",
+    "ETH": "fade",
+    "SOL": "fade",
+    "XRP": "fade",
+    "BNB": "fade",
+    "HYPE": "trend",
+    "DOGE": "fade",
+}
+
 HOLD_TO_SETTLEMENT = True  # do NOT post resting sells - let positions ride to settlement
 EXIT_MULTIPLIER = 2  # unused when HOLD_TO_SETTLEMENT=True
 FADE_THRESHOLD = 6  # out of 10 rolling cycles
@@ -313,7 +325,7 @@ class Crypto15mAgent:
             in_window = False
 
         # Get target contract count from fade signal
-        fade_signal, target_contracts = self.get_fade_signal(self.settlement_history[coin])
+        fade_signal, target_contracts = self.get_fade_signal(self.settlement_history[coin], coin=coin)
 
         existing = self.ticker_contracts.get(ticker, 0)
         at_target = existing >= target_contracts
@@ -528,10 +540,14 @@ class Crypto15mAgent:
         except Exception:
             pass
 
-    def get_fade_signal(self, history):
+    def get_fade_signal(self, history, coin=None):
         """Returns (signal, num_contracts).
         signal: 'buy_yes' / 'buy_no' / None
-        num_contracts: BASE_CONTRACTS, +1 if 5-streak aligns with 8/10 fade
+        num_contracts: BASE_CONTRACTS, +1 if 5-streak aligns with signal
+
+        Per-coin mode (COIN_SIGNAL_MODE):
+        - 'fade' (default): mean-reversion — buy opposite of majority
+        - 'trend': follow majority — buy with the trend
         """
         if len(history) < FADE_WINDOW:
             return None, 0
@@ -539,22 +555,37 @@ class Crypto15mAgent:
         yes_count = sum(1 for r in recent if r == "yes")
         no_count = FADE_WINDOW - yes_count
 
+        mode = COIN_SIGNAL_MODE.get(coin, "fade") if coin else "fade"
+
         signal = None
-        if no_count >= FADE_THRESHOLD:
-            signal = "buy_yes"
-        elif yes_count >= FADE_THRESHOLD:
-            signal = "buy_no"
+        if mode == "fade":
+            if no_count >= FADE_THRESHOLD:
+                signal = "buy_yes"
+            elif yes_count >= FADE_THRESHOLD:
+                signal = "buy_no"
+        else:  # trend
+            if yes_count >= FADE_THRESHOLD:
+                signal = "buy_yes"
+            elif no_count >= FADE_THRESHOLD:
+                signal = "buy_no"
+
         if not signal:
             return None, 0
 
-        # Streak bonus check
+        # Streak bonus check (aligned with signal mode)
         if len(history) >= STREAK_BONUS_LEN:
             last_n = history[-STREAK_BONUS_LEN:]
             streak_side = None
-            if all(r == "no" for r in last_n):
-                streak_side = "buy_yes"
-            elif all(r == "yes" for r in last_n):
-                streak_side = "buy_no"
+            if mode == "fade":
+                if all(r == "no" for r in last_n):
+                    streak_side = "buy_yes"
+                elif all(r == "yes" for r in last_n):
+                    streak_side = "buy_no"
+            else:  # trend
+                if all(r == "yes" for r in last_n):
+                    streak_side = "buy_yes"
+                elif all(r == "no" for r in last_n):
+                    streak_side = "buy_no"
             if streak_side == signal:
                 return signal, min(BASE_CONTRACTS + 1, MAX_CONTRACTS_PER_MARKET)
 
@@ -590,12 +621,13 @@ class Crypto15mAgent:
                 minutes_remaining = 15 - (datetime.now().minute % 15)
                 active_fades = []
                 for coin in COINS:
-                    sig, n = self.get_fade_signal(self.settlement_history[coin])
+                    sig, n = self.get_fade_signal(self.settlement_history[coin], coin=coin)
                     if sig:
                         hist = self.settlement_history[coin][-FADE_WINDOW:]
                         yes_ct = sum(1 for r in hist if r == "yes")
                         bonus = "+1" if n > BASE_CONTRACTS else ""
-                        active_fades.append(f"{coin}:{sig.replace('buy_','').upper()}{bonus}({yes_ct}Y/{FADE_WINDOW-yes_ct}N)")
+                        mode_tag = "T" if COIN_SIGNAL_MODE.get(coin) == "trend" else ""
+                        active_fades.append(f"{coin}{mode_tag}:{sig.replace('buy_','').upper()}{bonus}({yes_ct}Y/{FADE_WINDOW-yes_ct}N)")
 
                 fades_str = " | ".join(active_fades) if active_fades else "none"
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Min left: {minutes_remaining} | Fades: {fades_str} | WS: {'✓' if self.ws_connected else '✗'}")
@@ -716,7 +748,9 @@ class Crypto15mAgent:
     async def run(self):
         coins_str = ", ".join(COINS.keys())
         print(f"🚀 Crypto 15m Fade Agent — {coins_str}")
-        print(f"   Fade: {FADE_THRESHOLD}/{FADE_WINDOW} | T1: min 0-7 @ {TIER1_ENTRY_LOW}-{TIER1_ENTRY_HIGH}c | T2: min 7-10 @ {TIER2_ENTRY_LOW}-{TIER2_ENTRY_HIGH}c")
+        print(f"   Signal: {FADE_THRESHOLD}/{FADE_WINDOW} | T1: min 0-7 @ {TIER1_ENTRY_LOW}-{TIER1_ENTRY_HIGH}c | T2: min 7-10 @ {TIER2_ENTRY_LOW}-{TIER2_ENTRY_HIGH}c")
+        modes = " ".join(f"{c}={COIN_SIGNAL_MODE.get(c,'fade')[0].upper()}" for c in COINS)
+        print(f"   Modes: {modes}")
         print(f"   Cooldown: {COOLDOWN_SEC}s/coin | Base: {BASE_CONTRACTS}/mkt (+1 on {STREAK_BONUS_LEN}-streak, max {MAX_CONTRACTS_PER_MARKET}) | Hold to settlement")
         print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
 
