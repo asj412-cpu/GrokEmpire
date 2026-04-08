@@ -58,6 +58,21 @@ COIN_SIGNAL_MODE = {
     "DOGE": "fade",
 }
 
+# Per-coin fade threshold/window overrides (data-driven from 5-day backtest 2026-04-08)
+# BTC: 7/10 fade — 59% WR at 162 trades, +42.4c avg (vs 6/10's 53% WR, +35.6c)
+# ETH: 5/7 fade — 58% WR at 190 trades, +41.6c avg (vs 6/10's 53% WR, +36.8c)
+# DOGE: 5/7 fade — 55% WR at 173 trades, +38.6c avg (vs 6/10's 52% WR, +35.9c)
+# Others stay at 6/10 baseline. Re-evaluate 2026-04-10.
+COIN_FADE_CONFIG = {
+    "BTC":  {"thresh": 7, "window": 10},
+    "ETH":  {"thresh": 5, "window": 7},
+    "SOL":  {"thresh": 6, "window": 10},
+    "XRP":  {"thresh": 6, "window": 10},
+    "BNB":  {"thresh": 6, "window": 10},
+    "HYPE": {"thresh": 6, "window": 10},
+    "DOGE": {"thresh": 5, "window": 7},
+}
+
 HOLD_TO_SETTLEMENT = True  # do NOT post resting sells - let positions ride to settlement
 EXIT_MULTIPLIER = 2  # unused when HOLD_TO_SETTLEMENT=True
 FADE_THRESHOLD = 6  # out of 10 rolling cycles
@@ -396,9 +411,10 @@ class Crypto15mAgent:
     def _post_buy(self, ticker, coin, side, price, target_contracts):
         """Post a single resting limit buy order. Only 1 contract at a time."""
         client_order_id = f"fade-{side}-{ticker}-{int(time.time())}"
-        hist = self.settlement_history.get(coin, [])[-FADE_WINDOW:]
+        coin_window = COIN_FADE_CONFIG.get(coin, {}).get("window", FADE_WINDOW)
+        hist = self.settlement_history.get(coin, [])[-coin_window:]
         yes_ct = sum(1 for r in hist if r == "yes")
-        fade_str = f"{yes_ct}Y/{FADE_WINDOW - yes_ct}N"
+        fade_str = f"{yes_ct}Y/{coin_window - yes_ct}N"
         decision = f"BUY {side.upper()}"
         existing = self.ticker_contracts.get(ticker, 0)
 
@@ -534,9 +550,10 @@ class Crypto15mAgent:
                     if len(self.settlement_history[coin_name]) > FADE_WINDOW * 2:
                         self.settlement_history[coin_name] = self.settlement_history[coin_name][-FADE_WINDOW * 2:]
                     self.last_settled_ticker[coin_name] = latest_ticker
-                    hist = self.settlement_history[coin_name][-FADE_WINDOW:]
+                    cw = COIN_FADE_CONFIG.get(coin_name, {}).get("window", FADE_WINDOW)
+                    hist = self.settlement_history[coin_name][-cw:]
                     yes_ct = sum(1 for r in hist if r == "yes")
-                    print(f"  📊 {coin_name} settled {result.upper()} → {yes_ct}Y/{FADE_WINDOW - yes_ct}N")
+                    print(f"  📊 {coin_name} settled {result.upper()} → {yes_ct}Y/{cw - yes_ct}N")
         except Exception:
             pass
 
@@ -549,24 +566,27 @@ class Crypto15mAgent:
         - 'fade' (default): mean-reversion — buy opposite of majority
         - 'trend': follow majority — buy with the trend
         """
-        if len(history) < FADE_WINDOW:
+        cfg = COIN_FADE_CONFIG.get(coin, {"thresh": FADE_THRESHOLD, "window": FADE_WINDOW}) if coin else {"thresh": FADE_THRESHOLD, "window": FADE_WINDOW}
+        window = cfg["window"]
+        thresh = cfg["thresh"]
+        if len(history) < window:
             return None, 0
-        recent = history[-FADE_WINDOW:]
+        recent = history[-window:]
         yes_count = sum(1 for r in recent if r == "yes")
-        no_count = FADE_WINDOW - yes_count
+        no_count = window - yes_count
 
         mode = COIN_SIGNAL_MODE.get(coin, "fade") if coin else "fade"
 
         signal = None
         if mode == "fade":
-            if no_count >= FADE_THRESHOLD:
+            if no_count >= thresh:
                 signal = "buy_yes"
-            elif yes_count >= FADE_THRESHOLD:
+            elif yes_count >= thresh:
                 signal = "buy_no"
         else:  # trend
-            if yes_count >= FADE_THRESHOLD:
+            if yes_count >= thresh:
                 signal = "buy_yes"
-            elif no_count >= FADE_THRESHOLD:
+            elif no_count >= thresh:
                 signal = "buy_no"
 
         if not signal:
@@ -623,11 +643,12 @@ class Crypto15mAgent:
                 for coin in COINS:
                     sig, n = self.get_fade_signal(self.settlement_history[coin], coin=coin)
                     if sig:
-                        hist = self.settlement_history[coin][-FADE_WINDOW:]
+                        cw = COIN_FADE_CONFIG.get(coin, {}).get("window", FADE_WINDOW)
+                        hist = self.settlement_history[coin][-cw:]
                         yes_ct = sum(1 for r in hist if r == "yes")
                         bonus = "+1" if n > BASE_CONTRACTS else ""
                         mode_tag = "T" if COIN_SIGNAL_MODE.get(coin) == "trend" else ""
-                        active_fades.append(f"{coin}{mode_tag}:{sig.replace('buy_','').upper()}{bonus}({yes_ct}Y/{FADE_WINDOW-yes_ct}N)")
+                        active_fades.append(f"{coin}{mode_tag}:{sig.replace('buy_','').upper()}{bonus}({yes_ct}Y/{cw-yes_ct}N)")
 
                 fades_str = " | ".join(active_fades) if active_fades else "none"
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Min left: {minutes_remaining} | Fades: {fades_str} | WS: {'✓' if self.ws_connected else '✗'}")
@@ -748,9 +769,12 @@ class Crypto15mAgent:
     async def run(self):
         coins_str = ", ".join(COINS.keys())
         print(f"🚀 Crypto 15m Fade Agent — {coins_str}")
-        print(f"   Signal: {FADE_THRESHOLD}/{FADE_WINDOW} | T1: min 0-7 @ {TIER1_ENTRY_LOW}-{TIER1_ENTRY_HIGH}c | T2: min 7-10 @ {TIER2_ENTRY_LOW}-{TIER2_ENTRY_HIGH}c")
-        modes = " ".join(f"{c}={COIN_SIGNAL_MODE.get(c,'fade')[0].upper()}" for c in COINS)
-        print(f"   Modes: {modes}")
+        print(f"   Signal: per-coin | T1: min 0-7 @ {TIER1_ENTRY_LOW}-{TIER1_ENTRY_HIGH}c | T2: min 7-10 @ {TIER2_ENTRY_LOW}-{TIER2_ENTRY_HIGH}c")
+        per_coin = " ".join(
+            f"{c}={COIN_FADE_CONFIG[c]['thresh']}/{COIN_FADE_CONFIG[c]['window']}{COIN_SIGNAL_MODE.get(c,'fade')[0].upper()}"
+            for c in COINS
+        )
+        print(f"   Per-coin: {per_coin}")
         print(f"   Cooldown: {COOLDOWN_SEC}s/coin | Base: {BASE_CONTRACTS}/mkt (+1 on {STREAK_BONUS_LEN}-streak, max {MAX_CONTRACTS_PER_MARKET}) | Hold to settlement")
         print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
 
