@@ -30,8 +30,22 @@ BASE_CASH_FLOOR = 40.0
 RATCHET_PERCENT = 0.80
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 
-ENTRY_LOW = 5    # min entry price in cents
-ENTRY_HIGH = 35   # max entry price in cents
+# Tiered entry strategy (backtested: +$13.46 vs current $4.38 over 60 cycles)
+# Tier 1: min 0-7 of cycle (cycle_sec 0-420 = 8-15 min remaining) → entry 1-20c
+# Tier 2: min 7-10 of cycle (cycle_sec 420-600 = 5-8 min remaining) → entry 20-49c
+TIER1_MAX_CYCLE_SEC = 420   # min 7
+TIER1_ENTRY_LOW = 1
+TIER1_ENTRY_HIGH = 20
+TIER2_MAX_CYCLE_SEC = 600   # min 10
+TIER2_ENTRY_LOW = 20
+TIER2_ENTRY_HIGH = 49
+
+# Legacy single-tier constants kept for backwards compat in some helpers
+ENTRY_LOW = TIER1_ENTRY_LOW
+ENTRY_HIGH = TIER2_ENTRY_HIGH
+
+COOLDOWN_SEC = 60  # cooldown between fills per ticker (resets at cycle boundary)
+
 HOLD_TO_SETTLEMENT = True  # do NOT post resting sells - let positions ride to settlement
 EXIT_MULTIPLIER = 2  # unused when HOLD_TO_SETTLEMENT=True
 FADE_THRESHOLD = 6  # out of 10 rolling cycles
@@ -40,9 +54,6 @@ STREAK_BONUS_LEN = 5  # 5-in-a-row streak adds +1 contract
 BASE_CONTRACTS = 2   # base contracts per market
 MAX_CONTRACTS_PER_MARKET = 3  # max with streak bonus
 DRIFT_MIN_DELTA = 2  # minimum price drop (cents) before cancel/repost
-# Buy window: first 5 min of cycle (10-15 minutes remaining)
-BUY_WINDOW_MIN_REMAINING = 10
-BUY_WINDOW_MAX_REMAINING = 15
 
 COINS = {
     "BTC": "KXBTC15M",
@@ -103,6 +114,9 @@ class Crypto15mAgent:
         # Resting buy orders — drift with market
         # {ticker: {order_id, side, price, coin}}
         self.resting_buys: Dict[str, dict] = {}
+
+        # Cooldown tracking: ticker -> last buy fill timestamp (ms)
+        self.last_buy_ts: Dict[str, int] = {}
 
         # Current open market tickers per coin
         self.current_tickers: Dict[str, str] = {}
@@ -171,16 +185,23 @@ class Crypto15mAgent:
         if not self.client:
             return
         tickers = []
+        rotated = False
         for coin, series in COINS.items():
             try:
                 data = self.client.get_markets(series_ticker=series, status="open", limit=1)
                 for m in data.get("markets", []):
                     ticker = m.get("ticker")
                     if ticker:
+                        if self.current_tickers.get(coin) != ticker:
+                            rotated = True
                         self.current_tickers[coin] = ticker
                         tickers.append(ticker)
             except Exception as e:
                 print(f"  Open market lookup error {coin}: {e}")
+
+        # Reset cooldowns on cycle rotation (cooldowns are within-cycle only)
+        if rotated:
+            self.last_buy_ts.clear()
 
         if tickers and self.ws_connected:
             await self.ws.send(json.dumps({
@@ -238,7 +259,9 @@ class Crypto15mAgent:
                 self.positions[ticker].append({"side": side, "entry_price": price, "count": count})
                 if ticker in self.resting_buys:
                     del self.resting_buys[ticker]
-                print(f"  ✅ Bought! Now {self.ticker_contracts[ticker]} contracts (HOLD to settlement)")
+                # Start cooldown
+                self.last_buy_ts[ticker] = int(datetime.now().timestamp() * 1000)
+                print(f"  ✅ Bought! Now {self.ticker_contracts[ticker]} contracts (HOLD to settlement) | cooldown {COOLDOWN_SEC}s")
                 # NOTE: Resting sells disabled — backtesting showed hold-to-settlement
                 # makes 5-60x more PnL than +5c or 2x exits at 5-30c entries
                 if not HOLD_TO_SETTLEMENT and self.client and not DRY_RUN and coin and price > 0:
@@ -257,7 +280,7 @@ class Crypto15mAgent:
             print(f"  WS subscribed: {channel}")
 
     async def _evaluate_trade(self, ticker):
-        """Called on every WS price update — manage resting buys that drift with market."""
+        """Called on every WS price update — manage resting buys with tiered window + cooldown."""
         coin = None
         for c, t in self.current_tickers.items():
             if t == ticker:
@@ -266,18 +289,40 @@ class Crypto15mAgent:
         if not coin:
             return
 
-        # Time window: first 5 min of cycle (10-15 minutes remaining)
-        minutes_remaining = 15 - (datetime.now().minute % 15)
-        in_window = BUY_WINDOW_MIN_REMAINING <= minutes_remaining <= BUY_WINDOW_MAX_REMAINING
+        # Compute cycle position
+        now = datetime.now()
+        minutes_remaining = 15 - (now.minute % 15)
+        cycle_sec = (now.minute % 15) * 60 + now.second  # 0-899
 
-        # Get target contract count from signal (BASE or BASE+1 with streak bonus)
+        # Tiered entry window
+        # Tier 1: cycle_sec 0-420 (min 0-7), entry 1-20c
+        # Tier 2: cycle_sec 420-600 (min 7-10), entry 20-49c
+        # After cycle_sec 600: no buys
+        if cycle_sec <= TIER1_MAX_CYCLE_SEC:
+            tier_low, tier_high, tier_label = TIER1_ENTRY_LOW, TIER1_ENTRY_HIGH, "T1"
+            in_window = True
+        elif cycle_sec <= TIER2_MAX_CYCLE_SEC:
+            tier_low, tier_high, tier_label = TIER2_ENTRY_LOW, TIER2_ENTRY_HIGH, "T2"
+            in_window = True
+        else:
+            tier_low, tier_high, tier_label = 0, 0, "OUT"
+            in_window = False
+
+        # Get target contract count from fade signal
         fade_signal, target_contracts = self.get_fade_signal(self.settlement_history[coin])
 
         existing = self.ticker_contracts.get(ticker, 0)
-        # Already have enough — no need to buy more
         at_target = existing >= target_contracts
 
-        # Price check from WS cache
+        # Cooldown check
+        cooldown_active = False
+        last_ts = self.last_buy_ts.get(ticker)
+        if last_ts is not None:
+            elapsed_sec = (int(now.timestamp() * 1000) - last_ts) / 1000
+            if elapsed_sec < COOLDOWN_SEC:
+                cooldown_active = True
+
+        # Price check
         prices = self.ws_prices.get(ticker)
         if not prices:
             return
@@ -301,24 +346,25 @@ class Crypto15mAgent:
 
         resting = self.resting_buys.get(ticker)
 
-        # Cancel resting buy if conditions changed (out of window, target reached, signal gone)
-        if resting and (not in_window or at_target or not fade_signal):
-            reason = "window closed" if not in_window else ("target reached" if at_target else "no signal")
+        # Cancel resting buy if conditions changed
+        if resting and (not in_window or at_target or not fade_signal or cooldown_active):
+            reason = "window closed" if not in_window else \
+                     ("target reached" if at_target else
+                      ("cooldown active" if cooldown_active else "no signal"))
             self._cancel_order(resting["order_id"], ticker, reason)
             return
 
-        if not fade_signal or not in_window or at_target or not target_side:
+        if not fade_signal or not in_window or at_target or not target_side or cooldown_active:
             return
 
-        in_range = ENTRY_LOW <= market_price <= ENTRY_HIGH
+        in_range = tier_low <= market_price <= tier_high
 
         if resting:
-            # Drift only if market dropped by DRIFT_MIN_DELTA cents (avoid spam)
             if in_range and (resting["price"] - market_price) >= DRIFT_MIN_DELTA:
                 self._cancel_order(resting["order_id"], ticker, f"drift {resting['price']}c→{market_price}c")
                 self._post_buy(ticker, coin, target_side, market_price, target_contracts)
             elif not in_range:
-                self._cancel_order(resting["order_id"], ticker, "left range")
+                self._cancel_order(resting["order_id"], ticker, f"left {tier_label} range")
         else:
             if in_range:
                 self._post_buy(ticker, coin, target_side, market_price, target_contracts)
@@ -658,8 +704,8 @@ class Crypto15mAgent:
     async def run(self):
         coins_str = ", ".join(COINS.keys())
         print(f"🚀 Crypto 15m Fade Agent — {coins_str}")
-        print(f"   Fade: {FADE_THRESHOLD}/{FADE_WINDOW} | Entry: {ENTRY_LOW}-{ENTRY_HIGH}c | Base: {BASE_CONTRACTS}/mkt (+1 on {STREAK_BONUS_LEN}-streak, max {MAX_CONTRACTS_PER_MARKET})")
-        print(f"   Exit: HOLD TO SETTLEMENT | Buy window: first 5 min of cycle | Drift Δ: {DRIFT_MIN_DELTA}c")
+        print(f"   Fade: {FADE_THRESHOLD}/{FADE_WINDOW} | T1: min 0-7 @ {TIER1_ENTRY_LOW}-{TIER1_ENTRY_HIGH}c | T2: min 7-10 @ {TIER2_ENTRY_LOW}-{TIER2_ENTRY_HIGH}c")
+        print(f"   Cooldown: {COOLDOWN_SEC}s/coin | Base: {BASE_CONTRACTS}/mkt (+1 on {STREAK_BONUS_LEN}-streak, max {MAX_CONTRACTS_PER_MARKET}) | Hold to settlement")
         print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
 
         print("Seeding settlement history...")
