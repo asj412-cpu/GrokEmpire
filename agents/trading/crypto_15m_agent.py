@@ -73,8 +73,8 @@ COIN_FADE_CONFIG = {
     "DOGE": {"thresh": 5, "window": 7},
 }
 
-HOLD_TO_SETTLEMENT = True  # do NOT post resting sells - let positions ride to settlement
-EXIT_MULTIPLIER = 2  # unused when HOLD_TO_SETTLEMENT=True
+SETTLEMENT_GUARD_SEC = 30  # last 30s of each 15m cycle: no new buys (extra safety on top of T2 cutoff)
+ROLLOVER_GUARD_SEC = 5     # first 5s of each new cycle: skip evals until tickers refresh
 FADE_THRESHOLD = 6  # out of 10 rolling cycles
 FADE_WINDOW = 10
 STREAK_BONUS_LEN = 5  # 5-in-a-row streak adds +1 contract
@@ -149,6 +149,8 @@ class Crypto15mAgent:
 
         # Current open market tickers per coin
         self.current_tickers: Dict[str, str] = {}
+        # Per-ticker timestamp of last subscribe refresh (ms) — for rollover guard
+        self.ticker_refreshed_ts: Dict[str, int] = {}
 
         # Kalshi WS ticker cache: ticker -> {yes_bid, yes_ask, ...}
         self.ws_prices: Dict[str, dict] = {}
@@ -215,15 +217,24 @@ class Crypto15mAgent:
             return
         tickers = []
         rotated = False
+        now_ms = int(datetime.now().timestamp() * 1000)
+        # Only accept markets whose close_ts is far enough in the future to actually trade
+        min_close_ts = int(datetime.now().timestamp()) + SETTLEMENT_GUARD_SEC
         for coin, series in COINS.items():
             try:
                 data = self.client.get_markets(series_ticker=series, status="open", limit=1)
                 for m in data.get("markets", []):
                     ticker = m.get("ticker")
-                    if ticker:
+                    close_ts = m.get("close_ts") or m.get("expiration_ts") or 0
+                    if ticker and close_ts and close_ts > min_close_ts:
                         if self.current_tickers.get(coin) != ticker:
                             rotated = True
+                            # Drop stale price cache for the old ticker
+                            old = self.current_tickers.get(coin)
+                            if old:
+                                self.ws_prices.pop(old, None)
                         self.current_tickers[coin] = ticker
+                        self.ticker_refreshed_ts[ticker] = now_ms
                         tickers.append(ticker)
             except Exception as e:
                 print(f"  Open market lookup error {coin}: {e}")
@@ -297,10 +308,6 @@ class Crypto15mAgent:
                 self.last_buy_ts[ticker] = int(datetime.now().timestamp() * 1000)
                 self.last_buy_price[ticker] = cost_price
                 print(f"  ✅ Bought! Now {self.ticker_contracts[ticker]} contracts @ {cost_price}c (HOLD to settlement) | cooldown {COOLDOWN_SEC}s")
-                # NOTE: Resting sells disabled — backtesting showed hold-to-settlement
-                # makes 5-60x more PnL than +5c or 2x exits at 5-30c entries
-                if not HOLD_TO_SETTLEMENT and self.client and not DRY_RUN and coin and price > 0:
-                    self._post_resting_sell(ticker, coin, side, price)
 
             elif action == "sell":
                 self.resting_sells[ticker] = max(0, self.resting_sells.get(ticker, 0) - count)
@@ -342,6 +349,21 @@ class Crypto15mAgent:
         else:
             tier_low, tier_high, tier_label = 0, 0, "OUT"
             in_window = False
+
+        # Settlement guard: no new buys in the last SETTLEMENT_GUARD_SEC of the cycle
+        if cycle_sec >= (900 - SETTLEMENT_GUARD_SEC):
+            in_window = False
+
+        # Rollover guard: skip first ROLLOVER_GUARD_SEC of new cycle until ticker is refreshed
+        if cycle_sec < ROLLOVER_GUARD_SEC:
+            in_window = False
+        else:
+            # Also skip if this ticker hasn't been refreshed in the last 60s
+            # (settlement_check_loop refreshes ~every 30s, so 60s is generous)
+            now_ms = int(now.timestamp() * 1000)
+            refreshed_ms = self.ticker_refreshed_ts.get(ticker, 0)
+            if now_ms - refreshed_ms > 60_000:
+                in_window = False
 
         # Get target contract count from fade signal
         fade_signal, target_contracts = self.get_fade_signal(self.settlement_history[coin], coin=coin)
@@ -441,8 +463,7 @@ class Crypto15mAgent:
                 print(f"  → Buy error: {e}")
         elif DRY_RUN:
             self.resting_buys[ticker] = {"order_id": client_order_id, "side": side, "price": price, "coin": coin}
-            mult = 3 if price <= 20 else EXIT_MULTIPLIER
-            print(f"  📄 PAPER: → sell @ {min(price * mult, 95)}c ({mult}x)")
+            print(f"  📄 PAPER: → buy {side} @ {price}c (HOLD to settlement)")
 
         with open(self.log_file, "a", newline="") as f:
             csv.writer(f).writerow([
@@ -462,35 +483,6 @@ class Crypto15mAgent:
             print(f"  ✗ PAPER cancel {order_id[:20]}... ({reason})")
         if ticker in self.resting_buys:
             del self.resting_buys[ticker]
-
-    def _post_resting_sell(self, ticker, coin, side, entry_price):
-        """Post a resting sell order at 2x (or 3x if <20c). Never sell more than held."""
-        multiplier = 3 if entry_price <= 20 else EXIT_MULTIPLIER
-        sell_price = min(entry_price * multiplier, 95)  # cap at 95c
-
-        # Safety: never post more sells than contracts held (use ticker_contracts as truth)
-        held = self.ticker_contracts.get(ticker, 0)
-        existing_sells = self.resting_sells.get(ticker, 0)
-        if existing_sells >= held:
-            print(f"  ⚠ Skip sell — already {existing_sells} resting sells for {held} held")
-            return
-
-        sell_order_id = f"exit-{side}-{ticker}-{int(time.time())}"
-        try:
-            self.client.create_order(
-                ticker=ticker,
-                client_order_id=sell_order_id,
-                side=side,
-                action="sell",
-                count=1,
-                type="limit",
-                yes_price=sell_price if side == "yes" else None,
-                no_price=sell_price if side == "no" else None,
-            )
-            self.resting_sells[ticker] = existing_sells + 1
-            print(f"  → Resting SELL {side.upper()} 1 @ {sell_price}c ({multiplier}x of {entry_price}c)")
-        except Exception as e:
-            print(f"  → Sell order error: {e}")
 
     # ─── Settlement History ───────────────────────────────────
 
@@ -660,7 +652,11 @@ class Crypto15mAgent:
             except Exception as e:
                 print(f"Settlement check error: {e}")
 
-            await asyncio.sleep(30)
+            # Sleep 30s, but never past the next 15m cycle boundary (refresh promptly on rollover)
+            now2 = datetime.now()
+            cycle_sec_now = (now2.minute % 15) * 60 + now2.second
+            sec_to_boundary = max(1, 900 - cycle_sec_now + 1)
+            await asyncio.sleep(min(30, sec_to_boundary))
 
     def _check_flip_sell_window(self):
         """At minute 11 (4 min remaining), flip held positions if losing.
