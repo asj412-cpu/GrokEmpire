@@ -30,6 +30,26 @@ BASE_CASH_FLOOR = 40.0
 RATCHET_PERCENT = 0.80
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 
+# Strategy selector — mutually exclusive
+#   "fade"          → existing tiered fade strategy (min 0-10, entry 1-49c)
+#   "late_favorite" → buy the favored side late in cycle (per-coin band + min-rem)
+STRATEGY = os.getenv('STRATEGY', 'fade').lower()
+if STRATEGY not in ("fade", "late_favorite"):
+    raise SystemExit(f"Invalid STRATEGY={STRATEGY!r}; must be 'fade' or 'late_favorite'")
+
+# Per-coin late-favorite config (5-day backtest 2026-04-08, net of fees+slippage)
+# {lo, hi} = entry cost band in cents; min_rem = trigger when this many minutes remain
+# HYPE excluded — every config loses on 5-day data (regime broken)
+COIN_LATE_FAV_CONFIG = {
+    "BTC":  {"lo": 65, "hi": 85, "min_rem": 3},   # +587c, 84% WR, 76 trades
+    "ETH":  {"lo": 60, "hi": 80, "min_rem": 5},   # +725c, 78% WR, 127 trades
+    "SOL":  {"lo": 60, "hi": 80, "min_rem": 5},   # +601c, 76% WR, 144 trades
+    "XRP":  {"lo": 80, "hi": 92, "min_rem": 5},   # +436c, 92% WR, 92 trades
+    "BNB":  {"lo": 65, "hi": 95, "min_rem": 6},   # +857c, 87% WR, 292 trades
+    "DOGE": {"lo": 75, "hi": 85, "min_rem": 6},   # +624c, 89% WR, 90 trades
+    # HYPE: skip
+}
+
 # Tiered entry strategy (backtested: +$13.46 vs current $4.38 over 60 cycles)
 # Tier 1: min 0-7 of cycle (cycle_sec 0-420 = 8-15 min remaining) → entry 1-20c
 # Tier 2: min 7-10 of cycle (cycle_sec 420-600 = 5-8 min remaining) → entry 20-49c
@@ -331,6 +351,73 @@ class Crypto15mAgent:
             print(f"  WS subscribed: {channel}")
 
     async def _evaluate_trade(self, ticker):
+        """Router: dispatch to the active strategy's evaluator."""
+        if STRATEGY == "fade":
+            await self._evaluate_fade(ticker)
+        elif STRATEGY == "late_favorite":
+            await self._evaluate_late_favorite(ticker)
+
+    async def _evaluate_late_favorite(self, ticker):
+        """Late-favorite strategy: at min_rem before close, buy the favored side if cost in band.
+        One trade per ticker per cycle. No averaging-down, no cooldown (single fire)."""
+        coin = None
+        for c, t in self.current_tickers.items():
+            if t == ticker:
+                coin = c
+                break
+        if not coin or coin not in COIN_LATE_FAV_CONFIG:
+            return
+
+        cfg = COIN_LATE_FAV_CONFIG[coin]
+        now = datetime.now()
+        cycle_sec = (now.minute % 15) * 60 + now.second  # 0-899
+
+        # Trigger window: from (min_rem * 60) seconds before close until 30s before close
+        # min_rem=5 → fire any time between cycle_sec 600 and 870
+        entry_threshold_sec = 900 - (cfg["min_rem"] * 60)
+        if cycle_sec < entry_threshold_sec or cycle_sec > 870:
+            return
+
+        # Rollover guard: ensure ticker is fresh (refreshed in last 60s)
+        now_ms = int(now.timestamp() * 1000)
+        refreshed_ms = self.ticker_refreshed_ts.get(ticker, 0)
+        if now_ms - refreshed_ms > 60_000:
+            return
+
+        # One trade per ticker per cycle (last_buy_ts cleared on rotation in _subscribe_open_markets)
+        if self.last_buy_ts.get(ticker) is not None:
+            return
+        if self.ticker_contracts.get(ticker, 0) > 0:
+            return
+        if ticker in self.resting_buys:
+            return  # in-flight order pending
+
+        # Get prices
+        prices = self.ws_prices.get(ticker)
+        if not prices:
+            return
+        yes_ask = prices.get("yes_ask")
+        yes_bid = prices.get("yes_bid")
+        if yes_ask is None or yes_bid is None or yes_ask <= 0 or yes_bid <= 0:
+            return
+
+        yes_mid = (yes_bid + yes_ask) / 2
+        if yes_mid > 50:
+            target_side = "yes"
+            cost = yes_ask  # cross the spread to take YES
+        else:
+            target_side = "no"
+            cost = 100 - yes_bid  # cross the spread to take NO
+
+        if not (cfg["lo"] <= cost <= cfg["hi"]):
+            return
+
+        # Set in-flight guard BEFORE posting so a second WS tick can't double-fire
+        self.last_buy_ts[ticker] = now_ms
+        print(f"[{now.strftime('%H:%M:%S')}] {coin} | LATE-FAV {target_side.upper()} @ {cost}c (band {cfg['lo']}-{cfg['hi']}, {cfg['min_rem']}m left)")
+        self._post_buy(ticker, coin, target_side, cost, target_contracts=1)
+
+    async def _evaluate_fade(self, ticker):
         """Called on every WS price update — manage resting buys with tiered window + cooldown."""
         coin = None
         for c, t in self.current_tickers.items():
@@ -640,19 +727,32 @@ class Crypto15mAgent:
 
                 # Log status every cycle
                 minutes_remaining = 15 - (datetime.now().minute % 15)
-                active_fades = []
-                for coin in COINS:
-                    sig, n = self.get_fade_signal(self.settlement_history[coin], coin=coin)
-                    if sig:
-                        cw = COIN_FADE_CONFIG.get(coin, {}).get("window", FADE_WINDOW)
-                        hist = self.settlement_history[coin][-cw:]
-                        yes_ct = sum(1 for r in hist if r == "yes")
-                        bonus = "+1" if n > BASE_CONTRACTS else ""
-                        mode_tag = "T" if COIN_SIGNAL_MODE.get(coin) == "trend" else ""
-                        active_fades.append(f"{coin}{mode_tag}:{sig.replace('buy_','').upper()}{bonus}({yes_ct}Y/{cw-yes_ct}N)")
-
-                fades_str = " | ".join(active_fades) if active_fades else "none"
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Min left: {minutes_remaining} | Fades: {fades_str} | WS: {'✓' if self.ws_connected else '✗'}")
+                if STRATEGY == "fade":
+                    active = []
+                    for coin in COINS:
+                        sig, n = self.get_fade_signal(self.settlement_history[coin], coin=coin)
+                        if sig:
+                            cw = COIN_FADE_CONFIG.get(coin, {}).get("window", FADE_WINDOW)
+                            hist = self.settlement_history[coin][-cw:]
+                            yes_ct = sum(1 for r in hist if r == "yes")
+                            bonus = "+1" if n > BASE_CONTRACTS else ""
+                            mode_tag = "T" if COIN_SIGNAL_MODE.get(coin) == "trend" else ""
+                            active.append(f"{coin}{mode_tag}:{sig.replace('buy_','').upper()}{bonus}({yes_ct}Y/{cw-yes_ct}N)")
+                    status = "Fades: " + (" | ".join(active) if active else "none")
+                else:  # late_favorite
+                    armed = []
+                    for coin, cfg in COIN_LATE_FAV_CONFIG.items():
+                        ticker = self.current_tickers.get(coin)
+                        held = self.ticker_contracts.get(ticker, 0) if ticker else 0
+                        fired = self.last_buy_ts.get(ticker) is not None if ticker else False
+                        if held or fired:
+                            armed.append(f"{coin}:done")
+                        elif minutes_remaining <= cfg["min_rem"]:
+                            armed.append(f"{coin}:armed({cfg['lo']}-{cfg['hi']}c)")
+                        else:
+                            armed.append(f"{coin}:wait{cfg['min_rem']}m")
+                    status = "LateFav: " + " | ".join(armed)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Min left: {minutes_remaining} | {status} | WS: {'✓' if self.ws_connected else '✗'}")
 
             except Exception as e:
                 print(f"Settlement check error: {e}")
@@ -773,14 +873,23 @@ class Crypto15mAgent:
 
     async def run(self):
         coins_str = ", ".join(COINS.keys())
-        print(f"🚀 Crypto 15m Fade Agent — {coins_str}")
-        print(f"   Signal: per-coin | T1: min 0-7 @ {TIER1_ENTRY_LOW}-{TIER1_ENTRY_HIGH}c | T2: min 7-10 @ {TIER2_ENTRY_LOW}-{TIER2_ENTRY_HIGH}c")
-        per_coin = " ".join(
-            f"{c}={COIN_FADE_CONFIG[c]['thresh']}/{COIN_FADE_CONFIG[c]['window']}{COIN_SIGNAL_MODE.get(c,'fade')[0].upper()}"
-            for c in COINS
-        )
-        print(f"   Per-coin: {per_coin}")
-        print(f"   Cooldown: {COOLDOWN_SEC}s/coin | Base: {BASE_CONTRACTS}/mkt (+1 on {STREAK_BONUS_LEN}-streak, max {MAX_CONTRACTS_PER_MARKET}) | Hold to settlement")
+        print(f"🚀 Crypto 15m Agent — STRATEGY={STRATEGY} — {coins_str}")
+        if STRATEGY == "fade":
+            print(f"   Signal: per-coin fade | T1: min 0-7 @ {TIER1_ENTRY_LOW}-{TIER1_ENTRY_HIGH}c | T2: min 7-10 @ {TIER2_ENTRY_LOW}-{TIER2_ENTRY_HIGH}c")
+            per_coin = " ".join(
+                f"{c}={COIN_FADE_CONFIG[c]['thresh']}/{COIN_FADE_CONFIG[c]['window']}{COIN_SIGNAL_MODE.get(c,'fade')[0].upper()}"
+                for c in COINS
+            )
+            print(f"   Per-coin: {per_coin}")
+            print(f"   Cooldown: {COOLDOWN_SEC}s/coin | Base: {BASE_CONTRACTS}/mkt (+1 on {STREAK_BONUS_LEN}-streak, max {MAX_CONTRACTS_PER_MARKET}) | Hold to settlement")
+        else:  # late_favorite
+            print(f"   Signal: late-favorite | one buy/cycle/coin | hold to settlement")
+            per_coin = " ".join(
+                f"{c}={cfg['lo']}-{cfg['hi']}c@{cfg['min_rem']}m"
+                for c, cfg in COIN_LATE_FAV_CONFIG.items()
+            )
+            print(f"   Per-coin: {per_coin}")
+            print(f"   Excluded: HYPE (no profitable config in backtest)")
         print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
 
         print("Seeding settlement history...")
