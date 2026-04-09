@@ -414,8 +414,8 @@ class Crypto15mAgent:
 
         # Set in-flight guard BEFORE posting so a second WS tick can't double-fire
         self.last_buy_ts[ticker] = now_ms
-        print(f"[{now.strftime('%H:%M:%S')}] {coin} | LATE-FAV {target_side.upper()} @ {cost}c (band {cfg['lo']}-{cfg['hi']}, {cfg['min_rem']}m left)")
-        self._post_buy(ticker, coin, target_side, cost, target_contracts=1)
+        print(f"[{now.strftime('%H:%M:%S')}] {coin} | LATE-FAV {target_side.upper()} 2 @ {cost}c (band {cfg['lo']}-{cfg['hi']}, {cfg['min_rem']}m left)")
+        self._post_buy(ticker, coin, target_side, cost, target_contracts=2, count=2)
 
     async def _evaluate_fade(self, ticker):
         """Called on every WS price update — manage resting buys with tiered window + cooldown."""
@@ -526,8 +526,8 @@ class Crypto15mAgent:
             if in_range:
                 self._post_buy(ticker, coin, target_side, market_price, target_contracts)
 
-    def _post_buy(self, ticker, coin, side, price, target_contracts):
-        """Post a single resting limit buy order. Only 1 contract at a time."""
+    def _post_buy(self, ticker, coin, side, price, target_contracts, count=1):
+        """Post a limit buy order. count=number of contracts in this single order."""
         client_order_id = f"fade-{side}-{ticker}-{int(time.time())}"
         coin_window = COIN_FADE_CONFIG.get(coin, {}).get("window", FADE_WINDOW)
         hist = self.settlement_history.get(coin, [])[-coin_window:]
@@ -536,7 +536,7 @@ class Crypto15mAgent:
         decision = f"BUY {side.upper()}"
         existing = self.ticker_contracts.get(ticker, 0)
 
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {coin} | {decision} 1 @ {price}c | held:{existing}/{target_contracts} | Fade: {fade_str}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {coin} | {decision} {count} @ {price}c | held:{existing}/{target_contracts} | Fade: {fade_str}")
 
         if self.client and not DRY_RUN:
             try:
@@ -545,7 +545,7 @@ class Crypto15mAgent:
                     client_order_id=client_order_id,
                     side=side,
                     action="buy",
-                    count=1,
+                    count=count,
                     type="limit",
                     yes_price=price if side == "yes" else None,
                     no_price=price if side == "no" else None,
