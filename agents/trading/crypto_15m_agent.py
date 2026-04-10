@@ -11,11 +11,13 @@ import os
 import csv
 import time
 import json
+import re
 import base64
 from datetime import datetime
 from typing import Dict, Optional, Set
 from collections import defaultdict
 
+import requests as http_requests
 import websockets
 from kalshi_client.client import KalshiClient
 from cryptography.hazmat.primitives import hashes, serialization
@@ -31,11 +33,19 @@ RATCHET_PERCENT = 0.80
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 
 # Strategy selector — mutually exclusive
-#   "fade"          → existing tiered fade strategy (min 0-10, entry 1-49c)
-#   "late_favorite" → buy the favored side late in cycle (per-coin band + min-rem)
-STRATEGY = os.getenv('STRATEGY', 'fade').lower()
-if STRATEGY not in ("fade", "late_favorite"):
-    raise SystemExit(f"Invalid STRATEGY={STRATEGY!r}; must be 'fade' or 'late_favorite'")
+#   "fade"          → tiered fade/trend strategy
+#   "late_favorite" → buy favored side late in cycle
+#   "brti"          → BRTI momentum: BTC only, entry from 1st 15s direction, flip sell on reversal
+STRATEGY = os.getenv('STRATEGY', 'brti').lower()
+if STRATEGY not in ("fade", "late_favorite", "brti"):
+    raise SystemExit(f"Invalid STRATEGY={STRATEGY!r}; must be 'fade', 'late_favorite', or 'brti'")
+
+# ─── BRTI Config ───
+BRTI_URL = "https://www.cfbenchmarks.com/data/indices/BRTI"
+BRTI_POLL_SEC = 10            # poll cfbenchmarks every 10s
+BRTI_MOMENTUM_WINDOW = 15    # seconds of BRTI data to assess initial direction
+BRTI_ENTRY_MAX = 20          # max entry price (cents) for initial buy
+BRTI_FLIP_BUFFER_PCT = 0.01  # flip when BRTI crosses within 0.01% of strike (early warning)
 
 # Per-coin late-favorite config (5-day backtest 2026-04-08, net of fees+slippage)
 # {lo, hi} = entry cost band in cents; min_rem = trigger when this many minutes remain
@@ -175,6 +185,15 @@ class Crypto15mAgent:
         self.ws_prices: Dict[str, dict] = {}
         self.ws_connected = False
 
+        # BRTI state (used when STRATEGY="brti")
+        self.brti_ticks: list = []         # [(unix_ts, value), ...] rolling buffer
+        self.brti_last_poll: float = 0     # last poll timestamp
+        self.brti_strike: float = 0        # current cycle strike price
+        self.brti_direction: str = ""      # "up" or "down" from initial momentum
+        self.brti_entry_made: bool = False # whether we entered this cycle
+        self.brti_held_side: str = ""      # "yes" or "no" — what we currently hold
+        self.brti_cycle_id: str = ""       # ticker of current cycle (to detect rotation)
+
         if not os.path.exists(self.log_file):
             with open(self.log_file, "w", newline="") as f:
                 csv.writer(f).writerow([
@@ -264,6 +283,12 @@ class Crypto15mAgent:
                     self.current_tickers[coin] = ticker
                     self.ticker_refreshed_ts[ticker] = now_ms
                     tickers.append(ticker)
+                    # Capture strike for BRTI strategy
+                    if STRATEGY == "brti" and coin == "BTC":
+                        strike = m.get("floor_strike")
+                        if strike:
+                            self.brti_strike = float(strike)
+                            print(f"  📍 BTC strike: ${self.brti_strike:,.2f}")
             except Exception as e:
                 print(f"  Open market lookup error {coin}: {e}")
 
@@ -271,6 +296,12 @@ class Crypto15mAgent:
         if rotated:
             self.last_buy_ts.clear()
             self.last_buy_price.clear()
+            # Reset BRTI cycle state
+            if STRATEGY == "brti":
+                self.brti_direction = ""
+                self.brti_entry_made = False
+                self.brti_held_side = ""
+                print(f"  🔄 BRTI cycle reset (strike: ${self.brti_strike:,.2f})")
 
         if tickers and self.ws_connected:
             await self.ws.send(json.dumps({
@@ -355,6 +386,148 @@ class Crypto15mAgent:
             await self._evaluate_fade(ticker)
         elif STRATEGY == "late_favorite":
             await self._evaluate_late_favorite(ticker)
+        elif STRATEGY == "brti":
+            await self._evaluate_brti(ticker)
+
+    async def _evaluate_brti(self, ticker):
+        """BRTI momentum strategy: BTC only.
+        1. At cycle start (after 15s), buy the side BRTI momentum suggests, at ≤20c
+        2. Throughout cycle, monitor BRTI vs strike — flip sell if position going unprofitable
+        """
+        coin = None
+        for c, t in self.current_tickers.items():
+            if t == ticker:
+                coin = c
+                break
+        if not coin or coin != "BTC":
+            return
+        if self.brti_strike <= 0 or not self.brti_ticks:
+            return
+
+        now = datetime.now()
+        cycle_sec = (now.minute % 15) * 60 + now.second
+
+        # Rollover guard
+        if cycle_sec < ROLLOVER_GUARD_SEC:
+            return
+        now_ms = int(now.timestamp() * 1000)
+        refreshed_ms = self.ticker_refreshed_ts.get(ticker, 0)
+        if now_ms - refreshed_ms > 60_000:
+            return
+
+        prices = self.ws_prices.get(ticker)
+        if not prices:
+            return
+        yes_ask = prices.get("yes_ask", 0)
+        yes_bid = prices.get("yes_bid", 0)
+        if yes_ask <= 0 or yes_bid <= 0:
+            return
+
+        latest_brti = self.brti_ticks[-1][1] if self.brti_ticks else 0
+        if latest_brti <= 0:
+            return
+
+        # ── Phase 1: Determine direction from first 15s of cycle ──
+        if not self.brti_direction and cycle_sec >= BRTI_MOMENTUM_WINDOW:
+            # Get BRTI values from cycle start vs now
+            cycle_start_ts = now.timestamp() - cycle_sec
+            start_ticks = [v for t, v in self.brti_ticks if t >= cycle_start_ts and t <= cycle_start_ts + 5]
+            recent_ticks = [v for t, v in self.brti_ticks if t >= now.timestamp() - 5]
+            if start_ticks and recent_ticks:
+                start_avg = sum(start_ticks) / len(start_ticks)
+                recent_avg = sum(recent_ticks) / len(recent_ticks)
+                if recent_avg > start_avg:
+                    self.brti_direction = "up"
+                elif recent_avg < start_avg:
+                    self.brti_direction = "down"
+                else:
+                    self.brti_direction = "flat"
+                delta = recent_avg - start_avg
+                print(f"[{now.strftime('%H:%M:%S')}] BRTI direction: {self.brti_direction} (${start_avg:,.2f} → ${recent_avg:,.2f}, Δ${delta:+,.2f}) | strike: ${self.brti_strike:,.2f}")
+
+        # ── Phase 2: Initial entry ──
+        if self.brti_direction and not self.brti_entry_made and self.brti_direction != "flat":
+            target_side = "yes" if self.brti_direction == "up" else "no"
+            # Cost to buy
+            if target_side == "yes":
+                cost = yes_ask
+            else:
+                cost = 100 - yes_bid
+            if 1 <= cost <= BRTI_ENTRY_MAX:
+                self.brti_entry_made = True
+                self.brti_held_side = target_side
+                print(f"[{now.strftime('%H:%M:%S')}] BTC BRTI-ENTRY {target_side.upper()} 1 @ {cost}c (BRTI {self.brti_direction}, strike ${self.brti_strike:,.2f})")
+                self._post_buy(ticker, coin, target_side, cost, target_contracts=1, count=1)
+                return
+
+        # ── Phase 3: Flip sell — monitor BRTI vs strike throughout cycle ──
+        if self.brti_held_side and self.ticker_contracts.get(ticker, 0) > 0:
+            # Determine if our position is about to go unprofitable
+            # YES wins if BRTI ≥ strike at settlement. NO wins if BRTI < strike.
+            buffer = self.brti_strike * BRTI_FLIP_BUFFER_PCT / 100  # e.g., 0.01% of strike
+
+            should_flip = False
+            if self.brti_held_side == "yes":
+                # We're profitable while BRTI > strike. Flip if BRTI dropping below strike
+                if latest_brti < self.brti_strike - buffer:
+                    should_flip = True
+                    new_side = "no"
+            elif self.brti_held_side == "no":
+                # We're profitable while BRTI < strike. Flip if BRTI rising above strike
+                if latest_brti > self.brti_strike + buffer:
+                    should_flip = True
+                    new_side = "yes"
+
+            if should_flip:
+                held_count = self.ticker_contracts.get(ticker, 0)
+                old_side = self.brti_held_side
+                # Sell current position
+                sell_price = yes_bid if old_side == "yes" else (100 - yes_ask)
+                print(f"[{now.strftime('%H:%M:%S')}] 🔄 BRTI FLIP: BRTI=${latest_brti:,.2f} crossed strike ${self.brti_strike:,.2f} | SELL {old_side.upper()} {held_count}x @ {sell_price}c → BUY {new_side.upper()}")
+
+                if self.client and not DRY_RUN:
+                    try:
+                        # Sell existing position
+                        sell_id = f"flip-sell-{ticker}-{int(time.time())}"
+                        self.client.create_order(
+                            ticker=ticker,
+                            client_order_id=sell_id,
+                            side=old_side,
+                            action="sell",
+                            count=held_count,
+                            type="limit",
+                            yes_price=yes_bid if old_side == "yes" else None,
+                            no_price=(100 - yes_ask) if old_side == "no" else None,
+                        )
+                        # Reset position tracking
+                        self.ticker_contracts[ticker] = 0
+                        self.positions[ticker] = []
+
+                        # Buy new side
+                        new_cost = yes_ask if new_side == "yes" else (100 - yes_bid)
+                        if new_cost <= BRTI_ENTRY_MAX:
+                            buy_id = f"flip-buy-{ticker}-{int(time.time())}"
+                            self.client.create_order(
+                                ticker=ticker,
+                                client_order_id=buy_id,
+                                side=new_side,
+                                action="buy",
+                                count=1,
+                                type="limit",
+                                yes_price=yes_ask if new_side == "yes" else None,
+                                no_price=(100 - yes_bid) if new_side == "no" else None,
+                            )
+                            self.brti_held_side = new_side
+                            print(f"  → Flipped to {new_side.upper()} 1x @ {new_cost}c")
+                        else:
+                            self.brti_held_side = ""
+                            print(f"  → Sold but new side too expensive ({new_cost}c > {BRTI_ENTRY_MAX}c), flat")
+                    except Exception as e:
+                        print(f"  → Flip error: {e}")
+                elif DRY_RUN:
+                    self.ticker_contracts[ticker] = 0
+                    self.brti_held_side = new_side
+                    print(f"  📄 PAPER flip to {new_side.upper()}")
 
     async def _evaluate_late_favorite(self, ticker):
         """Late-favorite strategy: at min_rem before close, buy the favored side if cost in band.
@@ -700,6 +873,38 @@ class Crypto15mAgent:
 
     # ─── Periodic Tasks ───────────────────────────────────────
 
+    async def brti_poll_loop(self):
+        """Poll cfbenchmarks.com for BRTI ticks every BRTI_POLL_SEC."""
+        while self.running:
+            try:
+                resp = http_requests.get(BRTI_URL, timeout=30)
+                m = re.search(r'"rtis":\[(.*?)\]', resp.text)
+                if m:
+                    data = json.loads('[' + m.group(1) + ']')
+                    # Merge new ticks into rolling buffer
+                    existing_ts = set(t for t, _ in self.brti_ticks)
+                    new_count = 0
+                    for tick in data:
+                        ts = tick['time'] / 1000  # ms → s
+                        val = float(tick['value'])
+                        if ts not in existing_ts:
+                            self.brti_ticks.append((ts, val))
+                            new_count += 1
+                    # Sort and trim to last 5 min
+                    self.brti_ticks.sort()
+                    cutoff = time.time() - 300
+                    self.brti_ticks = [(t, v) for t, v in self.brti_ticks if t > cutoff]
+                    if self.brti_ticks:
+                        latest = self.brti_ticks[-1]
+                        age = time.time() - latest[0]
+                        if new_count > 0 or age < 120:
+                            pass  # normal, no log spam
+                        else:
+                            print(f"  ⚠ BRTI data stale ({age:.0f}s)")
+            except Exception as e:
+                print(f"  BRTI poll error: {e}")
+            await asyncio.sleep(BRTI_POLL_SEC)
+
     async def settlement_check_loop(self):
         """Every 30s: check for new settlements and refresh open market subscriptions."""
         while self.running:
@@ -738,7 +943,7 @@ class Crypto15mAgent:
                             mode_tag = "T" if COIN_SIGNAL_MODE.get(coin) == "trend" else ""
                             active.append(f"{coin}{mode_tag}:{sig.replace('buy_','').upper()}{bonus}({yes_ct}Y/{cw-yes_ct}N)")
                     status = "Fades: " + (" | ".join(active) if active else "none")
-                else:  # late_favorite
+                elif STRATEGY == "late_favorite":
                     armed = []
                     for coin, cfg in COIN_LATE_FAV_CONFIG.items():
                         ticker = self.current_tickers.get(coin)
@@ -751,6 +956,13 @@ class Crypto15mAgent:
                         else:
                             armed.append(f"{coin}:wait{cfg['min_rem']}m")
                     status = "LateFav: " + " | ".join(armed)
+                elif STRATEGY == "brti":
+                    brti_val = f"${self.brti_ticks[-1][1]:,.2f}" if self.brti_ticks else "?"
+                    brti_age = f"{time.time() - self.brti_ticks[-1][0]:.0f}s" if self.brti_ticks else "?"
+                    btc_ticker = self.current_tickers.get("BTC", "")
+                    held = self.ticker_contracts.get(btc_ticker, 0)
+                    side_str = self.brti_held_side.upper() if self.brti_held_side else "flat"
+                    status = f"BRTI: {brti_val} (age:{brti_age}) | strike: ${self.brti_strike:,.2f} | dir: {self.brti_direction or 'wait'} | pos: {side_str} {held}x"
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Min left: {minutes_remaining} | {status} | WS: {'✓' if self.ws_connected else '✗'}")
 
             except Exception as e:
@@ -882,7 +1094,7 @@ class Crypto15mAgent:
             )
             print(f"   Per-coin: {per_coin}")
             print(f"   Cooldown: {COOLDOWN_SEC}s/coin | Base: {BASE_CONTRACTS}/mkt (+1 on {STREAK_BONUS_LEN}-streak, max {MAX_CONTRACTS_PER_MARKET}) | Hold to settlement")
-        else:  # late_favorite
+        elif STRATEGY == "late_favorite":
             print(f"   Signal: late-favorite | one buy/cycle/coin | hold to settlement")
             per_coin = " ".join(
                 f"{c}={cfg['lo']}-{cfg['hi']}c@{cfg['min_rem']}m"
@@ -890,6 +1102,11 @@ class Crypto15mAgent:
             )
             print(f"   Per-coin: {per_coin}")
             print(f"   Excluded: HYPE (no profitable config in backtest)")
+        elif STRATEGY == "brti":
+            print(f"   Signal: BRTI momentum | BTC only | entry ≤{BRTI_ENTRY_MAX}c")
+            print(f"   Momentum: first {BRTI_MOMENTUM_WINDOW}s of cycle → direction")
+            print(f"   Flip sell: when BRTI crosses strike (buffer {BRTI_FLIP_BUFFER_PCT}%)")
+            print(f"   BRTI source: cfbenchmarks.com (poll every {BRTI_POLL_SEC}s)")
         print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
 
         print("Seeding settlement history...")
@@ -899,6 +1116,9 @@ class Crypto15mAgent:
         if self.client and self.key_id and self.private_key_path:
             asyncio.create_task(self.kalshi_websocket())
         asyncio.create_task(self.settlement_check_loop())
+        if STRATEGY == "brti":
+            asyncio.create_task(self.brti_poll_loop())
+            print("📡 BRTI poll loop started")
 
         # Keep main alive
         while self.running:
