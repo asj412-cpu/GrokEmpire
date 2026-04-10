@@ -55,6 +55,7 @@ BRTI_CONVICTION_MAX_ADDS = 2        # max 2 additional contracts (3 total with e
 BRTI_CONVICTION_COOLDOWN_SEC = 60   # 60s between conviction buys
 BRTI_CONVICTION_MAX_PRICE = 85      # only buy if ≤85c (getting a discount vs true probability)
 BRTI_TAKE_PROFIT_C = 95              # exit immediately if position value hits 95c+ (lock in the win)
+BRTI_REENTRY_MAX_PRICE = 80          # after take-profit, only re-enter at ≤80c (buy the dip)
 
 # Synthetic BRTI — real-time feed from constituent exchange WebSockets
 # Volume-weighted median of Coinbase, Kraken, Bitstamp, Gemini (~80%+ of BRTI weight)
@@ -518,7 +519,9 @@ class Crypto15mAgent:
                         cost = 100 - yb if yb > 0 else 0
                 except Exception:
                     pass
-            if 1 <= cost <= BRTI_ENTRY_MAX:
+            # Use tighter cap for re-entries after take-profit (buy the dip, not the top)
+            max_price = BRTI_REENTRY_MAX_PRICE if self.brti_conviction_adds > 0 or self.brti_peak_value > 0 else BRTI_ENTRY_MAX
+            if 1 <= cost <= max_price:
                 self.brti_entry_made = True
                 self.brti_held_side = target_side
                 self.brti_entry_price = cost
@@ -916,7 +919,10 @@ class Crypto15mAgent:
                                     self.ticker_contracts[btc_ticker] = 0
                                     self.positions[btc_ticker] = []
                                     self.brti_held_side = ""
-                                    print(f"  → Sold {held}x @ {current_value}c — done for this cycle")
+                                    self.brti_entry_made = False  # allow re-entry if price dips back
+                                    self.brti_peak_value = 0
+                                    self.brti_entry_price = 0
+                                    print(f"  → Sold {held}x @ {current_value}c — watching for re-entry")
                                 except Exception as e:
                                     print(f"  → Take profit error: {e}")
                             await asyncio.sleep(0.5)
