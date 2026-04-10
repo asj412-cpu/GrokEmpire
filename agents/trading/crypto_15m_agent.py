@@ -44,8 +44,9 @@ if STRATEGY not in ("fade", "late_favorite", "brti"):
 BRTI_MOMENTUM_WINDOW = 15    # seconds of BRTI data to assess initial direction
 BRTI_ENTRY_MAX = 95          # max entry price (cents) — buy at market if momentum agrees
 BRTI_FLIP_COOLDOWN_SEC = 30   # minimum seconds between flips — prevents thrashing
-BRTI_TRAILING_STOP_C = 5      # profitable position: flip when value drops 5c from peak
+BRTI_TRAILING_STOP_C = 5      # profitable position: flip when value drops 5c from peak (in danger zone)
 BRTI_STOP_LOSS_C = 5          # never-profitable position: flip when down 5c from entry (max loss)
+BRTI_SMOOTHING_WINDOW = 60    # 60-second rolling average to simulate settlement smoothing
 
 # Synthetic BRTI — real-time feed from constituent exchange WebSockets
 # Volume-weighted median of Coinbase, Kraken, Bitstamp, Gemini (~80%+ of BRTI weight)
@@ -897,28 +898,52 @@ class Crypto15mAgent:
                         was_profitable = self.brti_peak_value > self.brti_entry_price
                         loss_from_entry = self.brti_entry_price - current_value
 
-                        # How far is sBRTI from strike on our side?
-                        if self.brti_held_side == "yes":
-                            our_distance = distance   # positive = good for YES
-                        else:
-                            our_distance = -distance  # positive = good for NO
+                        # ── Compute projected settlement value ──
+                        # 60s smoothed sBRTI (simulates the settlement smoothing)
+                        now_ts = time.time()
+                        smooth_ticks = [v for t, v in self.brti_ticks if t > now_ts - BRTI_SMOOTHING_WINDOW]
+                        smoothed_brti = sum(smooth_ticks) / len(smooth_ticks) if smooth_ticks else latest_brti
 
-                        in_danger_zone = our_distance < 30  # sBRTI within $30 of strike
+                        # Momentum: rate of change over last 30s ($/sec)
+                        ticks_30s = [v for t, v in self.brti_ticks if t > now_ts - 30]
+                        ticks_10s = [v for t, v in self.brti_ticks if t > now_ts - 10]
+                        if len(ticks_30s) >= 2 and len(ticks_10s) >= 1:
+                            momentum = (sum(ticks_10s) / len(ticks_10s)) - (sum(ticks_30s) / len(ticks_30s))
+                            # momentum > 0 = rising, < 0 = falling
+                        else:
+                            momentum = 0
+
+                        # Time remaining in cycle
+                        cycle_now = datetime.now()
+                        cycle_sec = (cycle_now.minute % 15) * 60 + cycle_now.second
+                        secs_remaining = max(1, 900 - cycle_sec)
+
+                        # Project where the smoothed sBRTI will be at settlement
+                        # Simple linear projection: current_smoothed + (momentum_per_sec * secs_remaining)
+                        # Dampen momentum projection (markets don't trend linearly)
+                        momentum_per_sec = momentum / 20  # 20s span of the momentum calc
+                        dampen = min(1.0, 60 / secs_remaining)  # more dampening with more time left
+                        projected_settlement = smoothed_brti + (momentum_per_sec * secs_remaining * dampen * 0.3)
+
+                        # Is our position at risk based on the PROJECTED settlement?
+                        if self.brti_held_side == "yes":
+                            projected_winning = projected_settlement >= self.brti_strike
+                        else:
+                            projected_winning = projected_settlement < self.brti_strike
 
                         if was_profitable:
-                            # ── SCENARIO 1: Was profitable → trailing stop ONLY in danger zone ──
-                            # If sBRTI is comfortably on our side ($30+), hold — price dip is noise
-                            if drop_from_peak >= BRTI_TRAILING_STOP_C and in_danger_zone:
+                            # ── SCENARIO 1: Was profitable → trailing stop ONLY if projected to lose ──
+                            if drop_from_peak >= BRTI_TRAILING_STOP_C and not projected_winning:
                                 should_flip = True
                                 new_side = "no" if self.brti_held_side == "yes" else "yes"
                                 profit = current_value - self.brti_entry_price
-                                reason = f"TRAILING STOP (entry:{self.brti_entry_price}c peak:{self.brti_peak_value}c now:{current_value}c pnl:{profit:+d}c sBRTI ${our_distance:+,.0f} from strike)"
+                                reason = f"TRAILING STOP (entry:{self.brti_entry_price}c peak:{self.brti_peak_value}c now:{current_value}c pnl:{profit:+d}c proj:${projected_settlement:,.0f} vs strike:${self.brti_strike:,.0f})"
                         else:
-                            # ── SCENARIO 2: Never profitable → hard stop-loss to limit damage ──
-                            if loss_from_entry >= BRTI_STOP_LOSS_C:
+                            # ── SCENARIO 2: Never profitable → stop-loss ONLY if projected to lose ──
+                            if loss_from_entry >= BRTI_STOP_LOSS_C and not projected_winning:
                                 should_flip = True
                                 new_side = "no" if self.brti_held_side == "yes" else "yes"
-                                reason = f"STOP LOSS (entry:{self.brti_entry_price}c now:{current_value}c loss:{loss_from_entry}c)"
+                                reason = f"STOP LOSS (entry:{self.brti_entry_price}c now:{current_value}c loss:{loss_from_entry}c proj:${projected_settlement:,.0f} vs strike:${self.brti_strike:,.0f})"
 
                         if should_flip:
                             old_side = self.brti_held_side
