@@ -1132,10 +1132,6 @@ class Crypto15mAgent:
                 if self.ws_connected:
                     await self._subscribe_open_markets()
 
-                # FLIP SELL DISABLED — live test revealed math flaw:
-                # When held side bid < 50c, opp ask > 50c (always sums to ~100)
-                # so flip-buying opp has minimal upside. Was burning capital.
-                # self._check_flip_sell_window()
 
                 # Balance ratchet
                 balance = self.get_balance() or self.last_balance
@@ -1191,16 +1187,9 @@ class Crypto15mAgent:
             sec_to_boundary = max(1, 900 - cycle_sec_now + 1)
             await asyncio.sleep(min(30, sec_to_boundary))
 
-    def _check_flip_sell_window(self):
-        """At minute 11 (4 min remaining), flip held positions if losing.
-
-        Backtest showed: if held YES is still <50c at min 11, contract has 59-100%
-        chance of settling NO. Flipping to NO converts likely loss into likely win.
-
-        Logic:
-        - Only fires once per ticker (tracked via self.flipped_tickers)
-        - Only fires when minutes_remaining == 4 (min 11 of cycle)
-        - For each held position, check current ask. If ask < 50c → flip via two orders:
+    def _check_flip_sell_window_DISABLED(self):
+        """DISABLED — replaced by brti_fast_flip_loop with trailing stop + projected settlement.
+        Kept for reference only.
           1. Sell our held position (close)
           2. Buy opposite side at current ask
         """
