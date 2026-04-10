@@ -43,19 +43,57 @@ if STRATEGY not in ("fade", "late_favorite", "brti"):
 # ─── BRTI Config ───
 BRTI_MOMENTUM_WINDOW = 15    # seconds of BRTI data to assess initial direction
 BRTI_ENTRY_MAX = 95          # max entry price (cents) — buy at market if momentum agrees
-BRTI_FLIP_COOLDOWN_SEC = 30   # minimum seconds between flips — prevents thrashing
-BRTI_TRAILING_STOP_C = 5      # profitable position: flip when value drops 5c from peak (in danger zone)
-BRTI_STOP_LOSS_C = 5          # never-profitable position: flip when down 5c from entry (max loss)
 BRTI_SMOOTHING_WINDOW = 60    # 60-second rolling average to simulate settlement smoothing
 
-# Conviction buy — add contracts when projected settlement is locked in our favor
-BRTI_CONVICTION_MIN_DISTANCE = 50   # projected settlement must be $50+ past strike
-BRTI_CONVICTION_MIN_CYCLE_SEC = 180 # at least 3 min into cycle before conviction buys
-BRTI_CONVICTION_MAX_ADDS = 2        # max 2 additional contracts (3 total with entry)
-BRTI_CONVICTION_COOLDOWN_SEC = 60   # 60s between conviction buys
-BRTI_CONVICTION_MAX_PRICE = 85      # only buy if ≤85c (getting a discount vs true probability)
-BRTI_TAKE_PROFIT_C = 95              # exit immediately if position value hits 95c+ (lock in the win)
-BRTI_REENTRY_MAX_PRICE = 80          # after take-profit, only re-enter at ≤80c (buy the dip)
+# Per-coin trading parameters — tuned for each asset's volatility and price level
+BRTI_COIN_CONFIG = {
+    "BTC": {
+        "series": "KXBTC15M",
+        "flip_cooldown_sec": 30,
+        "trailing_stop_c": 5,
+        "stop_loss_c": 5,
+        "conviction_min_distance": 50,
+        "conviction_min_cycle_sec": 180,
+        "conviction_max_adds": 2,
+        "conviction_cooldown_sec": 60,
+        "conviction_max_price": 85,
+        "take_profit_c": 95,
+        "reentry_max_price": 80,
+        "entry_max": 49,
+        "momentum_window": 15,
+        "ws_pairs": {"coinbase": "BTC-USD", "kraken": "XBT/USD", "bitstamp": "btcusd", "gemini": "BTCUSD"},
+    },
+    "ETH": {
+        "series": "KXETH15M",
+        "flip_cooldown_sec": 30,
+        "trailing_stop_c": 5,
+        "stop_loss_c": 5,
+        "conviction_min_distance": 1.50,
+        "conviction_min_cycle_sec": 180,
+        "conviction_max_adds": 2,
+        "conviction_cooldown_sec": 60,
+        "conviction_max_price": 85,
+        "take_profit_c": 95,
+        "reentry_max_price": 80,
+        "entry_max": 49,
+        "momentum_window": 15,
+        "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD"},
+    },
+}
+
+# Legacy constants — used as defaults when coin not in BRTI_COIN_CONFIG
+BRTI_FLIP_COOLDOWN_SEC = 30
+BRTI_TRAILING_STOP_C = 5
+BRTI_STOP_LOSS_C = 5
+BRTI_CONVICTION_MIN_DISTANCE = 50
+BRTI_CONVICTION_MIN_CYCLE_SEC = 180
+BRTI_CONVICTION_MAX_ADDS = 2
+BRTI_CONVICTION_COOLDOWN_SEC = 60
+BRTI_CONVICTION_MAX_PRICE = 85
+BRTI_TAKE_PROFIT_C = 95
+BRTI_REENTRY_MAX_PRICE = 80
+BRTI_ENTRY_MAX = 95
+BRTI_MOMENTUM_WINDOW = 15
 
 # Synthetic BRTI — real-time feed from constituent exchange WebSockets
 # Volume-weighted median of Coinbase, Kraken, Bitstamp, Gemini (~80%+ of BRTI weight)
@@ -1006,14 +1044,44 @@ class Crypto15mAgent:
                             projected_winning = projected_settlement < self.brti_strike
 
                         if was_profitable:
-                            # ── SCENARIO 1: Was profitable → trailing stop ONLY if projected to lose ──
-                            if drop_from_peak >= BRTI_TRAILING_STOP_C and not projected_winning:
+                            # ── SCENARIO 1: Was profitable → trailing stop on PRICE alone ──
+                            # Don't wait for projection — Kalshi market sees drops before smoothed sBRTI
+                            if drop_from_peak >= BRTI_TRAILING_STOP_C:
                                 should_flip = True
                                 new_side = "no" if self.brti_held_side == "yes" else "yes"
                                 profit = current_value - self.brti_entry_price
-                                reason = f"TRAILING STOP (entry:{self.brti_entry_price}c peak:{self.brti_peak_value}c now:{current_value}c pnl:{profit:+d}c proj:${projected_settlement:,.0f} vs strike:${self.brti_strike:,.0f})"
+                                reason = f"TRAILING STOP (entry:{self.brti_entry_price}c peak:{self.brti_peak_value}c now:{current_value}c pnl:{profit:+d}c)"
+                                # But only buy the OTHER side if projection confirms it
+                                if projected_winning:
+                                    should_flip = False  # sell but don't flip — just go flat
+                                    if drop_from_peak >= BRTI_TRAILING_STOP_C:
+                                        # Still sell to protect profits, just don't buy other side
+                                        old_side = self.brti_held_side
+                                        sell_price = current_value
+                                        pnl_val = sell_price - self.brti_entry_price
+                                        print(f"[{datetime.now().strftime('%H:%M:%S')}] 📉 PROTECT PROFIT: SELL {old_side.upper()} @ {sell_price}c (peak:{self.brti_peak_value}c pnl:{pnl_val:+d}c) — flat, watching")
+                                        if self.client and not DRY_RUN:
+                                            try:
+                                                tp_id = f"prot-{btc_ticker}-{int(time.time()*1000)}"
+                                                self.client.create_order(
+                                                    ticker=btc_ticker, client_order_id=tp_id,
+                                                    side=old_side, action="sell", count=held, type="limit",
+                                                    yes_price=yes_bid if old_side == "yes" else None,
+                                                    no_price=(100 - yes_ask) if old_side == "no" else None,
+                                                )
+                                                self.ticker_contracts[btc_ticker] = 0
+                                                self.positions[btc_ticker] = []
+                                                self.brti_held_side = ""
+                                                self.brti_entry_made = False
+                                                self.brti_peak_value = 0
+                                                self.brti_entry_price = 0
+                                                self.brti_last_flip_ts = time.time()
+                                            except Exception as e:
+                                                print(f"  → Protect profit error: {e}")
+                                        await asyncio.sleep(0.5)
+                                        continue
                         else:
-                            # ── SCENARIO 2: Never profitable → stop-loss ONLY if projected to lose ──
+                            # ── SCENARIO 2: Never profitable → stop-loss if projected to lose ──
                             if loss_from_entry >= BRTI_STOP_LOSS_C and not projected_winning:
                                 should_flip = True
                                 new_side = "no" if self.brti_held_side == "yes" else "yes"
