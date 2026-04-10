@@ -545,14 +545,15 @@ class Crypto15mAgent:
             # (projected settlement must have crossed strike — not routine momentum)
             secs_remaining = max(1, 900 - cycle_sec)
             if secs_remaining <= 120:
-                # Check if projected settlement actually crossed strike
+                # Only enter on MASSIVE regime change — smoothed sBRTI must have crossed
+                # strike by enough to actually move the 1-min settlement average
+                # Need $50+ past strike (for BTC) to overcome the smoothing inertia
                 smooth_ticks = [v for t, v in self.brti_ticks if t > now.timestamp() - BRTI_SMOOTHING_WINDOW]
                 if smooth_ticks:
                     smoothed = sum(smooth_ticks) / len(smooth_ticks)
-                    if target_side == "yes" and smoothed < self.brti_strike:
-                        return  # sBRTI still below strike — not a real regime change
-                    if target_side == "no" and smoothed > self.brti_strike:
-                        return  # sBRTI still above strike — not a real regime change
+                    distance_past_strike = smoothed - self.brti_strike if target_side == "yes" else self.brti_strike - smoothed
+                    if distance_past_strike < 50:
+                        return  # not enough momentum to move the smoothed settlement price
                 else:
                     return  # no data, don't enter this late
 
