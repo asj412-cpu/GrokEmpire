@@ -44,7 +44,7 @@ if STRATEGY not in ("fade", "late_favorite", "brti"):
 BRTI_URL = "https://www.cfbenchmarks.com/data/indices/BRTI"
 BRTI_POLL_SEC = 10            # poll cfbenchmarks every 10s
 BRTI_MOMENTUM_WINDOW = 15    # seconds of BRTI data to assess initial direction
-BRTI_ENTRY_MAX = 20          # max entry price (cents) for initial buy
+BRTI_ENTRY_MAX = 95          # max entry price (cents) — buy at market if momentum agrees
 BRTI_FLIP_BUFFER_PCT = 0.01  # flip when BRTI crosses within 0.01% of strike (early warning)
 
 # Per-coin late-favorite config (5-day backtest 2026-04-08, net of fees+slippage)
