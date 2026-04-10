@@ -44,8 +44,8 @@ if STRATEGY not in ("fade", "late_favorite", "brti"):
 BRTI_MOMENTUM_WINDOW = 15    # seconds of BRTI data to assess initial direction
 BRTI_ENTRY_MAX = 95          # max entry price (cents) — buy at market if momentum agrees
 BRTI_FLIP_COOLDOWN_SEC = 30   # minimum seconds between flips — prevents thrashing
-BRTI_FLIP_MIN_DISTANCE = 10   # sBRTI must be $10+ past strike on the wrong side to flip (safety net)
-BRTI_TRAILING_STOP_C = 5      # flip when position drops 5c from its peak value (profit protection)
+BRTI_TRAILING_STOP_C = 5      # profitable position: flip when value drops 5c from peak
+BRTI_STOP_LOSS_C = 5          # never-profitable position: flip when down 5c from entry (max loss)
 
 # Synthetic BRTI — real-time feed from constituent exchange WebSockets
 # Volume-weighted median of Coinbase, Kraken, Bitstamp, Gemini (~80%+ of BRTI weight)
@@ -968,23 +968,22 @@ class Crypto15mAgent:
                         should_flip = False
                         new_side = ""
                         reason = ""
+                        was_profitable = self.brti_peak_value > self.brti_entry_price
+                        loss_from_entry = self.brti_entry_price - current_value
 
-                        # Trigger 1: Trailing stop — profit is declining
-                        if drop_from_peak >= BRTI_TRAILING_STOP_C and self.brti_peak_value > self.brti_entry_price:
-                            should_flip = True
-                            new_side = "no" if self.brti_held_side == "yes" else "yes"
-                            reason = f"trailing stop (peak:{self.brti_peak_value}c→now:{current_value}c, drop:{drop_from_peak}c)"
-
-                        # Trigger 2: Strike crossing — already on wrong side (safety net)
-                        if not should_flip:
-                            if self.brti_held_side == "yes" and distance < -BRTI_FLIP_MIN_DISTANCE:
+                        if was_profitable:
+                            # ── SCENARIO 1: Was profitable → trailing stop to lock in gains ──
+                            if drop_from_peak >= BRTI_TRAILING_STOP_C:
                                 should_flip = True
-                                new_side = "no"
-                                reason = f"strike cross (sBRTI ${distance:+,.0f} from strike)"
-                            elif self.brti_held_side == "no" and distance > BRTI_FLIP_MIN_DISTANCE:
+                                new_side = "no" if self.brti_held_side == "yes" else "yes"
+                                profit = current_value - self.brti_entry_price
+                                reason = f"TRAILING STOP (entry:{self.brti_entry_price}c peak:{self.brti_peak_value}c now:{current_value}c pnl:{profit:+d}c)"
+                        else:
+                            # ── SCENARIO 2: Never profitable → hard stop-loss to limit damage ──
+                            if loss_from_entry >= BRTI_STOP_LOSS_C:
                                 should_flip = True
-                                new_side = "yes"
-                                reason = f"strike cross (sBRTI ${distance:+,.0f} from strike)"
+                                new_side = "no" if self.brti_held_side == "yes" else "yes"
+                                reason = f"STOP LOSS (entry:{self.brti_entry_price}c now:{current_value}c loss:{loss_from_entry}c)"
 
                         if should_flip:
                             old_side = self.brti_held_side
