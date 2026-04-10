@@ -557,8 +557,10 @@ class Crypto15mAgent:
                         cost = 100 - yb if yb > 0 else 0
                 except Exception:
                     pass
-            # Use tighter cap for re-entries after take-profit (buy the dip, not the top)
-            max_price = BRTI_REENTRY_MAX_PRICE if self.brti_conviction_adds > 0 or self.brti_peak_value > 0 else BRTI_ENTRY_MAX
+            # Initial entry: 49c max (only enter as underdog/coinflip — asymmetric payoff)
+            # Re-entry after take-profit: 80c max (buy the dip)
+            is_reentry = self.brti_conviction_adds > 0 or self.brti_peak_value > 0
+            max_price = BRTI_REENTRY_MAX_PRICE if is_reentry else 49
             if 1 <= cost <= max_price:
                 self.brti_entry_made = True
                 self.brti_held_side = target_side
