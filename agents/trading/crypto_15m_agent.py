@@ -43,8 +43,8 @@ if STRATEGY not in ("fade", "late_favorite", "brti"):
 # ─── BRTI Config ───
 BRTI_MOMENTUM_WINDOW = 15    # seconds of BRTI data to assess initial direction
 BRTI_ENTRY_MAX = 95          # max entry price (cents) — buy at market if momentum agrees
-BRTI_FLIP_COOLDOWN_SEC = 120  # minimum seconds between flips — prevents thrashing
-BRTI_FLIP_MIN_DISTANCE = 50   # sBRTI must be $50+ past strike on the wrong side to flip (ignore noise)
+BRTI_FLIP_COOLDOWN_SEC = 30   # minimum seconds between flips — prevents thrashing
+BRTI_FLIP_MIN_DISTANCE = 20   # sBRTI must be $20+ past strike on the wrong side to flip
 
 # Synthetic BRTI — real-time feed from constituent exchange WebSockets
 # Volume-weighted median of Coinbase, Kraken, Bitstamp, Gemini (~80%+ of BRTI weight)
