@@ -892,7 +892,7 @@ class Crypto15mAgent:
                             new_count += 1
                     # Sort and trim to last 5 min
                     self.brti_ticks.sort()
-                    cutoff = time.time() - 300
+                    cutoff = time.time() - 960  # keep full 16 min of ticks (covers any cycle)
                     self.brti_ticks = [(t, v) for t, v in self.brti_ticks if t > cutoff]
                     if self.brti_ticks:
                         latest = self.brti_ticks[-1]
