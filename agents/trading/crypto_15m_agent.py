@@ -366,7 +366,7 @@ class Crypto15mAgent:
                     price = msg.get("yes_price", 0) or msg.get("price", 0) or 0
             else:
                 price = msg.get("yes_price", 0) or msg.get("price", 0) or 0
-            count = int(float(msg.get("count_fp") or msg.get("count") or 0))
+            count = round(float(msg.get("count_fp") or msg.get("count") or 0))
             coin = None
             for c, t in self.current_tickers.items():
                 if t == ticker:
