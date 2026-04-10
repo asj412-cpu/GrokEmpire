@@ -514,81 +514,7 @@ class Crypto15mAgent:
                 self._post_buy(ticker, coin, target_side, cost, target_contracts=1, count=1)
                 return
 
-        # ── Phase 3: Flip sell — detect BRTI momentum reversal BEFORE strike crossing ──
-        if self.brti_held_side and self.ticker_contracts.get(ticker, 0) > 0 and len(self.brti_ticks) >= 10 \
-                and (time.time() - self.brti_last_flip_ts) > BRTI_FLIP_COOLDOWN_SEC:
-            # Compare BRTI trend over last 10s vs last 30s to detect momentum shift
-            # Flip when short-term momentum diverges from our position's direction
-            now_ts = time.time()
-            recent_5 = [v for t, v in self.brti_ticks if t > now_ts - 5]
-            recent_15 = [v for t, v in self.brti_ticks if t > now_ts - 15]
-
-            should_flip = False
-            distance = latest_brti - self.brti_strike  # positive = above strike, negative = below
-
-            if self.brti_held_side == "yes" and distance < -BRTI_FLIP_MIN_DISTANCE:
-                # Holding YES but BRTI is $50+ below strike — clearly losing
-                should_flip = True
-                new_side = "no"
-            elif self.brti_held_side == "no" and distance > BRTI_FLIP_MIN_DISTANCE:
-                # Holding NO but BRTI is $50+ above strike — clearly losing
-                should_flip = True
-                new_side = "yes"
-
-            if should_flip:
-                held_count = self.ticker_contracts.get(ticker, 0)
-                old_side = self.brti_held_side
-                # Sell current position
-                sell_price = yes_bid if old_side == "yes" else (100 - yes_ask)
-                print(f"[{now.strftime('%H:%M:%S')}] 🔄 BRTI FLIP: BRTI=${latest_brti:,.2f} crossed strike ${self.brti_strike:,.2f} | SELL {old_side.upper()} {held_count}x @ {sell_price}c → BUY {new_side.upper()}")
-
-                if self.client and not DRY_RUN:
-                    try:
-                        # Sell existing position
-                        sell_id = f"flip-sell-{ticker}-{int(time.time())}"
-                        self.client.create_order(
-                            ticker=ticker,
-                            client_order_id=sell_id,
-                            side=old_side,
-                            action="sell",
-                            count=held_count,
-                            type="limit",
-                            yes_price=yes_bid if old_side == "yes" else None,
-                            no_price=(100 - yes_ask) if old_side == "no" else None,
-                        )
-                        # Reset position tracking
-                        self.ticker_contracts[ticker] = 0
-                        self.positions[ticker] = []
-
-                        # Buy new side
-                        new_cost = yes_ask if new_side == "yes" else (100 - yes_bid)
-                        if new_cost <= BRTI_ENTRY_MAX:
-                            buy_id = f"flip-buy-{ticker}-{int(time.time())}"
-                            self.client.create_order(
-                                ticker=ticker,
-                                client_order_id=buy_id,
-                                side=new_side,
-                                action="buy",
-                                count=1,
-                                type="limit",
-                                yes_price=yes_ask if new_side == "yes" else None,
-                                no_price=(100 - yes_bid) if new_side == "no" else None,
-                            )
-                            self.brti_held_side = new_side
-                            self.brti_last_flip_ts = time.time()
-                            print(f"  → Flipped to {new_side.upper()} 1x @ {new_cost}c")
-                        else:
-                            self.brti_held_side = ""
-                            self.brti_last_flip_ts = time.time()
-                            print(f"  → Sold but new side too expensive ({new_cost}c > {BRTI_ENTRY_MAX}c), flat")
-                    except Exception as e:
-                        print(f"  → Flip error: {e}")
-                elif DRY_RUN:
-                    self.ticker_contracts[ticker] = 0
-                    self.brti_held_side = new_side
-                    self.brti_last_flip_ts = time.time()
-                    self.brti_flip_count += 1
-                    print(f"  📄 PAPER flip to {new_side.upper()}")
+        # Phase 3 handled by brti_fast_flip_loop (500ms, trailing stop + stop loss)
 
     async def _evaluate_late_favorite(self, ticker):
         """Late-favorite strategy: at min_rem before close, buy the favored side if cost in band.
@@ -1362,7 +1288,7 @@ class Crypto15mAgent:
         elif STRATEGY == "brti":
             print(f"   Signal: BRTI momentum | BTC only | entry ≤{BRTI_ENTRY_MAX}c")
             print(f"   Momentum: first {BRTI_MOMENTUM_WINDOW}s of cycle → direction")
-            print(f"   Flip sell: when sBRTI ${BRTI_FLIP_MIN_DISTANCE}+ past strike | cooldown {BRTI_FLIP_COOLDOWN_SEC}s")
+            print(f"   Trailing stop: {BRTI_TRAILING_STOP_C}c from peak | Stop loss: {BRTI_STOP_LOSS_C}c max | cooldown {BRTI_FLIP_COOLDOWN_SEC}s")
             print(f"   BRTI source: synthetic (Coinbase+Kraken+Bitstamp+Gemini WebSockets)")
         print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
 
