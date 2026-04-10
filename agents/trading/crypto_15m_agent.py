@@ -74,7 +74,7 @@ COIN_SIGNAL_MODE = {
     "ETH": "trend",
     "SOL": "trend",
     "XRP": "trend",
-    "BNB": "fade",
+    "BNB": "trend",
     "HYPE": "trend",
     "DOGE": "trend",
 }
