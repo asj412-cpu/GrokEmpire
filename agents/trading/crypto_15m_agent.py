@@ -43,9 +43,9 @@ if STRATEGY not in ("fade", "late_favorite", "brti"):
 # ─── BRTI Config ───
 BRTI_MOMENTUM_WINDOW = 15    # seconds of BRTI data to assess initial direction
 BRTI_ENTRY_MAX = 95          # max entry price (cents) — buy at market if momentum agrees
-BRTI_FLIP_BUFFER_PCT = 0.01  # flip when BRTI crosses within 0.01% of strike (early warning)
 BRTI_FLIP_COOLDOWN_SEC = 120  # minimum seconds between flips — prevents thrashing
 BRTI_MAX_FLIPS_PER_CYCLE = 2  # max flips per cycle
+BRTI_FLIP_MIN_DISTANCE = 50   # sBRTI must be $50+ past strike on the wrong side to flip (ignore noise)
 
 # Synthetic BRTI — real-time feed from constituent exchange WebSockets
 # Volume-weighted median of Coinbase, Kraken, Bitstamp, Gemini (~80%+ of BRTI weight)
@@ -521,33 +521,16 @@ class Crypto15mAgent:
             recent_15 = [v for t, v in self.brti_ticks if t > now_ts - 15]
 
             should_flip = False
-            if recent_5 and recent_15:
-                short_avg = sum(recent_5) / len(recent_5)
-                long_avg = sum(recent_15) / len(recent_15)
+            distance = latest_brti - self.brti_strike  # positive = above strike, negative = below
 
-                if self.brti_held_side == "yes":
-                    # We need BRTI > strike. Flip if:
-                    # 1) BRTI already below strike (losing), OR
-                    # 2) BRTI above strike but short-term dropping toward it (about to lose)
-                    if latest_brti < self.brti_strike:
-                        should_flip = True  # already losing
-                        new_side = "no"
-                    elif short_avg < long_avg and latest_brti < self.brti_strike + (self.brti_strike * 0.0003):
-                        # Momentum turning down and within 0.03% of strike — flip early
-                        should_flip = True
-                        new_side = "no"
-
-                elif self.brti_held_side == "no":
-                    # We need BRTI < strike. Flip if:
-                    # 1) BRTI already above strike (losing), OR
-                    # 2) BRTI below strike but short-term rising toward it (about to lose)
-                    if latest_brti > self.brti_strike:
-                        should_flip = True  # already losing
-                        new_side = "yes"
-                    elif short_avg > long_avg and latest_brti > self.brti_strike - (self.brti_strike * 0.0003):
-                        # Momentum turning up and within 0.03% of strike — flip early
-                        should_flip = True
-                        new_side = "yes"
+            if self.brti_held_side == "yes" and distance < -BRTI_FLIP_MIN_DISTANCE:
+                # Holding YES but BRTI is $50+ below strike — clearly losing
+                should_flip = True
+                new_side = "no"
+            elif self.brti_held_side == "no" and distance > BRTI_FLIP_MIN_DISTANCE:
+                # Holding NO but BRTI is $50+ above strike — clearly losing
+                should_flip = True
+                new_side = "yes"
 
             if should_flip:
                 held_count = self.ticker_contracts.get(ticker, 0)
