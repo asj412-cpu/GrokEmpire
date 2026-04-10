@@ -211,8 +211,7 @@ class Crypto15mAgent:
         self.brti_entry_made: bool = False # whether we entered this cycle
         self.brti_held_side: str = ""      # "yes" or "no" — what we currently hold
         self.brti_last_flip_ts: float = 0  # timestamp of last flip
-        self.brti_flip_count: int = 0      # flips this cycle
-
+        
         # Exchange price feeds for synthetic BRTI
         self.exchange_prices: Dict[str, float] = {}              # exchange -> latest trade price
         self.exchange_trades: Dict[str, list] = defaultdict(list) # exchange -> [(ts, price, vol)]
@@ -326,7 +325,6 @@ class Crypto15mAgent:
                 self.brti_entry_made = False
                 self.brti_held_side = ""
                 self.brti_last_flip_ts = 0
-                self.brti_flip_count = 0
                 print(f"  🔄 BRTI cycle reset (strike: ${self.brti_strike:,.2f})")
 
         if tickers and self.ws_connected:
@@ -571,12 +569,10 @@ class Crypto15mAgent:
                             )
                             self.brti_held_side = new_side
                             self.brti_last_flip_ts = time.time()
-                            self.brti_flip_count += 1
-                            print(f"  → Flipped to {new_side.upper()} 1x @ {new_cost}c (flip {self.brti_flip_count}/{BRTI_MAX_FLIPS_PER_CYCLE})")
+                            print(f"  → Flipped to {new_side.upper()} 1x @ {new_cost}c")
                         else:
                             self.brti_held_side = ""
                             self.brti_last_flip_ts = time.time()
-                            self.brti_flip_count += 1
                             print(f"  → Sold but new side too expensive ({new_cost}c > {BRTI_ENTRY_MAX}c), flat")
                     except Exception as e:
                         print(f"  → Flip error: {e}")
