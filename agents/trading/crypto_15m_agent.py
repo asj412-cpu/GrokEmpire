@@ -50,16 +50,14 @@ COIN_LATE_FAV_CONFIG = {
     # HYPE: skip
 }
 
-# Tiered entry strategy
-# Tier 1: min 0-7 of cycle (cycle_sec 0-420 = 8-15 min remaining) → entry 1-20c
-# Tier 2: min 7-10 of cycle (cycle_sec 420-600 = 5-8 min remaining) → entry 20-35c
-# (T2 max lowered from 49→35: live data showed 36-49c range was 36% WR, −$22/5d)
-TIER1_MAX_CYCLE_SEC = 420   # min 7
+# Entry window: min 0-4 only (cycle_sec 0-240), entry 1-20c
+# T2 disabled — live data showed higher entries bleeding money
+TIER1_MAX_CYCLE_SEC = 240   # min 4
 TIER1_ENTRY_LOW = 1
 TIER1_ENTRY_HIGH = 20
-TIER2_MAX_CYCLE_SEC = 600   # min 10
-TIER2_ENTRY_LOW = 20
-TIER2_ENTRY_HIGH = 35
+TIER2_MAX_CYCLE_SEC = 0     # disabled
+TIER2_ENTRY_LOW = 0
+TIER2_ENTRY_HIGH = 0
 
 # Legacy single-tier constants kept for backwards compat in some helpers
 ENTRY_LOW = TIER1_ENTRY_LOW
@@ -876,7 +874,8 @@ class Crypto15mAgent:
         coins_str = ", ".join(COINS.keys())
         print(f"🚀 Crypto 15m Agent — STRATEGY={STRATEGY} — {coins_str}")
         if STRATEGY == "fade":
-            print(f"   Signal: per-coin fade | T1: min 0-7 @ {TIER1_ENTRY_LOW}-{TIER1_ENTRY_HIGH}c | T2: min 7-10 @ {TIER2_ENTRY_LOW}-{TIER2_ENTRY_HIGH}c")
+            t2_str = f" | T2: disabled" if TIER2_MAX_CYCLE_SEC == 0 else f" | T2: min {TIER1_MAX_CYCLE_SEC//60}-{TIER2_MAX_CYCLE_SEC//60} @ {TIER2_ENTRY_LOW}-{TIER2_ENTRY_HIGH}c"
+            print(f"   Signal: per-coin | T1: min 0-{TIER1_MAX_CYCLE_SEC//60} @ {TIER1_ENTRY_LOW}-{TIER1_ENTRY_HIGH}c{t2_str}")
             per_coin = " ".join(
                 f"{c}={COIN_FADE_CONFIG[c]['thresh']}/{COIN_FADE_CONFIG[c]['window']}{COIN_SIGNAL_MODE.get(c,'fade')[0].upper()}"
                 for c in COINS
