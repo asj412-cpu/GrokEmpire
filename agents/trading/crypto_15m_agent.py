@@ -925,6 +925,79 @@ class Crypto15mAgent:
 
         return signal, BASE_CONTRACTS
 
+    # ─── Fast BRTI Flip Check Loop ─────────────────────────────
+
+    async def brti_fast_flip_loop(self):
+        """Check flip conditions every 500ms using latest sBRTI — don't wait for Kalshi WS ticks."""
+        while self.running:
+            try:
+                if self.brti_held_side and self.brti_strike > 0 and self.brti_ticks:
+                    btc_ticker = self.current_tickers.get("BTC", "")
+                    held = self.ticker_contracts.get(btc_ticker, 0)
+                    if btc_ticker and held > 0 and (time.time() - self.brti_last_flip_ts) > BRTI_FLIP_COOLDOWN_SEC:
+                        latest_brti = self.brti_ticks[-1][1]
+                        distance = latest_brti - self.brti_strike
+
+                        should_flip = False
+                        new_side = ""
+                        if self.brti_held_side == "yes" and distance < -BRTI_FLIP_MIN_DISTANCE:
+                            should_flip = True
+                            new_side = "no"
+                        elif self.brti_held_side == "no" and distance > BRTI_FLIP_MIN_DISTANCE:
+                            should_flip = True
+                            new_side = "yes"
+
+                        if should_flip:
+                            # Get fresh Kalshi prices via API for best execution
+                            prices = self.ws_prices.get(btc_ticker, {})
+                            yes_bid = prices.get("yes_bid", 0)
+                            yes_ask = prices.get("yes_ask", 0)
+                            if yes_bid <= 0 or yes_ask <= 0:
+                                # Fallback to API
+                                try:
+                                    md = self.client.get_markets(series_ticker="KXBTC15M", status="open", limit=1) if self.client else {}
+                                    mkt = md.get("markets", [{}])[0]
+                                    yes_bid = int(float(mkt.get("yes_bid_dollars", "0")) * 100)
+                                    yes_ask = int(float(mkt.get("yes_ask_dollars", "0")) * 100)
+                                except Exception:
+                                    pass
+                            if yes_bid > 0 and yes_ask > 0:
+                                old_side = self.brti_held_side
+                                sell_price = yes_bid if old_side == "yes" else (100 - yes_ask)
+                                new_cost = yes_ask if new_side == "yes" else (100 - yes_bid)
+                                print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 FAST FLIP: sBRTI=${latest_brti:,.2f} vs strike ${self.brti_strike:,.2f} (Δ${distance:+,.0f}) | SELL {old_side.upper()} @ {sell_price}c → BUY {new_side.upper()} @ {new_cost}c")
+                                if self.client and not DRY_RUN:
+                                    try:
+                                        sell_id = f"fflip-sell-{btc_ticker}-{int(time.time()*1000)}"
+                                        self.client.create_order(
+                                            ticker=btc_ticker, client_order_id=sell_id,
+                                            side=old_side, action="sell", count=held, type="limit",
+                                            yes_price=yes_bid if old_side == "yes" else None,
+                                            no_price=(100 - yes_ask) if old_side == "no" else None,
+                                        )
+                                        self.ticker_contracts[btc_ticker] = 0
+                                        self.positions[btc_ticker] = []
+
+                                        if new_cost <= BRTI_ENTRY_MAX:
+                                            buy_id = f"fflip-buy-{btc_ticker}-{int(time.time()*1000)}"
+                                            self.client.create_order(
+                                                ticker=btc_ticker, client_order_id=buy_id,
+                                                side=new_side, action="buy", count=1, type="limit",
+                                                yes_price=yes_ask if new_side == "yes" else None,
+                                                no_price=(100 - yes_bid) if new_side == "no" else None,
+                                            )
+                                            self.brti_held_side = new_side
+                                            print(f"  → Flipped to {new_side.upper()} 1x @ {new_cost}c")
+                                        else:
+                                            self.brti_held_side = ""
+                                            print(f"  → Sold, new side too expensive ({new_cost}c)")
+                                        self.brti_last_flip_ts = time.time()
+                                    except Exception as e:
+                                        print(f"  → Fast flip error: {e}")
+            except Exception as e:
+                print(f"  Fast flip loop error: {e}")
+            await asyncio.sleep(0.5)
+
     # ─── Periodic Tasks ───────────────────────────────────────
 
     def compute_synthetic_brti(self):
@@ -1277,7 +1350,8 @@ class Crypto15mAgent:
             asyncio.create_task(self._kraken_ws())
             asyncio.create_task(self._bitstamp_ws())
             asyncio.create_task(self._gemini_ws())
-            print("📡 Synthetic BRTI feeds launching (4 exchanges)")
+            asyncio.create_task(self.brti_fast_flip_loop())
+            print("📡 Synthetic BRTI feeds launching (4 exchanges) + fast flip loop (500ms)")
 
         # Keep main alive
         while self.running:
