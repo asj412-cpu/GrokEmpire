@@ -71,7 +71,7 @@ COOLDOWN_SEC = 60  # cooldown between fills per ticker (resets at cycle boundary
 # HYPE flipped to trend on 2026-04-06 — backtest shows trend WR 51.9% vs fade 48.1% over last 5 days
 COIN_SIGNAL_MODE = {
     "BTC": "fade",
-    "ETH": "fade",
+    "ETH": "trend",
     "SOL": "fade",
     "XRP": "fade",
     "BNB": "fade",
