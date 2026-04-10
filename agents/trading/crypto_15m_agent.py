@@ -44,6 +44,8 @@ if STRATEGY not in ("fade", "late_favorite", "brti"):
 BRTI_MOMENTUM_WINDOW = 15    # seconds of BRTI data to assess initial direction
 BRTI_ENTRY_MAX = 95          # max entry price (cents) — buy at market if momentum agrees
 BRTI_FLIP_BUFFER_PCT = 0.01  # flip when BRTI crosses within 0.01% of strike (early warning)
+BRTI_FLIP_COOLDOWN_SEC = 120  # minimum seconds between flips — prevents thrashing
+BRTI_MAX_FLIPS_PER_CYCLE = 2  # max flips per cycle
 
 # Synthetic BRTI — real-time feed from constituent exchange WebSockets
 # Volume-weighted median of Coinbase, Kraken, Bitstamp, Gemini (~80%+ of BRTI weight)
@@ -209,6 +211,8 @@ class Crypto15mAgent:
         self.brti_direction: str = ""      # "up" or "down" from initial momentum
         self.brti_entry_made: bool = False # whether we entered this cycle
         self.brti_held_side: str = ""      # "yes" or "no" — what we currently hold
+        self.brti_last_flip_ts: float = 0  # timestamp of last flip
+        self.brti_flip_count: int = 0      # flips this cycle
 
         # Exchange price feeds for synthetic BRTI
         self.exchange_prices: Dict[str, float] = {}              # exchange -> latest trade price
@@ -322,6 +326,8 @@ class Crypto15mAgent:
                 self.brti_direction = ""
                 self.brti_entry_made = False
                 self.brti_held_side = ""
+                self.brti_last_flip_ts = 0
+                self.brti_flip_count = 0
                 print(f"  🔄 BRTI cycle reset (strike: ${self.brti_strike:,.2f})")
 
         if tickers and self.ws_connected:
@@ -505,7 +511,9 @@ class Crypto15mAgent:
                 return
 
         # ── Phase 3: Flip sell — detect BRTI momentum reversal BEFORE strike crossing ──
-        if self.brti_held_side and self.ticker_contracts.get(ticker, 0) > 0 and len(self.brti_ticks) >= 10:
+        if self.brti_held_side and self.ticker_contracts.get(ticker, 0) > 0 and len(self.brti_ticks) >= 10 \
+                and self.brti_flip_count < BRTI_MAX_FLIPS_PER_CYCLE \
+                and (time.time() - self.brti_last_flip_ts) > BRTI_FLIP_COOLDOWN_SEC:
             # Compare BRTI trend over last 10s vs last 30s to detect momentum shift
             # Flip when short-term momentum diverges from our position's direction
             now_ts = time.time()
@@ -581,15 +589,21 @@ class Crypto15mAgent:
                                 no_price=(100 - yes_bid) if new_side == "no" else None,
                             )
                             self.brti_held_side = new_side
-                            print(f"  → Flipped to {new_side.upper()} 1x @ {new_cost}c")
+                            self.brti_last_flip_ts = time.time()
+                            self.brti_flip_count += 1
+                            print(f"  → Flipped to {new_side.upper()} 1x @ {new_cost}c (flip {self.brti_flip_count}/{BRTI_MAX_FLIPS_PER_CYCLE})")
                         else:
                             self.brti_held_side = ""
+                            self.brti_last_flip_ts = time.time()
+                            self.brti_flip_count += 1
                             print(f"  → Sold but new side too expensive ({new_cost}c > {BRTI_ENTRY_MAX}c), flat")
                     except Exception as e:
                         print(f"  → Flip error: {e}")
                 elif DRY_RUN:
                     self.ticker_contracts[ticker] = 0
                     self.brti_held_side = new_side
+                    self.brti_last_flip_ts = time.time()
+                    self.brti_flip_count += 1
                     print(f"  📄 PAPER flip to {new_side.upper()}")
 
     async def _evaluate_late_favorite(self, ticker):
