@@ -1267,7 +1267,7 @@ class Crypto15mAgent:
         elif STRATEGY == "brti":
             print(f"   Signal: BRTI momentum | BTC only | entry ≤{BRTI_ENTRY_MAX}c")
             print(f"   Momentum: first {BRTI_MOMENTUM_WINDOW}s of cycle → direction")
-            print(f"   Flip sell: when BRTI crosses strike (buffer {BRTI_FLIP_BUFFER_PCT}%)")
+            print(f"   Flip sell: when sBRTI ${BRTI_FLIP_MIN_DISTANCE}+ past strike | cooldown {BRTI_FLIP_COOLDOWN_SEC}s | max {BRTI_MAX_FLIPS_PER_CYCLE}/cycle")
             print(f"   BRTI source: synthetic (Coinbase+Kraken+Bitstamp+Gemini WebSockets)")
         print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
 
