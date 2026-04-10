@@ -44,7 +44,6 @@ if STRATEGY not in ("fade", "late_favorite", "brti"):
 BRTI_MOMENTUM_WINDOW = 15    # seconds of BRTI data to assess initial direction
 BRTI_ENTRY_MAX = 95          # max entry price (cents) — buy at market if momentum agrees
 BRTI_FLIP_COOLDOWN_SEC = 120  # minimum seconds between flips — prevents thrashing
-BRTI_MAX_FLIPS_PER_CYCLE = 2  # max flips per cycle
 BRTI_FLIP_MIN_DISTANCE = 50   # sBRTI must be $50+ past strike on the wrong side to flip (ignore noise)
 
 # Synthetic BRTI — real-time feed from constituent exchange WebSockets
@@ -512,7 +511,6 @@ class Crypto15mAgent:
 
         # ── Phase 3: Flip sell — detect BRTI momentum reversal BEFORE strike crossing ──
         if self.brti_held_side and self.ticker_contracts.get(ticker, 0) > 0 and len(self.brti_ticks) >= 10 \
-                and self.brti_flip_count < BRTI_MAX_FLIPS_PER_CYCLE \
                 and (time.time() - self.brti_last_flip_ts) > BRTI_FLIP_COOLDOWN_SEC:
             # Compare BRTI trend over last 10s vs last 30s to detect momentum shift
             # Flip when short-term momentum diverges from our position's direction
@@ -1267,7 +1265,7 @@ class Crypto15mAgent:
         elif STRATEGY == "brti":
             print(f"   Signal: BRTI momentum | BTC only | entry ≤{BRTI_ENTRY_MAX}c")
             print(f"   Momentum: first {BRTI_MOMENTUM_WINDOW}s of cycle → direction")
-            print(f"   Flip sell: when sBRTI ${BRTI_FLIP_MIN_DISTANCE}+ past strike | cooldown {BRTI_FLIP_COOLDOWN_SEC}s | max {BRTI_MAX_FLIPS_PER_CYCLE}/cycle")
+            print(f"   Flip sell: when sBRTI ${BRTI_FLIP_MIN_DISTANCE}+ past strike | cooldown {BRTI_FLIP_COOLDOWN_SEC}s")
             print(f"   BRTI source: synthetic (Coinbase+Kraken+Bitstamp+Gemini WebSockets)")
         print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
 
