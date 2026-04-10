@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Dict, Optional, Set
 from collections import defaultdict
 
-import requests as http_requests
+import statistics
 import websockets
 from kalshi_client.client import KalshiClient
 from cryptography.hazmat.primitives import hashes, serialization
@@ -41,11 +41,29 @@ if STRATEGY not in ("fade", "late_favorite", "brti"):
     raise SystemExit(f"Invalid STRATEGY={STRATEGY!r}; must be 'fade', 'late_favorite', or 'brti'")
 
 # ─── BRTI Config ───
-BRTI_URL = "https://www.cfbenchmarks.com/data/indices/BRTI"
-BRTI_POLL_SEC = 10            # poll cfbenchmarks every 10s
 BRTI_MOMENTUM_WINDOW = 15    # seconds of BRTI data to assess initial direction
 BRTI_ENTRY_MAX = 95          # max entry price (cents) — buy at market if momentum agrees
 BRTI_FLIP_BUFFER_PCT = 0.01  # flip when BRTI crosses within 0.01% of strike (early warning)
+
+# Synthetic BRTI — real-time feed from constituent exchange WebSockets
+# Volume-weighted median of Coinbase, Kraken, Bitstamp, Gemini (~80%+ of BRTI weight)
+BRTI_EXCHANGES = {
+    "coinbase": {
+        "url": "wss://ws-feed.exchange.coinbase.com",
+        "subscribe": {"type": "subscribe", "channels": [{"name": "ticker", "product_ids": ["BTC-USD"]}]},
+    },
+    "kraken": {
+        "url": "wss://ws.kraken.com",
+        "subscribe": {"event": "subscribe", "pair": ["XBT/USD"], "subscription": {"name": "trade"}},
+    },
+    "bitstamp": {
+        "url": "wss://ws.bitstamp.net",
+        "subscribe": {"event": "bts:subscribe", "data": {"channel": "live_trades_btcusd"}},
+    },
+    "gemini": {
+        "url": "wss://api.gemini.com/v1/marketdata/BTCUSD?trades=true&bids=false&offers=false",
+    },
+}
 
 # Per-coin late-favorite config (5-day backtest 2026-04-08, net of fees+slippage)
 # {lo, hi} = entry cost band in cents; min_rem = trigger when this many minutes remain
@@ -186,13 +204,16 @@ class Crypto15mAgent:
         self.ws_connected = False
 
         # BRTI state (used when STRATEGY="brti")
-        self.brti_ticks: list = []         # [(unix_ts, value), ...] rolling buffer
-        self.brti_last_poll: float = 0     # last poll timestamp
+        self.brti_ticks: list = []         # [(unix_ts, value), ...] rolling synthetic BRTI
         self.brti_strike: float = 0        # current cycle strike price
         self.brti_direction: str = ""      # "up" or "down" from initial momentum
         self.brti_entry_made: bool = False # whether we entered this cycle
         self.brti_held_side: str = ""      # "yes" or "no" — what we currently hold
-        self.brti_cycle_id: str = ""       # ticker of current cycle (to detect rotation)
+
+        # Exchange price feeds for synthetic BRTI
+        self.exchange_prices: Dict[str, float] = {}              # exchange -> latest trade price
+        self.exchange_trades: Dict[str, list] = defaultdict(list) # exchange -> [(ts, price, vol)]
+        self.exchange_status: Dict[str, str] = {}                # exchange -> status
 
         if not os.path.exists(self.log_file):
             with open(self.log_file, "w", newline="") as f:
@@ -483,20 +504,42 @@ class Crypto15mAgent:
                 self._post_buy(ticker, coin, target_side, cost, target_contracts=1, count=1)
                 return
 
-        # ── Phase 3: Flip sell — monitor BRTI vs strike throughout cycle ──
-        if self.brti_held_side and self.ticker_contracts.get(ticker, 0) > 0:
-            # Flip when BRTI crosses strike against our position
-            # YES profitable when BRTI > strike; NO profitable when BRTI < strike
-            # Buffer: flip slightly before the crossing so we beat the Kalshi orderbook
-            buffer = self.brti_strike * BRTI_FLIP_BUFFER_PCT / 100
+        # ── Phase 3: Flip sell — detect BRTI momentum reversal BEFORE strike crossing ──
+        if self.brti_held_side and self.ticker_contracts.get(ticker, 0) > 0 and len(self.brti_ticks) >= 10:
+            # Compare BRTI trend over last 10s vs last 30s to detect momentum shift
+            # Flip when short-term momentum diverges from our position's direction
+            now_ts = time.time()
+            recent_5 = [v for t, v in self.brti_ticks if t > now_ts - 5]
+            recent_15 = [v for t, v in self.brti_ticks if t > now_ts - 15]
 
             should_flip = False
-            if self.brti_held_side == "yes" and latest_brti < self.brti_strike - buffer:
-                should_flip = True
-                new_side = "no"
-            elif self.brti_held_side == "no" and latest_brti > self.brti_strike + buffer:
-                should_flip = True
-                new_side = "yes"
+            if recent_5 and recent_15:
+                short_avg = sum(recent_5) / len(recent_5)
+                long_avg = sum(recent_15) / len(recent_15)
+
+                if self.brti_held_side == "yes":
+                    # We need BRTI > strike. Flip if:
+                    # 1) BRTI already below strike (losing), OR
+                    # 2) BRTI above strike but short-term dropping toward it (about to lose)
+                    if latest_brti < self.brti_strike:
+                        should_flip = True  # already losing
+                        new_side = "no"
+                    elif short_avg < long_avg and latest_brti < self.brti_strike + (self.brti_strike * 0.0003):
+                        # Momentum turning down and within 0.03% of strike — flip early
+                        should_flip = True
+                        new_side = "no"
+
+                elif self.brti_held_side == "no":
+                    # We need BRTI < strike. Flip if:
+                    # 1) BRTI already above strike (losing), OR
+                    # 2) BRTI below strike but short-term rising toward it (about to lose)
+                    if latest_brti > self.brti_strike:
+                        should_flip = True  # already losing
+                        new_side = "yes"
+                    elif short_avg > long_avg and latest_brti > self.brti_strike - (self.brti_strike * 0.0003):
+                        # Momentum turning up and within 0.03% of strike — flip early
+                        should_flip = True
+                        new_side = "yes"
 
             if should_flip:
                 held_count = self.ticker_contracts.get(ticker, 0)
@@ -893,37 +936,138 @@ class Crypto15mAgent:
 
     # ─── Periodic Tasks ───────────────────────────────────────
 
-    async def brti_poll_loop(self):
-        """Poll cfbenchmarks.com for BRTI ticks every BRTI_POLL_SEC."""
+    def compute_synthetic_brti(self):
+        """Volume-weighted median of exchange trade prices → synthetic BRTI."""
+        prices_with_volume = []
+        for ex, trades in self.exchange_trades.items():
+            cutoff = time.time() - 5
+            recent = [(p, v) for t, p, v in trades if t > cutoff]
+            if not recent:
+                if ex in self.exchange_prices:
+                    prices_with_volume.append((self.exchange_prices[ex], 0.001))
+                continue
+            total_vol = sum(v for _, v in recent)
+            vwap = sum(p * v for p, v in recent) / total_vol if total_vol > 0 else recent[-1][0]
+            prices_with_volume.append((vwap, total_vol))
+        if not prices_with_volume:
+            return None
+        # Volume-weighted median
+        prices_with_volume.sort(key=lambda x: x[0])
+        total_volume = sum(v for _, v in prices_with_volume)
+        if total_volume <= 0:
+            return statistics.median([p for p, _ in prices_with_volume])
+        cumulative = 0
+        for price, vol in prices_with_volume:
+            cumulative += vol
+            if cumulative >= total_volume / 2:
+                return price
+        return prices_with_volume[-1][0]
+
+    def _record_exchange_trade(self, exchange, price, volume):
+        """Record a trade from an exchange and update synthetic BRTI."""
+        if price <= 0:
+            return
+        self.exchange_prices[exchange] = price
+        self.exchange_trades[exchange].append((time.time(), price, volume))
+        # Trim to last 60s
+        cutoff = time.time() - 60
+        self.exchange_trades[exchange] = [(t, p, v) for t, p, v in self.exchange_trades[exchange] if t > cutoff]
+        # Update synthetic BRTI tick
+        synthetic = self.compute_synthetic_brti()
+        if synthetic:
+            now = time.time()
+            # Only append if at least 0.5s since last tick (avoid flooding)
+            if not self.brti_ticks or now - self.brti_ticks[-1][0] >= 0.5:
+                self.brti_ticks.append((now, synthetic))
+                # Trim to last 16 min
+                cutoff = now - 960
+                self.brti_ticks = [(t, v) for t, v in self.brti_ticks if t > cutoff]
+
+    async def _coinbase_ws(self):
+        """Coinbase Exchange WebSocket — ticker channel."""
         while self.running:
             try:
-                resp = http_requests.get(BRTI_URL, timeout=30)
-                m = re.search(r'"rtis":\[(.*?)\]', resp.text)
-                if m:
-                    data = json.loads('[' + m.group(1) + ']')
-                    # Merge new ticks into rolling buffer
-                    existing_ts = set(t for t, _ in self.brti_ticks)
-                    new_count = 0
-                    for tick in data:
-                        ts = tick['time'] / 1000  # ms → s
-                        val = float(tick['value'])
-                        if ts not in existing_ts:
-                            self.brti_ticks.append((ts, val))
-                            new_count += 1
-                    # Sort and trim to last 5 min
-                    self.brti_ticks.sort()
-                    cutoff = time.time() - 960  # keep full 16 min of ticks (covers any cycle)
-                    self.brti_ticks = [(t, v) for t, v in self.brti_ticks if t > cutoff]
-                    if self.brti_ticks:
-                        latest = self.brti_ticks[-1]
-                        age = time.time() - latest[0]
-                        if new_count > 0 or age < 120:
-                            pass  # normal, no log spam
-                        else:
-                            print(f"  ⚠ BRTI data stale ({age:.0f}s)")
+                async with websockets.connect(BRTI_EXCHANGES["coinbase"]["url"], ping_interval=30, ping_timeout=10) as ws:
+                    await ws.send(json.dumps(BRTI_EXCHANGES["coinbase"]["subscribe"]))
+                    self.exchange_status["coinbase"] = "connected"
+                    print("  ✅ Coinbase connected")
+                    async for msg in ws:
+                        try:
+                            data = json.loads(msg)
+                            if data.get("type") == "ticker":
+                                price = float(data.get("price", 0))
+                                vol = float(data.get("last_size", 0))
+                                self._record_exchange_trade("coinbase", price, vol)
+                        except Exception:
+                            pass
             except Exception as e:
-                print(f"  BRTI poll error: {e}")
-            await asyncio.sleep(BRTI_POLL_SEC)
+                self.exchange_status["coinbase"] = f"error"
+                print(f"  Coinbase WS error: {e}, reconnecting...")
+                await asyncio.sleep(5)
+
+    async def _kraken_ws(self):
+        """Kraken WebSocket — trade channel."""
+        while self.running:
+            try:
+                async with websockets.connect(BRTI_EXCHANGES["kraken"]["url"], ping_interval=30, ping_timeout=10) as ws:
+                    await ws.send(json.dumps(BRTI_EXCHANGES["kraken"]["subscribe"]))
+                    self.exchange_status["kraken"] = "connected"
+                    print("  ✅ Kraken connected")
+                    async for msg in ws:
+                        try:
+                            data = json.loads(msg)
+                            if isinstance(data, list) and len(data) >= 3:
+                                trades = data[1] if isinstance(data[1], list) else []
+                                for trade in trades:
+                                    if isinstance(trade, list) and len(trade) >= 2:
+                                        self._record_exchange_trade("kraken", float(trade[0]), float(trade[1]))
+                        except Exception:
+                            pass
+            except Exception as e:
+                self.exchange_status["kraken"] = f"error"
+                print(f"  Kraken WS error: {e}, reconnecting...")
+                await asyncio.sleep(5)
+
+    async def _bitstamp_ws(self):
+        """Bitstamp WebSocket — live trades."""
+        while self.running:
+            try:
+                async with websockets.connect(BRTI_EXCHANGES["bitstamp"]["url"], ping_interval=30, ping_timeout=10) as ws:
+                    await ws.send(json.dumps(BRTI_EXCHANGES["bitstamp"]["subscribe"]))
+                    self.exchange_status["bitstamp"] = "connected"
+                    print("  ✅ Bitstamp connected")
+                    async for msg in ws:
+                        try:
+                            data = json.loads(msg)
+                            if data.get("event") == "trade":
+                                td = data.get("data", {})
+                                self._record_exchange_trade("bitstamp", float(td.get("price", 0)), float(td.get("amount", 0)))
+                        except Exception:
+                            pass
+            except Exception as e:
+                self.exchange_status["bitstamp"] = f"error"
+                print(f"  Bitstamp WS error: {e}, reconnecting...")
+                await asyncio.sleep(5)
+
+    async def _gemini_ws(self):
+        """Gemini WebSocket — auto-streams trades."""
+        while self.running:
+            try:
+                async with websockets.connect(BRTI_EXCHANGES["gemini"]["url"], ping_interval=30, ping_timeout=10) as ws:
+                    self.exchange_status["gemini"] = "connected"
+                    print("  ✅ Gemini connected")
+                    async for msg in ws:
+                        try:
+                            data = json.loads(msg)
+                            for ev in data.get("events", []):
+                                if ev.get("type") == "trade":
+                                    self._record_exchange_trade("gemini", float(ev.get("price", 0)), float(ev.get("amount", 0)))
+                        except Exception:
+                            pass
+            except Exception as e:
+                self.exchange_status["gemini"] = f"error"
+                print(f"  Gemini WS error: {e}, reconnecting...")
+                await asyncio.sleep(5)
 
     async def settlement_check_loop(self):
         """Every 30s: check for new settlements and refresh open market subscriptions."""
@@ -978,11 +1122,12 @@ class Crypto15mAgent:
                     status = "LateFav: " + " | ".join(armed)
                 elif STRATEGY == "brti":
                     brti_val = f"${self.brti_ticks[-1][1]:,.2f}" if self.brti_ticks else "?"
-                    brti_age = f"{time.time() - self.brti_ticks[-1][0]:.0f}s" if self.brti_ticks else "?"
+                    brti_age = f"{time.time() - self.brti_ticks[-1][0]:.1f}s" if self.brti_ticks else "?"
                     btc_ticker = self.current_tickers.get("BTC", "")
                     held = self.ticker_contracts.get(btc_ticker, 0)
                     side_str = self.brti_held_side.upper() if self.brti_held_side else "flat"
-                    status = f"BRTI: {brti_val} (age:{brti_age}) | strike: ${self.brti_strike:,.2f} | dir: {self.brti_direction or 'wait'} | pos: {side_str} {held}x"
+                    feeds = sum(1 for s in self.exchange_status.values() if s == "connected")
+                    status = f"sBRTI: {brti_val} ({brti_age}) | strike: ${self.brti_strike:,.2f} | dir: {self.brti_direction or 'wait'} | pos: {side_str} {held}x | feeds: {feeds}/4"
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Min left: {minutes_remaining} | {status} | WS: {'✓' if self.ws_connected else '✗'}")
 
             except Exception as e:
@@ -1126,7 +1271,7 @@ class Crypto15mAgent:
             print(f"   Signal: BRTI momentum | BTC only | entry ≤{BRTI_ENTRY_MAX}c")
             print(f"   Momentum: first {BRTI_MOMENTUM_WINDOW}s of cycle → direction")
             print(f"   Flip sell: when BRTI crosses strike (buffer {BRTI_FLIP_BUFFER_PCT}%)")
-            print(f"   BRTI source: cfbenchmarks.com (poll every {BRTI_POLL_SEC}s)")
+            print(f"   BRTI source: synthetic (Coinbase+Kraken+Bitstamp+Gemini WebSockets)")
         print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
 
         print("Seeding settlement history...")
@@ -1137,8 +1282,11 @@ class Crypto15mAgent:
             asyncio.create_task(self.kalshi_websocket())
         asyncio.create_task(self.settlement_check_loop())
         if STRATEGY == "brti":
-            asyncio.create_task(self.brti_poll_loop())
-            print("📡 BRTI poll loop started")
+            asyncio.create_task(self._coinbase_ws())
+            asyncio.create_task(self._kraken_ws())
+            asyncio.create_task(self._bitstamp_ws())
+            asyncio.create_task(self._gemini_ws())
+            print("📡 Synthetic BRTI feeds launching (4 exchanges)")
 
         # Keep main alive
         while self.running:
