@@ -82,7 +82,7 @@ BRTI_COIN_CONFIG = {
 }
 
 # Legacy constants — used as defaults when coin not in BRTI_COIN_CONFIG
-BRTI_FLIP_COOLDOWN_SEC = 30
+BRTI_FLIP_COOLDOWN_SEC = 90
 BRTI_TRAILING_STOP_C = 5
 BRTI_STOP_LOSS_C = 5
 BRTI_CONVICTION_MIN_DISTANCE = 50
@@ -91,8 +91,8 @@ BRTI_CONVICTION_MAX_ADDS = 2
 BRTI_CONVICTION_COOLDOWN_SEC = 60
 BRTI_CONVICTION_MAX_PRICE = 85
 BRTI_TAKE_PROFIT_C = 95
-BRTI_REENTRY_MAX_PRICE = 80
-BRTI_ENTRY_MAX = 95
+BRTI_REENTRY_MAX_PRICE = 49
+BRTI_ENTRY_MAX = 49
 BRTI_MOMENTUM_WINDOW = 15
 
 # Synthetic BRTI — real-time feed from constituent exchange WebSockets
@@ -1108,18 +1108,19 @@ class Crypto15mAgent:
                                     self.ticker_contracts[btc_ticker] = 0
                                     self.positions[btc_ticker] = []
 
+                                    flip_buy_count = held + 1  # sell N, buy N+1 — double down on new direction
                                     if new_cost <= BRTI_ENTRY_MAX:
                                         buy_id = f"fflip-buy-{btc_ticker}-{int(time.time()*1000)}"
                                         self.client.create_order(
                                             ticker=btc_ticker, client_order_id=buy_id,
-                                            side=new_side, action="buy", count=1, type="limit",
+                                            side=new_side, action="buy", count=flip_buy_count, type="limit",
                                             yes_price=yes_ask if new_side == "yes" else None,
                                             no_price=(100 - yes_bid) if new_side == "no" else None,
                                         )
                                         self.brti_held_side = new_side
                                         self.brti_entry_price = new_cost
                                         self.brti_peak_value = new_cost
-                                        print(f"  → Flipped to {new_side.upper()} 1x @ {new_cost}c")
+                                        print(f"  → Flipped to {new_side.upper()} {flip_buy_count}x @ {new_cost}c (was {held}x)")
                                     else:
                                         self.brti_held_side = ""
                                         print(f"  → Sold, new side too expensive ({new_cost}c)")
