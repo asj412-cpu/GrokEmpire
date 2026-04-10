@@ -897,13 +897,22 @@ class Crypto15mAgent:
                         was_profitable = self.brti_peak_value > self.brti_entry_price
                         loss_from_entry = self.brti_entry_price - current_value
 
+                        # How far is sBRTI from strike on our side?
+                        if self.brti_held_side == "yes":
+                            our_distance = distance   # positive = good for YES
+                        else:
+                            our_distance = -distance  # positive = good for NO
+
+                        in_danger_zone = our_distance < 30  # sBRTI within $30 of strike
+
                         if was_profitable:
-                            # ── SCENARIO 1: Was profitable → trailing stop to lock in gains ──
-                            if drop_from_peak >= BRTI_TRAILING_STOP_C:
+                            # ── SCENARIO 1: Was profitable → trailing stop ONLY in danger zone ──
+                            # If sBRTI is comfortably on our side ($30+), hold — price dip is noise
+                            if drop_from_peak >= BRTI_TRAILING_STOP_C and in_danger_zone:
                                 should_flip = True
                                 new_side = "no" if self.brti_held_side == "yes" else "yes"
                                 profit = current_value - self.brti_entry_price
-                                reason = f"TRAILING STOP (entry:{self.brti_entry_price}c peak:{self.brti_peak_value}c now:{current_value}c pnl:{profit:+d}c)"
+                                reason = f"TRAILING STOP (entry:{self.brti_entry_price}c peak:{self.brti_peak_value}c now:{current_value}c pnl:{profit:+d}c sBRTI ${our_distance:+,.0f} from strike)"
                         else:
                             # ── SCENARIO 2: Never profitable → hard stop-loss to limit damage ──
                             if loss_from_entry >= BRTI_STOP_LOSS_C:
