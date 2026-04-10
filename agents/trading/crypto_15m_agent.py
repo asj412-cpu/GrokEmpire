@@ -85,7 +85,7 @@ COIN_SIGNAL_MODE = {
 # Others stay at 6/10 baseline. Re-evaluate 2026-04-10.
 COIN_FADE_CONFIG = {
     "BTC":  {"thresh": 7, "window": 10},
-    "ETH":  {"thresh": 5, "window": 7},
+    "ETH":  {"thresh": 6, "window": 10},
     "SOL":  {"thresh": 6, "window": 10},
     "XRP":  {"thresh": 6, "window": 10},
     "BNB":  {"thresh": 6, "window": 10},
