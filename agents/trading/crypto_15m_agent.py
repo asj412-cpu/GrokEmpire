@@ -54,6 +54,7 @@ BRTI_CONVICTION_MIN_CYCLE_SEC = 180 # at least 3 min into cycle before convictio
 BRTI_CONVICTION_MAX_ADDS = 2        # max 2 additional contracts (3 total with entry)
 BRTI_CONVICTION_COOLDOWN_SEC = 60   # 60s between conviction buys
 BRTI_CONVICTION_MAX_PRICE = 85      # only buy if ≤85c (getting a discount vs true probability)
+BRTI_TAKE_PROFIT_C = 95              # exit immediately if position value hits 95c+ (lock in the win)
 
 # Synthetic BRTI — real-time feed from constituent exchange WebSockets
 # Volume-weighted median of Coinbase, Kraken, Bitstamp, Gemini (~80%+ of BRTI weight)
@@ -897,6 +898,29 @@ class Crypto15mAgent:
                         # Update peak (high water mark)
                         if current_value > self.brti_peak_value:
                             self.brti_peak_value = current_value
+
+                        # ── Take profit: exit at 95c+ — lock in the win, no reversal risk ──
+                        if current_value >= BRTI_TAKE_PROFIT_C:
+                            old_side = self.brti_held_side
+                            profit = current_value - self.brti_entry_price
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] 💰 TAKE PROFIT: {old_side.upper()} @ {current_value}c (entry:{self.brti_entry_price}c pnl:+{profit}c)")
+                            if self.client and not DRY_RUN:
+                                try:
+                                    tp_id = f"tp-{btc_ticker}-{int(time.time()*1000)}"
+                                    self.client.create_order(
+                                        ticker=btc_ticker, client_order_id=tp_id,
+                                        side=old_side, action="sell", count=held, type="limit",
+                                        yes_price=yes_bid if old_side == "yes" else None,
+                                        no_price=(100 - yes_ask) if old_side == "no" else None,
+                                    )
+                                    self.ticker_contracts[btc_ticker] = 0
+                                    self.positions[btc_ticker] = []
+                                    self.brti_held_side = ""
+                                    print(f"  → Sold {held}x @ {current_value}c — done for this cycle")
+                                except Exception as e:
+                                    print(f"  → Take profit error: {e}")
+                            await asyncio.sleep(0.5)
+                            continue
 
                         latest_brti = self.brti_ticks[-1][1]
                         distance = latest_brti - self.brti_strike
