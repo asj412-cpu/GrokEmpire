@@ -459,11 +459,23 @@ class Crypto15mAgent:
         # ── Phase 2: Initial entry ──
         if self.brti_direction and not self.brti_entry_made and self.brti_direction != "flat":
             target_side = "yes" if self.brti_direction == "up" else "no"
-            # Cost to buy
+            # Cost to buy — use WS prices if available, else fetch from API
             if target_side == "yes":
                 cost = yes_ask
             else:
                 cost = 100 - yes_bid
+            # If WS prices are stale (both zero), try fetching from market data
+            if cost <= 0 or cost > 100:
+                try:
+                    md = self.client.get_markets(series_ticker="KXBTC15M", status="open", limit=1) if self.client else {}
+                    mkt = md.get("markets", [{}])[0]
+                    if target_side == "yes":
+                        cost = int(float(mkt.get("yes_ask_dollars", "0")) * 100)
+                    else:
+                        yb = int(float(mkt.get("yes_bid_dollars", "0")) * 100)
+                        cost = 100 - yb if yb > 0 else 0
+                except Exception:
+                    pass
             if 1 <= cost <= BRTI_ENTRY_MAX:
                 self.brti_entry_made = True
                 self.brti_held_side = target_side
