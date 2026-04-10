@@ -540,6 +540,22 @@ class Crypto15mAgent:
         # ── Phase 2: Initial entry ──
         if self.brti_direction and not self.brti_entry_made and self.brti_direction != "flat":
             target_side = "yes" if self.brti_direction == "up" else "no"
+
+            # Late-cycle guard: in final 2 min, only enter on regime change
+            # (projected settlement must have crossed strike — not routine momentum)
+            secs_remaining = max(1, 900 - cycle_sec)
+            if secs_remaining <= 120:
+                # Check if projected settlement actually crossed strike
+                smooth_ticks = [v for t, v in self.brti_ticks if t > now.timestamp() - BRTI_SMOOTHING_WINDOW]
+                if smooth_ticks:
+                    smoothed = sum(smooth_ticks) / len(smooth_ticks)
+                    if target_side == "yes" and smoothed < self.brti_strike:
+                        return  # sBRTI still below strike — not a real regime change
+                    if target_side == "no" and smoothed > self.brti_strike:
+                        return  # sBRTI still above strike — not a real regime change
+                else:
+                    return  # no data, don't enter this late
+
             # Cost to buy — use WS prices if available, else fetch from API
             if target_side == "yes":
                 cost = yes_ask
@@ -557,8 +573,7 @@ class Crypto15mAgent:
                         cost = 100 - yb if yb > 0 else 0
                 except Exception:
                     pass
-            # Initial entry: 49c max (only enter as underdog/coinflip — asymmetric payoff)
-            # Re-entry after take-profit: 80c max (buy the dip)
+            # Initial entry: 49c max | Re-entry: 49c max
             is_reentry = self.brti_conviction_adds > 0 or self.brti_peak_value > 0
             max_price = BRTI_REENTRY_MAX_PRICE if is_reentry else 49
             if 1 <= cost <= max_price:
