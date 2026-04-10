@@ -48,6 +48,13 @@ BRTI_TRAILING_STOP_C = 5      # profitable position: flip when value drops 5c fr
 BRTI_STOP_LOSS_C = 5          # never-profitable position: flip when down 5c from entry (max loss)
 BRTI_SMOOTHING_WINDOW = 60    # 60-second rolling average to simulate settlement smoothing
 
+# Conviction buy — add contracts when projected settlement is locked in our favor
+BRTI_CONVICTION_MIN_DISTANCE = 50   # projected settlement must be $50+ past strike
+BRTI_CONVICTION_MIN_CYCLE_SEC = 180 # at least 3 min into cycle before conviction buys
+BRTI_CONVICTION_MAX_ADDS = 2        # max 2 additional contracts (3 total with entry)
+BRTI_CONVICTION_COOLDOWN_SEC = 60   # 60s between conviction buys
+BRTI_CONVICTION_MAX_PRICE = 85      # only buy if ≤85c (getting a discount vs true probability)
+
 # Synthetic BRTI — real-time feed from constituent exchange WebSockets
 # Volume-weighted median of Coinbase, Kraken, Bitstamp, Gemini (~80%+ of BRTI weight)
 BRTI_EXCHANGES = {
@@ -215,6 +222,8 @@ class Crypto15mAgent:
         self.brti_last_flip_ts: float = 0  # timestamp of last flip
         self.brti_entry_price: int = 0     # what we paid for current position (cents)
         self.brti_peak_value: int = 0      # highest value our position has reached (cents)
+        self.brti_conviction_adds: int = 0  # conviction buys this cycle
+        self.brti_last_conviction_ts: float = 0  # last conviction buy timestamp
         
         # Exchange price feeds for synthetic BRTI
         self.exchange_prices: Dict[str, float] = {}              # exchange -> latest trade price
@@ -331,6 +340,8 @@ class Crypto15mAgent:
                 self.brti_last_flip_ts = 0
                 self.brti_entry_price = 0
                 self.brti_peak_value = 0
+                self.brti_conviction_adds = 0
+                self.brti_last_conviction_ts = 0
                 print(f"  🔄 BRTI cycle reset (strike: ${self.brti_strike:,.2f})")
 
         if tickers and self.ws_connected:
@@ -887,11 +898,44 @@ class Crypto15mAgent:
                         if current_value > self.brti_peak_value:
                             self.brti_peak_value = current_value
 
-                        # Check trailing stop: position dropped Xc from peak
                         latest_brti = self.brti_ticks[-1][1]
                         distance = latest_brti - self.brti_strike
                         drop_from_peak = self.brti_peak_value - current_value
 
+                        # ── Conviction buy: add when projected settlement is locked ──
+                        cycle_now = datetime.now()
+                        cycle_sec = (cycle_now.minute % 15) * 60 + cycle_now.second
+                        if (self.brti_conviction_adds < BRTI_CONVICTION_MAX_ADDS
+                                and cycle_sec >= BRTI_CONVICTION_MIN_CYCLE_SEC
+                                and (time.time() - self.brti_last_conviction_ts) > BRTI_CONVICTION_COOLDOWN_SEC):
+                            # Quick projected settlement calc
+                            now_ts = time.time()
+                            smooth_ticks = [v for t, v in self.brti_ticks if t > now_ts - BRTI_SMOOTHING_WINDOW]
+                            if smooth_ticks:
+                                smoothed = sum(smooth_ticks) / len(smooth_ticks)
+                                if self.brti_held_side == "yes":
+                                    proj_distance = smoothed - self.brti_strike
+                                else:
+                                    proj_distance = self.brti_strike - smoothed
+                                # Projected $50+ on our side AND price is discounted
+                                buy_price = yes_ask if self.brti_held_side == "yes" else (100 - yes_bid)
+                                if proj_distance >= BRTI_CONVICTION_MIN_DISTANCE and buy_price <= BRTI_CONVICTION_MAX_PRICE:
+                                    self.brti_conviction_adds += 1
+                                    self.brti_last_conviction_ts = time.time()
+                                    print(f"[{cycle_now.strftime('%H:%M:%S')}] 💪 CONVICTION BUY: {self.brti_held_side.upper()} 1x @ {buy_price}c (smoothed ${proj_distance:+,.0f} from strike, add {self.brti_conviction_adds}/{BRTI_CONVICTION_MAX_ADDS})")
+                                    if self.client and not DRY_RUN:
+                                        try:
+                                            conv_id = f"conv-{btc_ticker}-{int(time.time()*1000)}"
+                                            self.client.create_order(
+                                                ticker=btc_ticker, client_order_id=conv_id,
+                                                side=self.brti_held_side, action="buy", count=1, type="limit",
+                                                yes_price=yes_ask if self.brti_held_side == "yes" else None,
+                                                no_price=(100 - yes_bid) if self.brti_held_side == "no" else None,
+                                            )
+                                        except Exception as e:
+                                            print(f"  → Conviction buy error: {e}")
+
+                        # ── Check trailing stop / stop loss ──
                         should_flip = False
                         new_side = ""
                         reason = ""
