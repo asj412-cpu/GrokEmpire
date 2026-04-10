@@ -50,15 +50,16 @@ COIN_LATE_FAV_CONFIG = {
     # HYPE: skip
 }
 
-# Tiered entry strategy (backtested: +$13.46 vs current $4.38 over 60 cycles)
+# Tiered entry strategy
 # Tier 1: min 0-7 of cycle (cycle_sec 0-420 = 8-15 min remaining) → entry 1-20c
-# Tier 2: min 7-10 of cycle (cycle_sec 420-600 = 5-8 min remaining) → entry 20-49c
+# Tier 2: min 7-10 of cycle (cycle_sec 420-600 = 5-8 min remaining) → entry 20-35c
+# (T2 max lowered from 49→35: live data showed 36-49c range was 36% WR, −$22/5d)
 TIER1_MAX_CYCLE_SEC = 420   # min 7
 TIER1_ENTRY_LOW = 1
 TIER1_ENTRY_HIGH = 20
 TIER2_MAX_CYCLE_SEC = 600   # min 10
 TIER2_ENTRY_LOW = 20
-TIER2_ENTRY_HIGH = 49
+TIER2_ENTRY_HIGH = 35
 
 # Legacy single-tier constants kept for backwards compat in some helpers
 ENTRY_LOW = TIER1_ENTRY_LOW
