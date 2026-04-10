@@ -70,13 +70,13 @@ COOLDOWN_SEC = 60  # cooldown between fills per ticker (resets at cycle boundary
 # Per-coin signal direction. "fade" = mean-reversion (default), "trend" = follow majority.
 # HYPE flipped to trend on 2026-04-06 — backtest shows trend WR 51.9% vs fade 48.1% over last 5 days
 COIN_SIGNAL_MODE = {
-    "BTC": "fade",
+    "BTC": "trend",
     "ETH": "trend",
-    "SOL": "fade",
-    "XRP": "fade",
+    "SOL": "trend",
+    "XRP": "trend",
     "BNB": "fade",
     "HYPE": "trend",
-    "DOGE": "fade",
+    "DOGE": "trend",
 }
 
 # Per-coin fade threshold/window overrides (data-driven from 5-day backtest 2026-04-08)
