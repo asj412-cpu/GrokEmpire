@@ -427,12 +427,15 @@ class Crypto15mAgent:
         if latest_brti <= 0:
             return
 
-        # ── Phase 1: Determine direction from first 15s of cycle ──
-        if not self.brti_direction and cycle_sec >= BRTI_MOMENTUM_WINDOW:
-            # Get BRTI values from cycle start vs now
+        # ── Phase 1: Determine direction from first ~15s of cycle ──
+        if not self.brti_direction and cycle_sec >= BRTI_MOMENTUM_WINDOW and len(self.brti_ticks) >= 10:
+            # Use BRTI data relative to cycle start — data has ~60-120s lag so use
+            # ticks near cycle_start and the most recent available ticks
             cycle_start_ts = now.timestamp() - cycle_sec
-            start_ticks = [v for t, v in self.brti_ticks if t >= cycle_start_ts and t <= cycle_start_ts + 5]
-            recent_ticks = [v for t, v in self.brti_ticks if t >= now.timestamp() - 5]
+            # Ticks near cycle start (within first 10s of cycle, accounting for data lag)
+            start_ticks = [v for t, v in self.brti_ticks if cycle_start_ts - 5 <= t <= cycle_start_ts + 10]
+            # Most recent ticks available (last 10 in buffer)
+            recent_ticks = [v for _, v in self.brti_ticks[-10:]]
             if start_ticks and recent_ticks:
                 start_avg = sum(start_ticks) / len(start_ticks)
                 recent_avg = sum(recent_ticks) / len(recent_ticks)
@@ -444,6 +447,14 @@ class Crypto15mAgent:
                     self.brti_direction = "flat"
                 delta = recent_avg - start_avg
                 print(f"[{now.strftime('%H:%M:%S')}] BRTI direction: {self.brti_direction} (${start_avg:,.2f} → ${recent_avg:,.2f}, Δ${delta:+,.2f}) | strike: ${self.brti_strike:,.2f}")
+            elif not start_ticks and recent_ticks:
+                # No cycle-start data yet — use BRTI vs strike as proxy
+                recent_avg = sum(recent_ticks) / len(recent_ticks)
+                if recent_avg > self.brti_strike:
+                    self.brti_direction = "up"
+                else:
+                    self.brti_direction = "down"
+                print(f"[{now.strftime('%H:%M:%S')}] BRTI direction (vs strike): {self.brti_direction} (BRTI ${recent_avg:,.2f} vs strike ${self.brti_strike:,.2f})")
 
         # ── Phase 2: Initial entry ──
         if self.brti_direction and not self.brti_entry_made and self.brti_direction != "flat":
@@ -462,21 +473,18 @@ class Crypto15mAgent:
 
         # ── Phase 3: Flip sell — monitor BRTI vs strike throughout cycle ──
         if self.brti_held_side and self.ticker_contracts.get(ticker, 0) > 0:
-            # Determine if our position is about to go unprofitable
-            # YES wins if BRTI ≥ strike at settlement. NO wins if BRTI < strike.
-            buffer = self.brti_strike * BRTI_FLIP_BUFFER_PCT / 100  # e.g., 0.01% of strike
+            # Flip when BRTI crosses strike against our position
+            # YES profitable when BRTI > strike; NO profitable when BRTI < strike
+            # Buffer: flip slightly before the crossing so we beat the Kalshi orderbook
+            buffer = self.brti_strike * BRTI_FLIP_BUFFER_PCT / 100
 
             should_flip = False
-            if self.brti_held_side == "yes":
-                # We're profitable while BRTI > strike. Flip if BRTI dropping below strike
-                if latest_brti < self.brti_strike - buffer:
-                    should_flip = True
-                    new_side = "no"
-            elif self.brti_held_side == "no":
-                # We're profitable while BRTI < strike. Flip if BRTI rising above strike
-                if latest_brti > self.brti_strike + buffer:
-                    should_flip = True
-                    new_side = "yes"
+            if self.brti_held_side == "yes" and latest_brti < self.brti_strike - buffer:
+                should_flip = True
+                new_side = "no"
+            elif self.brti_held_side == "no" and latest_brti > self.brti_strike + buffer:
+                should_flip = True
+                new_side = "yes"
 
             if should_flip:
                 held_count = self.ticker_contracts.get(ticker, 0)
