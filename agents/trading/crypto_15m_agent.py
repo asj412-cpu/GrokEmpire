@@ -467,29 +467,41 @@ class Crypto15mAgent:
 
         momentum_window = cfg.get("momentum_window", BRTI_MOMENTUM_WINDOW)
 
-        # ── Phase 1: Determine direction from first ~15s of cycle ──
+        # ── Phase 1: Determine direction ──
+        # Priority: position relative to strike > momentum
+        # If sBRTI is clearly on one side of strike, that's the direction
+        # regardless of tiny momentum noise. Only use momentum when near strike.
         if not st["direction"] and cycle_sec >= momentum_window and len(st["ticks"]) >= 10:
-            cycle_start_ts = now.timestamp() - cycle_sec
-            start_ticks = [v for t, v in st["ticks"] if cycle_start_ts - 5 <= t <= cycle_start_ts + 10]
             recent_ticks = [v for _, v in st["ticks"][-10:]]
-            if start_ticks and recent_ticks:
-                start_avg = sum(start_ticks) / len(start_ticks)
+            if recent_ticks:
                 recent_avg = sum(recent_ticks) / len(recent_ticks)
-                if recent_avg > start_avg:
-                    st["direction"] = "up"
-                elif recent_avg < start_avg:
-                    st["direction"] = "down"
+                distance_from_strike = recent_avg - st["strike"]
+                min_clear_dist = cfg.get("trailing_stop_mid_dist", 20)  # $20 BTC / $0.60 ETH
+
+                if abs(distance_from_strike) >= min_clear_dist:
+                    # sBRTI is clearly on one side — use position, not momentum
+                    st["direction"] = "up" if distance_from_strike > 0 else "down"
+                    print(f"[{now.strftime('%H:%M:%S')}] {coin} direction (position): {st['direction']} (index ${recent_avg:,.2f} is ${distance_from_strike:+,.2f} from strike ${st['strike']:,.2f})")
                 else:
-                    st["direction"] = "flat"
-                delta = recent_avg - start_avg
-                print(f"[{now.strftime('%H:%M:%S')}] {coin} direction: {st['direction']} (${start_avg:,.2f} → ${recent_avg:,.2f}, Δ${delta:+,.2f}) | strike: ${st['strike']:,.2f}")
-            elif not start_ticks and recent_ticks:
-                recent_avg = sum(recent_ticks) / len(recent_ticks)
-                if recent_avg > st["strike"]:
-                    st["direction"] = "up"
-                else:
-                    st["direction"] = "down"
-                print(f"[{now.strftime('%H:%M:%S')}] {coin} direction (vs strike): {st['direction']} (index ${recent_avg:,.2f} vs strike ${st['strike']:,.2f})")
+                    # sBRTI near strike — use momentum to break the tie
+                    cycle_start_ts = now.timestamp() - cycle_sec
+                    start_ticks = [v for t, v in st["ticks"] if cycle_start_ts - 5 <= t <= cycle_start_ts + 10]
+                    if start_ticks:
+                        start_avg = sum(start_ticks) / len(start_ticks)
+                        delta = recent_avg - start_avg
+                        # Require meaningful momentum (at least $5 BTC / $0.15 ETH)
+                        min_momentum = min_clear_dist * 0.25
+                        if delta > min_momentum:
+                            st["direction"] = "up"
+                        elif delta < -min_momentum:
+                            st["direction"] = "down"
+                        else:
+                            st["direction"] = "flat"  # too close to call
+                        print(f"[{now.strftime('%H:%M:%S')}] {coin} direction (momentum): {st['direction']} (${start_avg:,.2f} → ${recent_avg:,.2f}, Δ${delta:+,.2f}, need ±${min_momentum:,.2f}) | strike: ${st['strike']:,.2f}")
+                    else:
+                        # No start data — use position vs strike
+                        st["direction"] = "up" if distance_from_strike > 0 else "down"
+                        print(f"[{now.strftime('%H:%M:%S')}] {coin} direction (vs strike): {st['direction']} (index ${recent_avg:,.2f} vs strike ${st['strike']:,.2f})")
 
         # ── Phase 2: Initial entry ──
         if st["direction"] and not st["entry_made"] and st["direction"] != "flat":
