@@ -222,6 +222,7 @@ class Crypto15mAgent:
                 "peak_value": 0,          # highest value our position has reached (cents)
                 "conviction_adds": 0,     # conviction buys this cycle
                 "last_conviction_ts": 0.0, # last conviction buy timestamp
+                "flip_confirm_ticks": 0,  # sustained flip signal counter (need 4 = ~2s)
             }
 
         # Exchange price feeds for synthetic index — keyed by (exchange, coin)
@@ -540,6 +541,11 @@ class Crypto15mAgent:
             reentry_max = cfg.get("reentry_max_price", entry_max)
             is_reentry = st["conviction_adds"] > 0 or st["peak_value"] > 0
             max_price = reentry_max if is_reentry else entry_max
+            # Global exposure guard: max 5 contracts across all coins
+            total_exposure = sum(self.ticker_contracts.values())
+            if total_exposure >= 5:
+                return
+
             if 1 <= cost <= max_price:
                 st["entry_made"] = True
                 st["held_side"] = target_side
@@ -756,9 +762,11 @@ class Crypto15mAgent:
                     # ── Conviction buy: add when projected settlement is locked ──
                     cycle_now = datetime.now()
                     cycle_sec = (cycle_now.minute % 15) * 60 + cycle_now.second
+                    total_exposure = sum(self.ticker_contracts.values())
                     if (st["conviction_adds"] < conviction_max_adds
                             and cycle_sec >= conviction_min_cycle_sec
-                            and (time.time() - st["last_conviction_ts"]) > conviction_cooldown_sec):
+                            and (time.time() - st["last_conviction_ts"]) > conviction_cooldown_sec
+                            and total_exposure < 5):
                         now_ts = time.time()
                         smooth_ticks = [v for t, v in st["ticks"] if t > now_ts - BRTI_SMOOTHING_WINDOW]
                         if smooth_ticks:
@@ -817,7 +825,9 @@ class Crypto15mAgent:
                         projected_winning = projected_settlement < st["strike"]
 
                     if was_profitable:
-                        if drop_from_peak >= trailing_stop_c:
+                        # Only activate trailing stop once we have +8c locked in
+                        # Prevents selling on tiny peaks that barely exceeded entry
+                        if drop_from_peak >= trailing_stop_c and current_value >= st["entry_price"] + 8:
                             should_flip = True
                             new_side = "no" if st["held_side"] == "yes" else "yes"
                             profit = current_value - st["entry_price"]
@@ -859,11 +869,22 @@ class Crypto15mAgent:
                             wrong_side_distance = projected_settlement - st["strike"]
 
                         # Tier A: MOMENTUM FLIP — projected settlement is conviction-level wrong
-                        # "sBRTI clearly moved to the other side, we entered wrong"
-                        if wrong_side_distance >= momentum_flip_dist:
+                        # Requires 1.2x the conviction distance + momentum direction confirming
+                        # "sBRTI clearly moved AND is still moving to the other side"
+                        ticks_10s = [v for t, v in st["ticks"] if t > now_ts - 10]
+                        ticks_30s = [v for t, v in st["ticks"] if t > now_ts - 30]
+                        if len(ticks_10s) >= 2 and len(ticks_30s) >= 2:
+                            short_momentum = sum(ticks_10s) / len(ticks_10s) - sum(ticks_30s) / len(ticks_30s)
+                        else:
+                            short_momentum = 0
+                        # For YES holder, negative momentum = bad. For NO holder, positive = bad.
+                        momentum_confirms = (st["held_side"] == "yes" and short_momentum < 0) or \
+                                           (st["held_side"] == "no" and short_momentum > 0)
+
+                        if wrong_side_distance >= momentum_flip_dist * 1.2 and momentum_confirms:
                             should_flip = True
                             new_side = "no" if st["held_side"] == "yes" else "yes"
-                            reason = f"MOMENTUM FLIP (entry:{st['entry_price']}c now:{current_value}c proj ${wrong_side_distance:,.0f} past strike on wrong side)"
+                            reason = f"MOMENTUM FLIP (proj ${wrong_side_distance:,.0f} past strike + momentum confirms)"
 
                         # Tier B: HARD STOP — emergency cap, max loss regardless of projection
                         # "We've lost too much, exit to preserve capital"
@@ -874,15 +895,15 @@ class Crypto15mAgent:
                             print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛑 {coin} HARD STOP: SELL {old_side.upper()} @ {current_value}c (entry:{st['entry_price']}c loss:{loss_from_entry}c) — flat")
                             if self.client and not DRY_RUN:
                                 try:
-                                    hs_id = f"hstop-{btc_ticker}-{int(time.time()*1000)}"
+                                    hs_id = f"hstop-{coin_ticker}-{int(time.time()*1000)}"
                                     self.client.create_order(
-                                        ticker=btc_ticker, client_order_id=hs_id,
+                                        ticker=coin_ticker, client_order_id=hs_id,
                                         side=old_side, action="sell", count=safe_sell_count, type="limit",
                                         yes_price=yes_bid if old_side == "yes" else None,
                                         no_price=(100 - yes_ask) if old_side == "no" else None,
                                     )
-                                    self.ticker_contracts[btc_ticker] = 0
-                                    self.positions[btc_ticker] = []
+                                    self.ticker_contracts[coin_ticker] = 0
+                                    self.positions[coin_ticker] = []
                                     st["held_side"] = ""
                                     st["entry_made"] = False
                                     st["peak_value"] = 0
@@ -894,6 +915,15 @@ class Crypto15mAgent:
                             continue
 
                         # Tier C: small loss, projection unclear → DO NOTHING, let it play out
+
+                    # Flip confirmation: require 4 sustained ticks (~2s) before executing
+                    if should_flip:
+                        st["flip_confirm_ticks"] += 1
+                        if st["flip_confirm_ticks"] < 4:
+                            continue  # wait for confirmation
+                        st["flip_confirm_ticks"] = 0  # reset after executing
+                    else:
+                        st["flip_confirm_ticks"] = 0  # reset if signal disappears
 
                     if should_flip:
                         old_side = st["held_side"]
