@@ -66,11 +66,11 @@ BRTI_COIN_CONFIG = {
         "trailing_stop_far_c": 15,
         "trailing_stop_mid_c": 10,
         "trailing_stop_near_c": 5,
-        "trailing_stop_far_dist": 1.50,  # ETH: $1.50 ≈ BTC $50
-        "trailing_stop_mid_dist": 0.60,  # ETH: $0.60 ≈ BTC $20
-        "stop_loss_hard_c": 20,
-        "momentum_flip_distance": 1.50,  # ETH: $1.50 ≈ BTC $50
-        "conviction_min_distance": 1.50,
+        "trailing_stop_far_dist": 3.00,  # ETH: $3.00 — wider, ETH oscillates $1-2 routinely
+        "trailing_stop_mid_dist": 1.50,  # ETH: $1.50 — mid zone starts further out
+        "stop_loss_hard_c": 35,          # ETH: wider hard stop — 50/50 contracts swing 30c on noise
+        "momentum_flip_distance": 2.00,  # ETH: need $2+ wrong side to flip (avoids noise flips)
+        "conviction_min_distance": 2.00, # ETH: $2+ past strike to add
         "conviction_min_cycle_sec": 180,
         "conviction_max_adds": 2,
         "conviction_cooldown_sec": 60,
