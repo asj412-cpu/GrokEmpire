@@ -713,6 +713,8 @@ class Crypto15mAgent:
                         trailing_stop_c = cfg.get("trailing_stop_mid_c", 10)
                     else:
                         trailing_stop_c = cfg.get("trailing_stop_near_c", 5)
+                    # Safe sell count: only sell what we actually bought this cycle (entry + conviction adds)
+                    safe_sell_count = max(1, min(held, 1 + st.get("conviction_adds", 0)))
                     conviction_max_adds = cfg.get("conviction_max_adds", BRTI_CONVICTION_MAX_ADDS)
                     conviction_min_cycle_sec = cfg.get("conviction_min_cycle_sec", BRTI_CONVICTION_MIN_CYCLE_SEC)
                     conviction_cooldown_sec = cfg.get("conviction_cooldown_sec", BRTI_CONVICTION_COOLDOWN_SEC)
@@ -724,13 +726,15 @@ class Crypto15mAgent:
                     if current_value >= take_profit_c:
                         old_side = st["held_side"]
                         profit = current_value - st["entry_price"]
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] 💰 {coin} TAKE PROFIT: {old_side.upper()} @ {current_value}c (entry:{st['entry_price']}c pnl:+{profit}c)")
+                        # Cap sell count: 1 entry + conviction_adds — don't oversell from stale ticker_contracts
+                        safe_sell_count = max(1, min(held, 1 + st.get("conviction_adds", 0)))
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] 💰 {coin} TAKE PROFIT: {old_side.upper()} {safe_sell_count}x @ {current_value}c (entry:{st['entry_price']}c pnl:+{profit}c)")
                         if self.client and not DRY_RUN:
                             try:
                                 tp_id = f"tp-{coin_ticker}-{int(time.time()*1000)}"
                                 self.client.create_order(
                                     ticker=coin_ticker, client_order_id=tp_id,
-                                    side=old_side, action="sell", count=held, type="limit",
+                                    side=old_side, action="sell", count=safe_sell_count, type="limit",
                                     yes_price=yes_bid if old_side == "yes" else None,
                                     no_price=(100 - yes_ask) if old_side == "no" else None,
                                 )
@@ -830,7 +834,7 @@ class Crypto15mAgent:
                                             tp_id = f"prot-{coin_ticker}-{int(time.time()*1000)}"
                                             self.client.create_order(
                                                 ticker=coin_ticker, client_order_id=tp_id,
-                                                side=old_side, action="sell", count=held, type="limit",
+                                                side=old_side, action="sell", count=safe_sell_count, type="limit",
                                                 yes_price=yes_bid if old_side == "yes" else None,
                                                 no_price=(100 - yes_ask) if old_side == "no" else None,
                                             )
@@ -873,7 +877,7 @@ class Crypto15mAgent:
                                     hs_id = f"hstop-{btc_ticker}-{int(time.time()*1000)}"
                                     self.client.create_order(
                                         ticker=btc_ticker, client_order_id=hs_id,
-                                        side=old_side, action="sell", count=held, type="limit",
+                                        side=old_side, action="sell", count=safe_sell_count, type="limit",
                                         yes_price=yes_bid if old_side == "yes" else None,
                                         no_price=(100 - yes_ask) if old_side == "no" else None,
                                     )
@@ -903,7 +907,7 @@ class Crypto15mAgent:
                                 sell_id = f"fflip-sell-{coin_ticker}-{int(time.time()*1000)}"
                                 self.client.create_order(
                                     ticker=coin_ticker, client_order_id=sell_id,
-                                    side=old_side, action="sell", count=held, type="limit",
+                                    side=old_side, action="sell", count=safe_sell_count, type="limit",
                                     yes_price=yes_bid if old_side == "yes" else None,
                                     no_price=(100 - yes_ask) if old_side == "no" else None,
                                 )
