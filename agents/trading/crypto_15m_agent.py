@@ -977,32 +977,48 @@ class Crypto15mAgent:
                             if projected_winning:
                                 should_flip = False
                                 if drop_from_peak >= trailing_stop_c:
-                                    old_side = st["held_side"]
-                                    sell_price = current_value
-                                    pnl_val = sell_price - st["entry_price"]
-                                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 📉 {coin} PROTECT PROFIT: SELL {old_side.upper()} @ {sell_price}c (peak:{st['peak_value']}c pnl:{pnl_val:+d}c) — flat, watching")
-                                    # ALWAYS reset state — prevents storm in paper mode too
-                                    self.ticker_contracts[coin_ticker] = 0
-                                    self.positions[coin_ticker] = []
-                                    st["held_side"] = ""
-                                    st["entry_made"] = False
-                                    st["peak_value"] = 0
-                                    st["entry_price"] = 0
-                                    st["last_flip_ts"] = time.time()
-                                    st["direction"] = ""  # re-evaluate before re-entry
-                                    if self.client and not DRY_RUN:
-                                        try:
-                                            tp_id = f"prot-{coin_ticker}-{int(time.time()*1000)}"
-                                            self.client.create_order(
-                                                ticker=coin_ticker, client_order_id=tp_id,
-                                                side=old_side, action="sell", count=safe_sell_count, type="limit",
-                                                yes_price=yes_bid if old_side == "yes" else None,
-                                                no_price=(100 - yes_ask) if old_side == "no" else None,
-                                            )
-                                        except Exception as e:
-                                            print(f"  → {coin} Protect profit error (state already cleared): {e}")
+                                    # Prob model gate: if P(held_side_wins) is still high,
+                                    # Kalshi price pullback is noise — hold for TP instead.
+                                    _prot_dist = smoothed_brti - st["strike"]
+                                    _prot_p_above = self.estimate_settlement_probability(
+                                        coin, _prot_dist, secs_remaining, momentum
+                                    )
+                                    _prot_p_held = _prot_p_above if st["held_side"] == "yes" else (1.0 - _prot_p_above)
+                                    _prot_gate = cfg.get("protect_profit_prob_gate", 0.70)
+                                    if _prot_p_held >= _prot_gate:
+                                        # P(win) still high — suppress protect profit, let TP fire
+                                        print(
+                                            f"[{datetime.now().strftime('%H:%M:%S')}] {coin} protect profit suppressed: "
+                                            f"P({st['held_side']}_wins)={_prot_p_held:.1%} >= {_prot_gate:.0%} gate "
+                                            f"(dist={_prot_dist:+.0f}, T={secs_remaining:.0f}s)"
+                                        )
                                     else:
-                                        print(f"  📄 PAPER: {coin} protect profit — flat, direction reset")
+                                        old_side = st["held_side"]
+                                        sell_price = current_value
+                                        pnl_val = sell_price - st["entry_price"]
+                                        print(f"[{datetime.now().strftime('%H:%M:%S')}] 📉 {coin} PROTECT PROFIT: SELL {old_side.upper()} @ {sell_price}c (peak:{st['peak_value']}c pnl:{pnl_val:+d}c P(win)={_prot_p_held:.0%}) — flat, watching")
+                                        # ALWAYS reset state — prevents storm in paper mode too
+                                        self.ticker_contracts[coin_ticker] = 0
+                                        self.positions[coin_ticker] = []
+                                        st["held_side"] = ""
+                                        st["entry_made"] = False
+                                        st["peak_value"] = 0
+                                        st["entry_price"] = 0
+                                        st["last_flip_ts"] = time.time()
+                                        st["direction"] = ""  # re-evaluate before re-entry
+                                        if self.client and not DRY_RUN:
+                                            try:
+                                                tp_id = f"prot-{coin_ticker}-{int(time.time()*1000)}"
+                                                self.client.create_order(
+                                                    ticker=coin_ticker, client_order_id=tp_id,
+                                                    side=old_side, action="sell", count=safe_sell_count, type="limit",
+                                                    yes_price=yes_bid if old_side == "yes" else None,
+                                                    no_price=(100 - yes_ask) if old_side == "no" else None,
+                                                )
+                                            except Exception as e:
+                                                print(f"  → {coin} Protect profit error (state already cleared): {e}")
+                                        else:
+                                            print(f"  📄 PAPER: {coin} protect profit — flat, direction reset")
                     else:
                         # ── SCENARIO 2: Never profitable — two tiers ──
                         hard_stop = cfg.get("stop_loss_hard_c", 20)
