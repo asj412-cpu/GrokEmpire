@@ -99,6 +99,60 @@ BRTI_COIN_CONFIG = {
         "volatility_per_sec": 0.071,
         "flip_probability_threshold": FLIP_PROBABILITY_THRESHOLD,
     },
+    "SOL": {
+        "series": "KXSOL15M",
+        "flip_cooldown_sec": 90,
+        "trailing_stop_c": 5,
+        "trailing_stop_far_c": 15,
+        "trailing_stop_mid_c": 10,
+        "trailing_stop_near_c": 5,
+        "trailing_stop_far_dist": 1.50,  # SOL: $1.50+ from strike = far zone
+        "trailing_stop_mid_dist": 0.50,  # SOL: $0.50-1.50 from strike = mid zone
+        "stop_loss_hard_c": 25,
+        "momentum_flip_distance": 0.30,  # SOL: $0.30+ wrong side (proportional to BTC $30 at ~$150 price)
+        "conviction_min_distance": 0.75, # SOL: $0.75 past strike to add (~0.5σ_15m)
+        "conviction_min_cycle_sec": 180,
+        "conviction_max_adds": 2,
+        "conviction_cooldown_sec": 60,
+        "conviction_max_price": 85,
+        "take_profit_c": 95,
+        "reentry_max_price": 59,
+        "entry_max": 79,
+        "entry_contracts": 1,
+        "momentum_window": 15,
+        "ws_pairs": {"coinbase": "SOL-USD", "kraken": "SOL/USD", "bitstamp": "solusd", "gemini": "SOLUSD"},
+        # Probability model — SOL ~$150, ~1.5-2x BTC/ETH percentage volatility
+        # σ_15m≈$1.50 => σ_per_sec=$1.50/sqrt(900)=$0.050/sec (conservative — errs toward less-flip)
+        "volatility_per_sec": 0.050,
+        "flip_probability_threshold": FLIP_PROBABILITY_THRESHOLD,
+    },
+    "XRP": {
+        "series": "KXXRP15M",
+        "flip_cooldown_sec": 90,
+        "trailing_stop_c": 5,
+        "trailing_stop_far_c": 15,
+        "trailing_stop_mid_c": 10,
+        "trailing_stop_near_c": 5,
+        "trailing_stop_far_dist": 0.05,  # XRP: $0.05+ from strike = far zone (2% at $2.50)
+        "trailing_stop_mid_dist": 0.02,  # XRP: $0.02-0.05 from strike = mid zone (0.8% at $2.50)
+        "stop_loss_hard_c": 25,
+        "momentum_flip_distance": 0.02,  # XRP: $0.02+ wrong side (0.8% — proportional to BTC)
+        "conviction_min_distance": 0.05, # XRP: $0.05 past strike to add (2% at $2.50)
+        "conviction_min_cycle_sec": 180,
+        "conviction_max_adds": 2,
+        "conviction_cooldown_sec": 60,
+        "conviction_max_price": 85,
+        "take_profit_c": 95,
+        "reentry_max_price": 59,
+        "entry_max": 79,
+        "entry_contracts": 1,
+        "momentum_window": 15,
+        "ws_pairs": {"coinbase": "XRP-USD", "kraken": "XRP/USD", "bitstamp": "xrpusd", "gemini": "XRPUSD"},
+        # Probability model — XRP ~$2.50, higher percentage volatility than BTC/ETH
+        # σ_15m≈$0.09 => σ_per_sec=$0.09/sqrt(900)=$0.003/sec (conservative — errs toward less-flip)
+        "volatility_per_sec": 0.003,
+        "flip_probability_threshold": FLIP_PROBABILITY_THRESHOLD,
+    },
 }
 
 # Default constants — used as fallbacks in cfg.get() when a key is missing from BRTI_COIN_CONFIG
