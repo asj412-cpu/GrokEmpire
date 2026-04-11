@@ -35,7 +35,7 @@ DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 # Strategy selector — mutually exclusive
 #   "fade"          → tiered fade/trend strategy
 #   "late_favorite" → buy favored side late in cycle
-#   "brti"          → BRTI momentum: BTC only, entry from 1st 15s direction, flip sell on reversal
+#   "brti"          → BRTI momentum: BTC+ETH, entry from 1st 15s direction, flip sell on reversal
 STRATEGY = os.getenv('STRATEGY', 'brti').lower()
 if STRATEGY not in ("fade", "late_favorite", "brti"):
     raise SystemExit(f"Invalid STRATEGY={STRATEGY!r}; must be 'fade', 'late_favorite', or 'brti'")
@@ -49,8 +49,13 @@ BRTI_SMOOTHING_WINDOW = 60    # 60-second rolling average to simulate settlement
 BRTI_COIN_CONFIG = {
     "BTC": {
         "series": "KXBTC15M",
-        "flip_cooldown_sec": 30,
-        "trailing_stop_c": 5,
+        "flip_cooldown_sec": 90,
+        "trailing_stop_c": 5,          # base trailing stop (dynamic: 5-15c based on distance from strike)
+        "trailing_stop_far_c": 15,     # trailing stop when $50+ from strike
+        "trailing_stop_mid_c": 10,     # trailing stop when $20-50 from strike
+        "trailing_stop_near_c": 5,     # trailing stop when <$20 from strike (danger zone)
+        "trailing_stop_far_dist": 50,  # "far" = $50+ from strike
+        "trailing_stop_mid_dist": 20,  # "mid" = $20-50 from strike
         "stop_loss_c": 5,
         "conviction_min_distance": 50,
         "conviction_min_cycle_sec": 180,
@@ -58,15 +63,20 @@ BRTI_COIN_CONFIG = {
         "conviction_cooldown_sec": 60,
         "conviction_max_price": 85,
         "take_profit_c": 95,
-        "reentry_max_price": 80,
-        "entry_max": 49,
+        "reentry_max_price": 59,
+        "entry_max": 59,
         "momentum_window": 15,
         "ws_pairs": {"coinbase": "BTC-USD", "kraken": "XBT/USD", "bitstamp": "btcusd", "gemini": "BTCUSD"},
     },
     "ETH": {
         "series": "KXETH15M",
-        "flip_cooldown_sec": 30,
+        "flip_cooldown_sec": 90,
         "trailing_stop_c": 5,
+        "trailing_stop_far_c": 15,
+        "trailing_stop_mid_c": 10,
+        "trailing_stop_near_c": 5,
+        "trailing_stop_far_dist": 1.50,  # ETH: $1.50 ≈ BTC $50
+        "trailing_stop_mid_dist": 0.60,  # ETH: $0.60 ≈ BTC $20
         "stop_loss_c": 5,
         "conviction_min_distance": 1.50,
         "conviction_min_cycle_sec": 180,
@@ -74,8 +84,8 @@ BRTI_COIN_CONFIG = {
         "conviction_cooldown_sec": 60,
         "conviction_max_price": 85,
         "take_profit_c": 95,
-        "reentry_max_price": 80,
-        "entry_max": 49,
+        "reentry_max_price": 59,
+        "entry_max": 59,
         "momentum_window": 15,
         "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD"},
     },
@@ -91,29 +101,48 @@ BRTI_CONVICTION_MAX_ADDS = 2
 BRTI_CONVICTION_COOLDOWN_SEC = 60
 BRTI_CONVICTION_MAX_PRICE = 85
 BRTI_TAKE_PROFIT_C = 95
-BRTI_REENTRY_MAX_PRICE = 49
-BRTI_ENTRY_MAX = 49
+BRTI_REENTRY_MAX_PRICE = 59
+BRTI_ENTRY_MAX = 59
 BRTI_MOMENTUM_WINDOW = 15
 
 # Synthetic BRTI — real-time feed from constituent exchange WebSockets
 # Volume-weighted median of Coinbase, Kraken, Bitstamp, Gemini (~80%+ of BRTI weight)
-BRTI_EXCHANGES = {
-    "coinbase": {
-        "url": "wss://ws-feed.exchange.coinbase.com",
-        "subscribe": {"type": "subscribe", "channels": [{"name": "ticker", "product_ids": ["BTC-USD"]}]},
-    },
-    "kraken": {
-        "url": "wss://ws.kraken.com",
-        "subscribe": {"event": "subscribe", "pair": ["XBT/USD"], "subscription": {"name": "trade"}},
-    },
-    "bitstamp": {
-        "url": "wss://ws.bitstamp.net",
-        "subscribe": {"event": "bts:subscribe", "data": {"channel": "live_trades_btcusd"}},
-    },
-    "gemini": {
-        "url": "wss://api.gemini.com/v1/marketdata/BTCUSD?trades=true&bids=false&offers=false",
-    },
-}
+# Built dynamically for all coins in BRTI_COIN_CONFIG
+def _build_brti_exchanges():
+    """Build per-exchange WS config that subscribes to ALL BRTI coins' pairs."""
+    all_coinbase_pairs = [cfg["ws_pairs"]["coinbase"] for cfg in BRTI_COIN_CONFIG.values()]
+    all_kraken_pairs = [cfg["ws_pairs"]["kraken"] for cfg in BRTI_COIN_CONFIG.values()]
+    # Bitstamp needs one subscription per channel, handled in the WS handler
+    # Gemini needs one WS connection per symbol, handled in the WS handler
+    return {
+        "coinbase": {
+            "url": "wss://ws-feed.exchange.coinbase.com",
+            "subscribe": {"type": "subscribe", "channels": [{"name": "ticker", "product_ids": all_coinbase_pairs}]},
+        },
+        "kraken": {
+            "url": "wss://ws.kraken.com",
+            "subscribe": {"event": "subscribe", "pair": all_kraken_pairs, "subscription": {"name": "trade"}},
+        },
+        "bitstamp": {
+            "url": "wss://ws.bitstamp.net",
+            # Subscribe to all coins — sent as separate messages in _bitstamp_ws
+            "channels": [cfg["ws_pairs"]["bitstamp"] for cfg in BRTI_COIN_CONFIG.values()],
+        },
+        "gemini": {
+            # Gemini needs separate WS connections per symbol — handled in _gemini_ws
+            "symbols": [cfg["ws_pairs"]["gemini"] for cfg in BRTI_COIN_CONFIG.values()],
+        },
+    }
+
+BRTI_EXCHANGES = _build_brti_exchanges()
+
+# Reverse lookup: exchange pair name -> coin (e.g., "BTC-USD" -> "BTC", "ethusd" -> "ETH")
+PAIR_TO_COIN = {}
+for _coin, _cfg in BRTI_COIN_CONFIG.items():
+    for _exchange, _pair in _cfg["ws_pairs"].items():
+        PAIR_TO_COIN[(_exchange, _pair)] = _coin
+        PAIR_TO_COIN[(_exchange, _pair.lower())] = _coin
+        PAIR_TO_COIN[(_exchange, _pair.upper())] = _coin
 
 # Per-coin late-favorite config (5-day backtest 2026-04-08, net of fees+slippage)
 # {lo, hi} = entry cost band in cents; min_rem = trigger when this many minutes remain
@@ -253,21 +282,27 @@ class Crypto15mAgent:
         self.ws_prices: Dict[str, dict] = {}
         self.ws_connected = False
 
-        # BRTI state (used when STRATEGY="brti")
-        self.brti_ticks: list = []         # [(unix_ts, value), ...] rolling synthetic BRTI
-        self.brti_strike: float = 0        # current cycle strike price
-        self.brti_direction: str = ""      # "up" or "down" from initial momentum
-        self.brti_entry_made: bool = False # whether we entered this cycle
-        self.brti_held_side: str = ""      # "yes" or "no" — what we currently hold
-        self.brti_last_flip_ts: float = 0  # timestamp of last flip
-        self.brti_entry_price: int = 0     # what we paid for current position (cents)
-        self.brti_peak_value: int = 0      # highest value our position has reached (cents)
-        self.brti_conviction_adds: int = 0  # conviction buys this cycle
-        self.brti_last_conviction_ts: float = 0  # last conviction buy timestamp
-        
-        # Exchange price feeds for synthetic BRTI
-        self.exchange_prices: Dict[str, float] = {}              # exchange -> latest trade price
-        self.exchange_trades: Dict[str, list] = defaultdict(list) # exchange -> [(ts, price, vol)]
+        # BRTI state per coin (used when STRATEGY="brti")
+        # Each coin gets its own state dict with: ticks, strike, direction, entry_made,
+        # held_side, last_flip_ts, entry_price, peak_value, conviction_adds, last_conviction_ts
+        self.brti_state: Dict[str, dict] = {}
+        for _coin in BRTI_COIN_CONFIG:
+            self.brti_state[_coin] = {
+                "ticks": [],              # [(unix_ts, value), ...] rolling synthetic index
+                "strike": 0.0,            # current cycle strike price
+                "direction": "",          # "up" or "down" from initial momentum
+                "entry_made": False,      # whether we entered this cycle
+                "held_side": "",          # "yes" or "no" — what we currently hold
+                "last_flip_ts": 0.0,      # timestamp of last flip
+                "entry_price": 0,         # what we paid for current position (cents)
+                "peak_value": 0,          # highest value our position has reached (cents)
+                "conviction_adds": 0,     # conviction buys this cycle
+                "last_conviction_ts": 0.0, # last conviction buy timestamp
+            }
+
+        # Exchange price feeds for synthetic index — keyed by (exchange, coin)
+        self.exchange_prices: Dict[str, Dict[str, float]] = defaultdict(dict)   # exchange -> {coin -> price}
+        self.exchange_trades: Dict[str, Dict[str, list]] = defaultdict(lambda: defaultdict(list))  # exchange -> {coin -> [(ts, price, vol)]}
         self.exchange_status: Dict[str, str] = {}                # exchange -> status
 
         if not os.path.exists(self.log_file):
@@ -359,12 +394,12 @@ class Crypto15mAgent:
                     self.current_tickers[coin] = ticker
                     self.ticker_refreshed_ts[ticker] = now_ms
                     tickers.append(ticker)
-                    # Capture strike for BRTI strategy
-                    if STRATEGY == "brti" and coin == "BTC":
+                    # Capture strike for BRTI strategy (all coins in BRTI_COIN_CONFIG)
+                    if STRATEGY == "brti" and coin in BRTI_COIN_CONFIG:
                         strike = m.get("floor_strike")
                         if strike:
-                            self.brti_strike = float(strike)
-                            print(f"  📍 BTC strike: ${self.brti_strike:,.2f}")
+                            self.brti_state[coin]["strike"] = float(strike)
+                            print(f"  📍 {coin} strike: ${self.brti_state[coin]['strike']:,.2f}")
             except Exception as e:
                 print(f"  Open market lookup error {coin}: {e}")
 
@@ -372,17 +407,19 @@ class Crypto15mAgent:
         if rotated:
             self.last_buy_ts.clear()
             self.last_buy_price.clear()
-            # Reset BRTI cycle state
+            # Reset BRTI cycle state for all coins
             if STRATEGY == "brti":
-                self.brti_direction = ""
-                self.brti_entry_made = False
-                self.brti_held_side = ""
-                self.brti_last_flip_ts = 0
-                self.brti_entry_price = 0
-                self.brti_peak_value = 0
-                self.brti_conviction_adds = 0
-                self.brti_last_conviction_ts = 0
-                print(f"  🔄 BRTI cycle reset (strike: ${self.brti_strike:,.2f})")
+                for _coin in BRTI_COIN_CONFIG:
+                    st = self.brti_state[_coin]
+                    st["direction"] = ""
+                    st["entry_made"] = False
+                    st["held_side"] = ""
+                    st["last_flip_ts"] = 0
+                    st["entry_price"] = 0
+                    st["peak_value"] = 0
+                    st["conviction_adds"] = 0
+                    st["last_conviction_ts"] = 0
+                    print(f"  🔄 {_coin} BRTI cycle reset (strike: ${st['strike']:,.2f})")
 
         if tickers and self.ws_connected:
             await self.ws.send(json.dumps({
@@ -471,18 +508,20 @@ class Crypto15mAgent:
             await self._evaluate_brti(ticker)
 
     async def _evaluate_brti(self, ticker):
-        """BRTI momentum strategy: BTC only.
-        1. At cycle start (after 15s), buy the side BRTI momentum suggests, at ≤20c
-        2. Throughout cycle, monitor BRTI vs strike — flip sell if position going unprofitable
+        """BRTI momentum strategy: all coins in BRTI_COIN_CONFIG.
+        1. At cycle start (after 15s), buy the side momentum suggests, at ≤entry_max c
+        2. Throughout cycle, monitor index vs strike — flip sell if position going unprofitable
         """
         coin = None
         for c, t in self.current_tickers.items():
             if t == ticker:
                 coin = c
                 break
-        if not coin or coin != "BTC":
+        if not coin or coin not in BRTI_COIN_CONFIG:
             return
-        if self.brti_strike <= 0 or not self.brti_ticks:
+        st = self.brti_state[coin]
+        cfg = BRTI_COIN_CONFIG[coin]
+        if st["strike"] <= 0 or not st["ticks"]:
             return
 
         now = datetime.now()
@@ -504,68 +543,61 @@ class Crypto15mAgent:
         if yes_ask <= 0 or yes_bid <= 0:
             return
 
-        latest_brti = self.brti_ticks[-1][1] if self.brti_ticks else 0
+        latest_brti = st["ticks"][-1][1] if st["ticks"] else 0
         if latest_brti <= 0:
             return
 
+        momentum_window = cfg.get("momentum_window", BRTI_MOMENTUM_WINDOW)
+
         # ── Phase 1: Determine direction from first ~15s of cycle ──
-        if not self.brti_direction and cycle_sec >= BRTI_MOMENTUM_WINDOW and len(self.brti_ticks) >= 10:
-            # Use BRTI data relative to cycle start — data has ~60-120s lag so use
-            # ticks near cycle_start and the most recent available ticks
+        if not st["direction"] and cycle_sec >= momentum_window and len(st["ticks"]) >= 10:
             cycle_start_ts = now.timestamp() - cycle_sec
-            # Ticks near cycle start (within first 10s of cycle, accounting for data lag)
-            start_ticks = [v for t, v in self.brti_ticks if cycle_start_ts - 5 <= t <= cycle_start_ts + 10]
-            # Most recent ticks available (last 10 in buffer)
-            recent_ticks = [v for _, v in self.brti_ticks[-10:]]
+            start_ticks = [v for t, v in st["ticks"] if cycle_start_ts - 5 <= t <= cycle_start_ts + 10]
+            recent_ticks = [v for _, v in st["ticks"][-10:]]
             if start_ticks and recent_ticks:
                 start_avg = sum(start_ticks) / len(start_ticks)
                 recent_avg = sum(recent_ticks) / len(recent_ticks)
                 if recent_avg > start_avg:
-                    self.brti_direction = "up"
+                    st["direction"] = "up"
                 elif recent_avg < start_avg:
-                    self.brti_direction = "down"
+                    st["direction"] = "down"
                 else:
-                    self.brti_direction = "flat"
+                    st["direction"] = "flat"
                 delta = recent_avg - start_avg
-                print(f"[{now.strftime('%H:%M:%S')}] BRTI direction: {self.brti_direction} (${start_avg:,.2f} → ${recent_avg:,.2f}, Δ${delta:+,.2f}) | strike: ${self.brti_strike:,.2f}")
+                print(f"[{now.strftime('%H:%M:%S')}] {coin} direction: {st['direction']} (${start_avg:,.2f} → ${recent_avg:,.2f}, Δ${delta:+,.2f}) | strike: ${st['strike']:,.2f}")
             elif not start_ticks and recent_ticks:
-                # No cycle-start data yet — use BRTI vs strike as proxy
                 recent_avg = sum(recent_ticks) / len(recent_ticks)
-                if recent_avg > self.brti_strike:
-                    self.brti_direction = "up"
+                if recent_avg > st["strike"]:
+                    st["direction"] = "up"
                 else:
-                    self.brti_direction = "down"
-                print(f"[{now.strftime('%H:%M:%S')}] BRTI direction (vs strike): {self.brti_direction} (BRTI ${recent_avg:,.2f} vs strike ${self.brti_strike:,.2f})")
+                    st["direction"] = "down"
+                print(f"[{now.strftime('%H:%M:%S')}] {coin} direction (vs strike): {st['direction']} (index ${recent_avg:,.2f} vs strike ${st['strike']:,.2f})")
 
         # ── Phase 2: Initial entry ──
-        if self.brti_direction and not self.brti_entry_made and self.brti_direction != "flat":
-            target_side = "yes" if self.brti_direction == "up" else "no"
+        if st["direction"] and not st["entry_made"] and st["direction"] != "flat":
+            target_side = "yes" if st["direction"] == "up" else "no"
 
             # Late-cycle guard: in final 2 min, only enter on regime change
-            # (projected settlement must have crossed strike — not routine momentum)
             secs_remaining = max(1, 900 - cycle_sec)
+            late_cycle_min_distance = cfg["conviction_min_distance"]
             if secs_remaining <= 120:
-                # Only enter on MASSIVE regime change — smoothed sBRTI must have crossed
-                # strike by enough to actually move the 1-min settlement average
-                # Need $50+ past strike (for BTC) to overcome the smoothing inertia
-                smooth_ticks = [v for t, v in self.brti_ticks if t > now.timestamp() - BRTI_SMOOTHING_WINDOW]
+                smooth_ticks = [v for t, v in st["ticks"] if t > now.timestamp() - BRTI_SMOOTHING_WINDOW]
                 if smooth_ticks:
                     smoothed = sum(smooth_ticks) / len(smooth_ticks)
-                    distance_past_strike = smoothed - self.brti_strike if target_side == "yes" else self.brti_strike - smoothed
-                    if distance_past_strike < 50:
-                        return  # not enough momentum to move the smoothed settlement price
+                    distance_past_strike = smoothed - st["strike"] if target_side == "yes" else st["strike"] - smoothed
+                    if distance_past_strike < late_cycle_min_distance:
+                        return
                 else:
-                    return  # no data, don't enter this late
+                    return
 
-            # Cost to buy — use WS prices if available, else fetch from API
+            # Cost to buy
             if target_side == "yes":
                 cost = yes_ask
             else:
                 cost = 100 - yes_bid
-            # If WS prices are stale (both zero), try fetching from market data
             if cost <= 0 or cost > 100:
                 try:
-                    md = self.client.get_markets(series_ticker="KXBTC15M", status="open", limit=1) if self.client else {}
+                    md = self.client.get_markets(series_ticker=cfg["series"], status="open", limit=1) if self.client else {}
                     mkt = md.get("markets", [{}])[0]
                     if target_side == "yes":
                         cost = int(float(mkt.get("yes_ask_dollars", "0")) * 100)
@@ -574,15 +606,16 @@ class Crypto15mAgent:
                         cost = 100 - yb if yb > 0 else 0
                 except Exception:
                     pass
-            # Initial entry: 49c max | Re-entry: 49c max
-            is_reentry = self.brti_conviction_adds > 0 or self.brti_peak_value > 0
-            max_price = BRTI_REENTRY_MAX_PRICE if is_reentry else 49
+            entry_max = cfg.get("entry_max", 49)
+            reentry_max = cfg.get("reentry_max_price", entry_max)
+            is_reentry = st["conviction_adds"] > 0 or st["peak_value"] > 0
+            max_price = reentry_max if is_reentry else entry_max
             if 1 <= cost <= max_price:
-                self.brti_entry_made = True
-                self.brti_held_side = target_side
-                self.brti_entry_price = cost
-                self.brti_peak_value = cost  # starts at entry
-                print(f"[{now.strftime('%H:%M:%S')}] BTC BRTI-ENTRY {target_side.upper()} 1 @ {cost}c (BRTI {self.brti_direction}, strike ${self.brti_strike:,.2f})")
+                st["entry_made"] = True
+                st["held_side"] = target_side
+                st["entry_price"] = cost
+                st["peak_value"] = cost
+                print(f"[{now.strftime('%H:%M:%S')}] {coin} BRTI-ENTRY {target_side.upper()} 1 @ {cost}c (dir {st['direction']}, strike ${st['strike']:,.2f})")
                 self._post_buy(ticker, coin, target_side, cost, target_contracts=1, count=1)
                 return
 
@@ -933,231 +966,240 @@ class Crypto15mAgent:
     # ─── Fast BRTI Flip Check Loop ─────────────────────────────
 
     async def brti_fast_flip_loop(self):
-        """Every 500ms: update trailing stop + check flip conditions."""
+        """Every 500ms: update trailing stop + check flip conditions for all BRTI coins."""
         while self.running:
-            try:
-                if self.brti_held_side and self.brti_strike > 0 and self.brti_ticks:
-                    btc_ticker = self.current_tickers.get("BTC", "")
-                    held = self.ticker_contracts.get(btc_ticker, 0)
-                    if btc_ticker and held > 0 and (time.time() - self.brti_last_flip_ts) > BRTI_FLIP_COOLDOWN_SEC:
-                        # Get current position value from Kalshi WS prices
-                        prices = self.ws_prices.get(btc_ticker, {})
-                        yes_bid = prices.get("yes_bid", 0)
-                        yes_ask = prices.get("yes_ask", 0)
-                        if yes_bid <= 0 or yes_ask <= 0:
-                            await asyncio.sleep(0.5)
-                            continue
+            for coin, cfg in BRTI_COIN_CONFIG.items():
+                try:
+                    st = self.brti_state[coin]
+                    if not st["held_side"] or st["strike"] <= 0 or not st["ticks"]:
+                        continue
+                    coin_ticker = self.current_tickers.get(coin, "")
+                    held = self.ticker_contracts.get(coin_ticker, 0)
+                    flip_cooldown = cfg.get("flip_cooldown_sec", BRTI_FLIP_COOLDOWN_SEC)
+                    if not coin_ticker or held <= 0 or (time.time() - st["last_flip_ts"]) <= flip_cooldown:
+                        continue
+                    # Get current position value from Kalshi WS prices
+                    prices = self.ws_prices.get(coin_ticker, {})
+                    yes_bid = prices.get("yes_bid", 0)
+                    yes_ask = prices.get("yes_ask", 0)
+                    if yes_bid <= 0 or yes_ask <= 0:
+                        continue
 
-                        # Current value of our position (what we'd get if we sold now)
-                        if self.brti_held_side == "yes":
-                            current_value = yes_bid  # sell YES at bid
-                        else:
-                            current_value = 100 - yes_ask  # sell NO at 100-ask
+                    # Current value of our position (what we'd get if we sold now)
+                    if st["held_side"] == "yes":
+                        current_value = yes_bid  # sell YES at bid
+                    else:
+                        current_value = 100 - yes_ask  # sell NO at 100-ask
 
-                        # Update peak (high water mark)
-                        if current_value > self.brti_peak_value:
-                            self.brti_peak_value = current_value
+                    # Update peak (high water mark)
+                    if current_value > st["peak_value"]:
+                        st["peak_value"] = current_value
 
-                        # ── Take profit: exit at 95c+ — lock in the win, no reversal risk ──
-                        if current_value >= BRTI_TAKE_PROFIT_C:
-                            old_side = self.brti_held_side
-                            profit = current_value - self.brti_entry_price
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] 💰 TAKE PROFIT: {old_side.upper()} @ {current_value}c (entry:{self.brti_entry_price}c pnl:+{profit}c)")
-                            if self.client and not DRY_RUN:
-                                try:
-                                    tp_id = f"tp-{btc_ticker}-{int(time.time()*1000)}"
-                                    self.client.create_order(
-                                        ticker=btc_ticker, client_order_id=tp_id,
-                                        side=old_side, action="sell", count=held, type="limit",
-                                        yes_price=yes_bid if old_side == "yes" else None,
-                                        no_price=(100 - yes_ask) if old_side == "no" else None,
-                                    )
-                                    self.ticker_contracts[btc_ticker] = 0
-                                    self.positions[btc_ticker] = []
-                                    self.brti_held_side = ""
-                                    self.brti_entry_made = False  # allow re-entry if price dips back
-                                    self.brti_peak_value = 0
-                                    self.brti_entry_price = 0
-                                    print(f"  → Sold {held}x @ {current_value}c — watching for re-entry")
-                                except Exception as e:
-                                    print(f"  → Take profit error: {e}")
-                            await asyncio.sleep(0.5)
-                            continue
+                    take_profit_c = cfg.get("take_profit_c", BRTI_TAKE_PROFIT_C)
+                    stop_loss_c = cfg.get("stop_loss_c", BRTI_STOP_LOSS_C)
 
-                        latest_brti = self.brti_ticks[-1][1]
-                        distance = latest_brti - self.brti_strike
-                        drop_from_peak = self.brti_peak_value - current_value
+                    # Dynamic trailing stop based on distance from strike
+                    # Far from strike = wider stop (noise), near strike = tight stop (danger)
+                    latest_brti_val = st["ticks"][-1][1] if st["ticks"] else 0
+                    abs_distance = abs(latest_brti_val - st["strike"]) if latest_brti_val and st["strike"] else 0
+                    far_dist = cfg.get("trailing_stop_far_dist", 50)
+                    mid_dist = cfg.get("trailing_stop_mid_dist", 20)
+                    if abs_distance >= far_dist:
+                        trailing_stop_c = cfg.get("trailing_stop_far_c", 15)
+                    elif abs_distance >= mid_dist:
+                        trailing_stop_c = cfg.get("trailing_stop_mid_c", 10)
+                    else:
+                        trailing_stop_c = cfg.get("trailing_stop_near_c", 5)
+                    conviction_max_adds = cfg.get("conviction_max_adds", BRTI_CONVICTION_MAX_ADDS)
+                    conviction_min_cycle_sec = cfg.get("conviction_min_cycle_sec", BRTI_CONVICTION_MIN_CYCLE_SEC)
+                    conviction_cooldown_sec = cfg.get("conviction_cooldown_sec", BRTI_CONVICTION_COOLDOWN_SEC)
+                    conviction_min_distance = cfg.get("conviction_min_distance", BRTI_CONVICTION_MIN_DISTANCE)
+                    conviction_max_price = cfg.get("conviction_max_price", BRTI_CONVICTION_MAX_PRICE)
+                    entry_max = cfg.get("entry_max", BRTI_ENTRY_MAX)
 
-                        # ── Conviction buy: add when projected settlement is locked ──
-                        cycle_now = datetime.now()
-                        cycle_sec = (cycle_now.minute % 15) * 60 + cycle_now.second
-                        if (self.brti_conviction_adds < BRTI_CONVICTION_MAX_ADDS
-                                and cycle_sec >= BRTI_CONVICTION_MIN_CYCLE_SEC
-                                and (time.time() - self.brti_last_conviction_ts) > BRTI_CONVICTION_COOLDOWN_SEC):
-                            # Quick projected settlement calc
-                            now_ts = time.time()
-                            smooth_ticks = [v for t, v in self.brti_ticks if t > now_ts - BRTI_SMOOTHING_WINDOW]
-                            if smooth_ticks:
-                                smoothed = sum(smooth_ticks) / len(smooth_ticks)
-                                if self.brti_held_side == "yes":
-                                    proj_distance = smoothed - self.brti_strike
-                                else:
-                                    proj_distance = self.brti_strike - smoothed
-                                # Projected $50+ on our side AND price is discounted
-                                buy_price = yes_ask if self.brti_held_side == "yes" else (100 - yes_bid)
-                                if proj_distance >= BRTI_CONVICTION_MIN_DISTANCE and buy_price <= BRTI_CONVICTION_MAX_PRICE:
-                                    self.brti_conviction_adds += 1
-                                    self.brti_last_conviction_ts = time.time()
-                                    print(f"[{cycle_now.strftime('%H:%M:%S')}] 💪 CONVICTION BUY: {self.brti_held_side.upper()} 1x @ {buy_price}c (smoothed ${proj_distance:+,.0f} from strike, add {self.brti_conviction_adds}/{BRTI_CONVICTION_MAX_ADDS})")
+                    # ── Take profit: exit at take_profit_c+ — lock in the win ──
+                    if current_value >= take_profit_c:
+                        old_side = st["held_side"]
+                        profit = current_value - st["entry_price"]
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] 💰 {coin} TAKE PROFIT: {old_side.upper()} @ {current_value}c (entry:{st['entry_price']}c pnl:+{profit}c)")
+                        if self.client and not DRY_RUN:
+                            try:
+                                tp_id = f"tp-{coin_ticker}-{int(time.time()*1000)}"
+                                self.client.create_order(
+                                    ticker=coin_ticker, client_order_id=tp_id,
+                                    side=old_side, action="sell", count=held, type="limit",
+                                    yes_price=yes_bid if old_side == "yes" else None,
+                                    no_price=(100 - yes_ask) if old_side == "no" else None,
+                                )
+                                self.ticker_contracts[coin_ticker] = 0
+                                self.positions[coin_ticker] = []
+                                st["held_side"] = ""
+                                st["entry_made"] = False  # allow re-entry if price dips back
+                                st["peak_value"] = 0
+                                st["entry_price"] = 0
+                                print(f"  → {coin} Sold {held}x @ {current_value}c — watching for re-entry")
+                            except Exception as e:
+                                print(f"  → {coin} Take profit error: {e}")
+                        continue
+
+                    latest_brti = st["ticks"][-1][1]
+                    distance = latest_brti - st["strike"]
+                    drop_from_peak = st["peak_value"] - current_value
+
+                    # ── Conviction buy: add when projected settlement is locked ──
+                    cycle_now = datetime.now()
+                    cycle_sec = (cycle_now.minute % 15) * 60 + cycle_now.second
+                    if (st["conviction_adds"] < conviction_max_adds
+                            and cycle_sec >= conviction_min_cycle_sec
+                            and (time.time() - st["last_conviction_ts"]) > conviction_cooldown_sec):
+                        now_ts = time.time()
+                        smooth_ticks = [v for t, v in st["ticks"] if t > now_ts - BRTI_SMOOTHING_WINDOW]
+                        if smooth_ticks:
+                            smoothed = sum(smooth_ticks) / len(smooth_ticks)
+                            if st["held_side"] == "yes":
+                                proj_distance = smoothed - st["strike"]
+                            else:
+                                proj_distance = st["strike"] - smoothed
+                            buy_price = yes_ask if st["held_side"] == "yes" else (100 - yes_bid)
+                            if proj_distance >= conviction_min_distance and buy_price <= conviction_max_price:
+                                st["conviction_adds"] += 1
+                                st["last_conviction_ts"] = time.time()
+                                print(f"[{cycle_now.strftime('%H:%M:%S')}] 💪 {coin} CONVICTION BUY: {st['held_side'].upper()} 1x @ {buy_price}c (smoothed ${proj_distance:+,.0f} from strike, add {st['conviction_adds']}/{conviction_max_adds})")
+                                if self.client and not DRY_RUN:
+                                    try:
+                                        conv_id = f"conv-{coin_ticker}-{int(time.time()*1000)}"
+                                        self.client.create_order(
+                                            ticker=coin_ticker, client_order_id=conv_id,
+                                            side=st["held_side"], action="buy", count=1, type="limit",
+                                            yes_price=yes_ask if st["held_side"] == "yes" else None,
+                                            no_price=(100 - yes_bid) if st["held_side"] == "no" else None,
+                                        )
+                                    except Exception as e:
+                                        print(f"  → {coin} Conviction buy error: {e}")
+
+                    # ── Check trailing stop / stop loss ──
+                    should_flip = False
+                    new_side = ""
+                    reason = ""
+                    was_profitable = st["peak_value"] > st["entry_price"]
+                    loss_from_entry = st["entry_price"] - current_value
+
+                    # ── Compute projected settlement value ──
+                    now_ts = time.time()
+                    smooth_ticks = [v for t, v in st["ticks"] if t > now_ts - BRTI_SMOOTHING_WINDOW]
+                    smoothed_brti = sum(smooth_ticks) / len(smooth_ticks) if smooth_ticks else latest_brti
+
+                    ticks_30s = [v for t, v in st["ticks"] if t > now_ts - 30]
+                    ticks_10s = [v for t, v in st["ticks"] if t > now_ts - 10]
+                    if len(ticks_30s) >= 2 and len(ticks_10s) >= 1:
+                        momentum = (sum(ticks_10s) / len(ticks_10s)) - (sum(ticks_30s) / len(ticks_30s))
+                    else:
+                        momentum = 0
+
+                    cycle_now = datetime.now()
+                    cycle_sec = (cycle_now.minute % 15) * 60 + cycle_now.second
+                    secs_remaining = max(1, 900 - cycle_sec)
+
+                    momentum_per_sec = momentum / 20
+                    dampen = min(1.0, 60 / secs_remaining)
+                    projected_settlement = smoothed_brti + (momentum_per_sec * secs_remaining * dampen * 0.3)
+
+                    if st["held_side"] == "yes":
+                        projected_winning = projected_settlement >= st["strike"]
+                    else:
+                        projected_winning = projected_settlement < st["strike"]
+
+                    if was_profitable:
+                        if drop_from_peak >= trailing_stop_c:
+                            should_flip = True
+                            new_side = "no" if st["held_side"] == "yes" else "yes"
+                            profit = current_value - st["entry_price"]
+                            reason = f"TRAILING STOP (entry:{st['entry_price']}c peak:{st['peak_value']}c now:{current_value}c pnl:{profit:+d}c)"
+                            if projected_winning:
+                                should_flip = False
+                                if drop_from_peak >= trailing_stop_c:
+                                    old_side = st["held_side"]
+                                    sell_price = current_value
+                                    pnl_val = sell_price - st["entry_price"]
+                                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 📉 {coin} PROTECT PROFIT: SELL {old_side.upper()} @ {sell_price}c (peak:{st['peak_value']}c pnl:{pnl_val:+d}c) — flat, watching")
                                     if self.client and not DRY_RUN:
                                         try:
-                                            conv_id = f"conv-{btc_ticker}-{int(time.time()*1000)}"
+                                            tp_id = f"prot-{coin_ticker}-{int(time.time()*1000)}"
                                             self.client.create_order(
-                                                ticker=btc_ticker, client_order_id=conv_id,
-                                                side=self.brti_held_side, action="buy", count=1, type="limit",
-                                                yes_price=yes_ask if self.brti_held_side == "yes" else None,
-                                                no_price=(100 - yes_bid) if self.brti_held_side == "no" else None,
+                                                ticker=coin_ticker, client_order_id=tp_id,
+                                                side=old_side, action="sell", count=held, type="limit",
+                                                yes_price=yes_bid if old_side == "yes" else None,
+                                                no_price=(100 - yes_ask) if old_side == "no" else None,
                                             )
+                                            self.ticker_contracts[coin_ticker] = 0
+                                            self.positions[coin_ticker] = []
+                                            st["held_side"] = ""
+                                            st["entry_made"] = False
+                                            st["peak_value"] = 0
+                                            st["entry_price"] = 0
+                                            st["last_flip_ts"] = time.time()
                                         except Exception as e:
-                                            print(f"  → Conviction buy error: {e}")
+                                            print(f"  → {coin} Protect profit error: {e}")
+                    else:
+                        if loss_from_entry >= stop_loss_c and not projected_winning:
+                            should_flip = True
+                            new_side = "no" if st["held_side"] == "yes" else "yes"
+                            reason = f"STOP LOSS (entry:{st['entry_price']}c now:{current_value}c loss:{loss_from_entry}c proj:${projected_settlement:,.0f} vs strike:${st['strike']:,.0f})"
 
-                        # ── Check trailing stop / stop loss ──
-                        should_flip = False
-                        new_side = ""
-                        reason = ""
-                        was_profitable = self.brti_peak_value > self.brti_entry_price
-                        loss_from_entry = self.brti_entry_price - current_value
+                    if should_flip:
+                        old_side = st["held_side"]
+                        sell_price = current_value
+                        new_cost = yes_ask if new_side == "yes" else (100 - yes_bid)
+                        pnl = sell_price - st["entry_price"]
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 {coin} FLIP: {reason} | SELL {old_side.upper()} @ {sell_price}c (pnl:{pnl:+d}c) → BUY {new_side.upper()} @ {new_cost}c")
 
-                        # ── Compute projected settlement value ──
-                        # 60s smoothed sBRTI (simulates the settlement smoothing)
-                        now_ts = time.time()
-                        smooth_ticks = [v for t, v in self.brti_ticks if t > now_ts - BRTI_SMOOTHING_WINDOW]
-                        smoothed_brti = sum(smooth_ticks) / len(smooth_ticks) if smooth_ticks else latest_brti
+                        if self.client and not DRY_RUN:
+                            try:
+                                sell_id = f"fflip-sell-{coin_ticker}-{int(time.time()*1000)}"
+                                self.client.create_order(
+                                    ticker=coin_ticker, client_order_id=sell_id,
+                                    side=old_side, action="sell", count=held, type="limit",
+                                    yes_price=yes_bid if old_side == "yes" else None,
+                                    no_price=(100 - yes_ask) if old_side == "no" else None,
+                                )
+                                self.ticker_contracts[coin_ticker] = 0
+                                self.positions[coin_ticker] = []
 
-                        # Momentum: rate of change over last 30s ($/sec)
-                        ticks_30s = [v for t, v in self.brti_ticks if t > now_ts - 30]
-                        ticks_10s = [v for t, v in self.brti_ticks if t > now_ts - 10]
-                        if len(ticks_30s) >= 2 and len(ticks_10s) >= 1:
-                            momentum = (sum(ticks_10s) / len(ticks_10s)) - (sum(ticks_30s) / len(ticks_30s))
-                            # momentum > 0 = rising, < 0 = falling
-                        else:
-                            momentum = 0
-
-                        # Time remaining in cycle
-                        cycle_now = datetime.now()
-                        cycle_sec = (cycle_now.minute % 15) * 60 + cycle_now.second
-                        secs_remaining = max(1, 900 - cycle_sec)
-
-                        # Project where the smoothed sBRTI will be at settlement
-                        # Simple linear projection: current_smoothed + (momentum_per_sec * secs_remaining)
-                        # Dampen momentum projection (markets don't trend linearly)
-                        momentum_per_sec = momentum / 20  # 20s span of the momentum calc
-                        dampen = min(1.0, 60 / secs_remaining)  # more dampening with more time left
-                        projected_settlement = smoothed_brti + (momentum_per_sec * secs_remaining * dampen * 0.3)
-
-                        # Is our position at risk based on the PROJECTED settlement?
-                        if self.brti_held_side == "yes":
-                            projected_winning = projected_settlement >= self.brti_strike
-                        else:
-                            projected_winning = projected_settlement < self.brti_strike
-
-                        if was_profitable:
-                            # ── SCENARIO 1: Was profitable → trailing stop on PRICE alone ──
-                            # Don't wait for projection — Kalshi market sees drops before smoothed sBRTI
-                            if drop_from_peak >= BRTI_TRAILING_STOP_C:
-                                should_flip = True
-                                new_side = "no" if self.brti_held_side == "yes" else "yes"
-                                profit = current_value - self.brti_entry_price
-                                reason = f"TRAILING STOP (entry:{self.brti_entry_price}c peak:{self.brti_peak_value}c now:{current_value}c pnl:{profit:+d}c)"
-                                # But only buy the OTHER side if projection confirms it
-                                if projected_winning:
-                                    should_flip = False  # sell but don't flip — just go flat
-                                    if drop_from_peak >= BRTI_TRAILING_STOP_C:
-                                        # Still sell to protect profits, just don't buy other side
-                                        old_side = self.brti_held_side
-                                        sell_price = current_value
-                                        pnl_val = sell_price - self.brti_entry_price
-                                        print(f"[{datetime.now().strftime('%H:%M:%S')}] 📉 PROTECT PROFIT: SELL {old_side.upper()} @ {sell_price}c (peak:{self.brti_peak_value}c pnl:{pnl_val:+d}c) — flat, watching")
-                                        if self.client and not DRY_RUN:
-                                            try:
-                                                tp_id = f"prot-{btc_ticker}-{int(time.time()*1000)}"
-                                                self.client.create_order(
-                                                    ticker=btc_ticker, client_order_id=tp_id,
-                                                    side=old_side, action="sell", count=held, type="limit",
-                                                    yes_price=yes_bid if old_side == "yes" else None,
-                                                    no_price=(100 - yes_ask) if old_side == "no" else None,
-                                                )
-                                                self.ticker_contracts[btc_ticker] = 0
-                                                self.positions[btc_ticker] = []
-                                                self.brti_held_side = ""
-                                                self.brti_entry_made = False
-                                                self.brti_peak_value = 0
-                                                self.brti_entry_price = 0
-                                                self.brti_last_flip_ts = time.time()
-                                            except Exception as e:
-                                                print(f"  → Protect profit error: {e}")
-                                        await asyncio.sleep(0.5)
-                                        continue
-                        else:
-                            # ── SCENARIO 2: Never profitable → stop-loss if projected to lose ──
-                            if loss_from_entry >= BRTI_STOP_LOSS_C and not projected_winning:
-                                should_flip = True
-                                new_side = "no" if self.brti_held_side == "yes" else "yes"
-                                reason = f"STOP LOSS (entry:{self.brti_entry_price}c now:{current_value}c loss:{loss_from_entry}c proj:${projected_settlement:,.0f} vs strike:${self.brti_strike:,.0f})"
-
-                        if should_flip:
-                            old_side = self.brti_held_side
-                            sell_price = current_value
-                            new_cost = yes_ask if new_side == "yes" else (100 - yes_bid)
-                            pnl = sell_price - self.brti_entry_price
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 FLIP: {reason} | SELL {old_side.upper()} @ {sell_price}c (pnl:{pnl:+d}c) → BUY {new_side.upper()} @ {new_cost}c")
-
-                            if self.client and not DRY_RUN:
-                                try:
-                                    sell_id = f"fflip-sell-{btc_ticker}-{int(time.time()*1000)}"
+                                flip_buy_count = held + 1  # sell N, buy N+1 — double down on new direction
+                                if new_cost <= entry_max:
+                                    buy_id = f"fflip-buy-{coin_ticker}-{int(time.time()*1000)}"
                                     self.client.create_order(
-                                        ticker=btc_ticker, client_order_id=sell_id,
-                                        side=old_side, action="sell", count=held, type="limit",
-                                        yes_price=yes_bid if old_side == "yes" else None,
-                                        no_price=(100 - yes_ask) if old_side == "no" else None,
+                                        ticker=coin_ticker, client_order_id=buy_id,
+                                        side=new_side, action="buy", count=flip_buy_count, type="limit",
+                                        yes_price=yes_ask if new_side == "yes" else None,
+                                        no_price=(100 - yes_bid) if new_side == "no" else None,
                                     )
-                                    self.ticker_contracts[btc_ticker] = 0
-                                    self.positions[btc_ticker] = []
-
-                                    flip_buy_count = held + 1  # sell N, buy N+1 — double down on new direction
-                                    if new_cost <= BRTI_ENTRY_MAX:
-                                        buy_id = f"fflip-buy-{btc_ticker}-{int(time.time()*1000)}"
-                                        self.client.create_order(
-                                            ticker=btc_ticker, client_order_id=buy_id,
-                                            side=new_side, action="buy", count=flip_buy_count, type="limit",
-                                            yes_price=yes_ask if new_side == "yes" else None,
-                                            no_price=(100 - yes_bid) if new_side == "no" else None,
-                                        )
-                                        self.brti_held_side = new_side
-                                        self.brti_entry_price = new_cost
-                                        self.brti_peak_value = new_cost
-                                        print(f"  → Flipped to {new_side.upper()} {flip_buy_count}x @ {new_cost}c (was {held}x)")
-                                    else:
-                                        self.brti_held_side = ""
-                                        print(f"  → Sold, new side too expensive ({new_cost}c)")
-                                    self.brti_last_flip_ts = time.time()
-                                except Exception as e:
-                                    print(f"  → Flip error: {e}")
-            except Exception as e:
-                print(f"  Fast flip loop error: {e}")
+                                    st["held_side"] = new_side
+                                    st["entry_price"] = new_cost
+                                    st["peak_value"] = new_cost
+                                    print(f"  → {coin} Flipped to {new_side.upper()} {flip_buy_count}x @ {new_cost}c (was {held}x)")
+                                else:
+                                    st["held_side"] = ""
+                                    print(f"  → {coin} Sold, new side too expensive ({new_cost}c)")
+                                st["last_flip_ts"] = time.time()
+                            except Exception as e:
+                                print(f"  → {coin} Flip error: {e}")
+                except Exception as e:
+                    print(f"  Fast flip loop error ({coin}): {e}")
             await asyncio.sleep(0.5)
 
     # ─── Periodic Tasks ───────────────────────────────────────
 
-    def compute_synthetic_brti(self):
-        """Volume-weighted median of exchange trade prices → synthetic BRTI."""
+    def compute_synthetic_brti(self, coin):
+        """Volume-weighted median of exchange trade prices for a specific coin → synthetic index."""
         prices_with_volume = []
-        for ex, trades in self.exchange_trades.items():
+        for ex in self.exchange_trades:
+            trades = self.exchange_trades[ex].get(coin, [])
             cutoff = time.time() - 5
             recent = [(p, v) for t, p, v in trades if t > cutoff]
             if not recent:
-                if ex in self.exchange_prices:
-                    prices_with_volume.append((self.exchange_prices[ex], 0.001))
+                if self.exchange_prices.get(ex, {}).get(coin):
+                    prices_with_volume.append((self.exchange_prices[ex][coin], 0.001))
                 continue
             total_vol = sum(v for _, v in recent)
             vwap = sum(p * v for p, v in recent) / total_vol if total_vol > 0 else recent[-1][0]
@@ -1176,28 +1218,29 @@ class Crypto15mAgent:
                 return price
         return prices_with_volume[-1][0]
 
-    def _record_exchange_trade(self, exchange, price, volume):
-        """Record a trade from an exchange and update synthetic BRTI."""
+    def _record_exchange_trade(self, exchange, coin, price, volume):
+        """Record a trade from an exchange for a specific coin and update synthetic index."""
         if price <= 0:
             return
-        self.exchange_prices[exchange] = price
-        self.exchange_trades[exchange].append((time.time(), price, volume))
+        self.exchange_prices[exchange][coin] = price
+        self.exchange_trades[exchange][coin].append((time.time(), price, volume))
         # Trim to last 60s
         cutoff = time.time() - 60
-        self.exchange_trades[exchange] = [(t, p, v) for t, p, v in self.exchange_trades[exchange] if t > cutoff]
-        # Update synthetic BRTI tick
-        synthetic = self.compute_synthetic_brti()
+        self.exchange_trades[exchange][coin] = [(t, p, v) for t, p, v in self.exchange_trades[exchange][coin] if t > cutoff]
+        # Update synthetic index tick for this coin
+        synthetic = self.compute_synthetic_brti(coin)
         if synthetic:
             now = time.time()
+            st = self.brti_state[coin]
             # Only append if at least 0.5s since last tick (avoid flooding)
-            if not self.brti_ticks or now - self.brti_ticks[-1][0] >= 0.5:
-                self.brti_ticks.append((now, synthetic))
+            if not st["ticks"] or now - st["ticks"][-1][0] >= 0.5:
+                st["ticks"].append((now, synthetic))
                 # Trim to last 16 min
                 cutoff = now - 960
-                self.brti_ticks = [(t, v) for t, v in self.brti_ticks if t > cutoff]
+                st["ticks"] = [(t, v) for t, v in st["ticks"] if t > cutoff]
 
     async def _coinbase_ws(self):
-        """Coinbase Exchange WebSocket — ticker channel."""
+        """Coinbase Exchange WebSocket — ticker channel for all BRTI coins."""
         while self.running:
             try:
                 async with websockets.connect(BRTI_EXCHANGES["coinbase"]["url"], ping_interval=30, ping_timeout=10) as ws:
@@ -1208,18 +1251,21 @@ class Crypto15mAgent:
                         try:
                             data = json.loads(msg)
                             if data.get("type") == "ticker":
-                                price = float(data.get("price", 0))
-                                vol = float(data.get("last_size", 0))
-                                self._record_exchange_trade("coinbase", price, vol)
+                                product_id = data.get("product_id", "")
+                                coin = PAIR_TO_COIN.get(("coinbase", product_id))
+                                if coin:
+                                    price = float(data.get("price", 0))
+                                    vol = float(data.get("last_size", 0))
+                                    self._record_exchange_trade("coinbase", coin, price, vol)
                         except Exception:
                             pass
             except Exception as e:
-                self.exchange_status["coinbase"] = f"error"
+                self.exchange_status["coinbase"] = "error"
                 print(f"  Coinbase WS error: {e}, reconnecting...")
                 await asyncio.sleep(5)
 
     async def _kraken_ws(self):
-        """Kraken WebSocket — trade channel."""
+        """Kraken WebSocket — trade channel for all BRTI coins."""
         while self.running:
             try:
                 async with websockets.connect(BRTI_EXCHANGES["kraken"]["url"], ping_interval=30, ping_timeout=10) as ws:
@@ -1229,58 +1275,81 @@ class Crypto15mAgent:
                     async for msg in ws:
                         try:
                             data = json.loads(msg)
-                            if isinstance(data, list) and len(data) >= 3:
-                                trades = data[1] if isinstance(data[1], list) else []
-                                for trade in trades:
-                                    if isinstance(trade, list) and len(trade) >= 2:
-                                        self._record_exchange_trade("kraken", float(trade[0]), float(trade[1]))
+                            # Kraken trade messages: [channelID, [[price, vol, ...], ...], "trade", "XBT/USD"]
+                            if isinstance(data, list) and len(data) >= 4:
+                                pair_name = data[-1] if isinstance(data[-1], str) else ""
+                                coin = PAIR_TO_COIN.get(("kraken", pair_name))
+                                if coin:
+                                    trades = data[1] if isinstance(data[1], list) else []
+                                    for trade in trades:
+                                        if isinstance(trade, list) and len(trade) >= 2:
+                                            self._record_exchange_trade("kraken", coin, float(trade[0]), float(trade[1]))
                         except Exception:
                             pass
             except Exception as e:
-                self.exchange_status["kraken"] = f"error"
+                self.exchange_status["kraken"] = "error"
                 print(f"  Kraken WS error: {e}, reconnecting...")
                 await asyncio.sleep(5)
 
     async def _bitstamp_ws(self):
-        """Bitstamp WebSocket — live trades."""
+        """Bitstamp WebSocket — live trades for all BRTI coins."""
         while self.running:
             try:
                 async with websockets.connect(BRTI_EXCHANGES["bitstamp"]["url"], ping_interval=30, ping_timeout=10) as ws:
-                    await ws.send(json.dumps(BRTI_EXCHANGES["bitstamp"]["subscribe"]))
+                    # Subscribe to each coin's channel separately
+                    for channel in BRTI_EXCHANGES["bitstamp"]["channels"]:
+                        await ws.send(json.dumps({
+                            "event": "bts:subscribe",
+                            "data": {"channel": f"live_trades_{channel}"}
+                        }))
                     self.exchange_status["bitstamp"] = "connected"
                     print("  ✅ Bitstamp connected")
                     async for msg in ws:
                         try:
                             data = json.loads(msg)
                             if data.get("event") == "trade":
-                                td = data.get("data", {})
-                                self._record_exchange_trade("bitstamp", float(td.get("price", 0)), float(td.get("amount", 0)))
+                                # Channel name is like "live_trades_btcusd"
+                                channel = data.get("channel", "")
+                                pair = channel.replace("live_trades_", "")
+                                coin = PAIR_TO_COIN.get(("bitstamp", pair))
+                                if coin:
+                                    td = data.get("data", {})
+                                    self._record_exchange_trade("bitstamp", coin, float(td.get("price", 0)), float(td.get("amount", 0)))
                         except Exception:
                             pass
             except Exception as e:
-                self.exchange_status["bitstamp"] = f"error"
+                self.exchange_status["bitstamp"] = "error"
                 print(f"  Bitstamp WS error: {e}, reconnecting...")
                 await asyncio.sleep(5)
 
-    async def _gemini_ws(self):
-        """Gemini WebSocket — auto-streams trades."""
+    async def _gemini_ws_single(self, symbol, coin):
+        """Gemini WebSocket for a single symbol — auto-streams trades."""
+        url = f"wss://api.gemini.com/v1/marketdata/{symbol}?trades=true&bids=false&offers=false"
         while self.running:
             try:
-                async with websockets.connect(BRTI_EXCHANGES["gemini"]["url"], ping_interval=30, ping_timeout=10) as ws:
-                    self.exchange_status["gemini"] = "connected"
-                    print("  ✅ Gemini connected")
+                async with websockets.connect(url, ping_interval=30, ping_timeout=10) as ws:
+                    self.exchange_status[f"gemini_{coin}"] = "connected"
+                    print(f"  ✅ Gemini {coin} connected")
                     async for msg in ws:
                         try:
                             data = json.loads(msg)
                             for ev in data.get("events", []):
                                 if ev.get("type") == "trade":
-                                    self._record_exchange_trade("gemini", float(ev.get("price", 0)), float(ev.get("amount", 0)))
+                                    self._record_exchange_trade("gemini", coin, float(ev.get("price", 0)), float(ev.get("amount", 0)))
                         except Exception:
                             pass
             except Exception as e:
-                self.exchange_status["gemini"] = f"error"
-                print(f"  Gemini WS error: {e}, reconnecting...")
+                self.exchange_status[f"gemini_{coin}"] = "error"
+                print(f"  Gemini {coin} WS error: {e}, reconnecting...")
                 await asyncio.sleep(5)
+
+    async def _gemini_ws(self):
+        """Launch Gemini WebSocket connections for all BRTI coins."""
+        tasks = []
+        for coin, cfg in BRTI_COIN_CONFIG.items():
+            symbol = cfg["ws_pairs"]["gemini"]
+            tasks.append(asyncio.create_task(self._gemini_ws_single(symbol, coin)))
+        await asyncio.gather(*tasks)
 
     async def settlement_check_loop(self):
         """Every 30s: check for new settlements and refresh open market subscriptions."""
@@ -1330,13 +1399,18 @@ class Crypto15mAgent:
                             armed.append(f"{coin}:wait{cfg['min_rem']}m")
                     status = "LateFav: " + " | ".join(armed)
                 elif STRATEGY == "brti":
-                    brti_val = f"${self.brti_ticks[-1][1]:,.2f}" if self.brti_ticks else "?"
-                    brti_age = f"{time.time() - self.brti_ticks[-1][0]:.1f}s" if self.brti_ticks else "?"
-                    btc_ticker = self.current_tickers.get("BTC", "")
-                    held = self.ticker_contracts.get(btc_ticker, 0)
-                    side_str = self.brti_held_side.upper() if self.brti_held_side else "flat"
+                    coin_parts = []
+                    for _coin in BRTI_COIN_CONFIG:
+                        _st = self.brti_state[_coin]
+                        _val = f"${_st['ticks'][-1][1]:,.2f}" if _st["ticks"] else "?"
+                        _age = f"{time.time() - _st['ticks'][-1][0]:.1f}s" if _st["ticks"] else "?"
+                        _ticker = self.current_tickers.get(_coin, "")
+                        _held = self.ticker_contracts.get(_ticker, 0)
+                        _side = _st["held_side"].upper() if _st["held_side"] else "flat"
+                        coin_parts.append(f"{_coin}:{_val}({_age}) stk${_st['strike']:,.0f} {_st['direction'] or 'wait'} {_side}{_held}x")
                     feeds = sum(1 for s in self.exchange_status.values() if s == "connected")
-                    status = f"sBRTI: {brti_val} ({brti_age}) | strike: ${self.brti_strike:,.2f} | dir: {self.brti_direction or 'wait'} | pos: {side_str} {held}x | feeds: {feeds}/4"
+                    num_feeds_expected = len(BRTI_COIN_CONFIG) + 3  # gemini has per-coin connections, others are shared
+                    status = " | ".join(coin_parts) + f" | feeds:{feeds}/{num_feeds_expected}"
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Min left: {minutes_remaining} | {status} | WS: {'✓' if self.ws_connected else '✗'}")
 
             except Exception as e:
@@ -1470,10 +1544,11 @@ class Crypto15mAgent:
             print(f"   Per-coin: {per_coin}")
             print(f"   Excluded: HYPE (no profitable config in backtest)")
         elif STRATEGY == "brti":
-            print(f"   Signal: BRTI momentum | BTC only | entry ≤{BRTI_ENTRY_MAX}c")
-            print(f"   Momentum: first {BRTI_MOMENTUM_WINDOW}s of cycle → direction")
-            print(f"   Trailing stop: {BRTI_TRAILING_STOP_C}c from peak | Stop loss: {BRTI_STOP_LOSS_C}c max | cooldown {BRTI_FLIP_COOLDOWN_SEC}s")
-            print(f"   BRTI source: synthetic (Coinbase+Kraken+Bitstamp+Gemini WebSockets)")
+            brti_coins_str = ", ".join(BRTI_COIN_CONFIG.keys())
+            print(f"   Signal: BRTI momentum | {brti_coins_str} | synthetic index from 4 exchanges")
+            for _coin, _cfg in BRTI_COIN_CONFIG.items():
+                print(f"   {_coin}: entry≤{_cfg['entry_max']}c | trail:{_cfg['trailing_stop_c']}c stop:{_cfg['stop_loss_c']}c | TP:{_cfg['take_profit_c']}c | conv_dist:{_cfg['conviction_min_distance']} | flip_cd:{_cfg['flip_cooldown_sec']}s")
+            print(f"   Source: synthetic (Coinbase+Kraken+Bitstamp+Gemini WebSockets)")
         print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
 
         print("Seeding settlement history...")
@@ -1489,7 +1564,8 @@ class Crypto15mAgent:
             asyncio.create_task(self._bitstamp_ws())
             asyncio.create_task(self._gemini_ws())
             asyncio.create_task(self.brti_fast_flip_loop())
-            print("📡 Synthetic BRTI feeds launching (4 exchanges) + fast flip loop (500ms)")
+            brti_coins_str = "+".join(BRTI_COIN_CONFIG.keys())
+            print(f"📡 Synthetic index feeds launching ({brti_coins_str}, 4 exchanges) + fast flip loop (500ms)")
 
         # Keep main alive
         while self.running:
