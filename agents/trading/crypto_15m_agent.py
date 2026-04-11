@@ -47,7 +47,7 @@ BRTI_COIN_CONFIG = {
         "trailing_stop_far_dist": 50,  # "far" = $50+ from strike
         "trailing_stop_mid_dist": 20,  # "mid" = $20-50 from strike
         "stop_loss_hard_c": 20,        # hard stop: max loss regardless (emergency exit, go flat)
-        "momentum_flip_distance": 50,  # momentum flip: projected settlement $50+ past strike on wrong side
+        "momentum_flip_distance": 30,  # momentum flip: projected settlement $30+ past strike on wrong side
         "conviction_min_distance": 50,
         "conviction_min_cycle_sec": 180,
         "conviction_max_adds": 2,
@@ -70,7 +70,7 @@ BRTI_COIN_CONFIG = {
         "trailing_stop_far_dist": 3.00,  # ETH: $3.00 — wider, ETH oscillates $1-2 routinely
         "trailing_stop_mid_dist": 1.50,  # ETH: $1.50 — mid zone starts further out
         "stop_loss_hard_c": 35,          # ETH: wider hard stop — 50/50 contracts swing 30c on noise
-        "momentum_flip_distance": 2.00,  # ETH: need $2+ wrong side to flip (avoids noise flips)
+        "momentum_flip_distance": 1.00,  # ETH: $1+ wrong side to flip (proportional to BTC $30)
         "conviction_min_distance": 2.00, # ETH: $2+ past strike to add
         "conviction_min_cycle_sec": 180,
         "conviction_max_adds": 2,
@@ -860,6 +860,7 @@ class Crypto15mAgent:
                                             st["peak_value"] = 0
                                             st["entry_price"] = 0
                                             st["last_flip_ts"] = time.time()
+                                            st["direction"] = ""  # re-evaluate before re-entry
                                         except Exception as e:
                                             print(f"  → {coin} Protect profit error: {e}")
                     else:
@@ -886,7 +887,7 @@ class Crypto15mAgent:
                         momentum_confirms = (st["held_side"] == "yes" and short_momentum < 0) or \
                                            (st["held_side"] == "no" and short_momentum > 0)
 
-                        if wrong_side_distance >= momentum_flip_dist * 1.2 and momentum_confirms:
+                        if wrong_side_distance >= momentum_flip_dist and momentum_confirms:
                             should_flip = True
                             new_side = "no" if st["held_side"] == "yes" else "yes"
                             reason = f"MOMENTUM FLIP (proj ${wrong_side_distance:,.0f} past strike + momentum confirms)"
@@ -914,6 +915,9 @@ class Crypto15mAgent:
                                     st["peak_value"] = 0
                                     st["entry_price"] = 0
                                     st["last_flip_ts"] = time.time()
+                                    # Reset direction — stale direction caused re-entry on losing side
+                                    st["direction"] = ""
+                                    print(f"  → {coin} Direction reset — will re-evaluate before re-entry")
                                 except Exception as e:
                                     print(f"  → {coin} Hard stop error: {e}")
                             await asyncio.sleep(0.5)
