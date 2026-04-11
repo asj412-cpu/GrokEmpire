@@ -731,6 +731,9 @@ class Crypto15mAgent:
                                 st["held_side"] = target_side
                                 st["entry_price"] = cost
                                 st["peak_value"] = cost
+                                # Set ticker_contracts immediately — don't wait for WS fill
+                                # (WS may be quiet during low-liquidity hours)
+                                self.ticker_contracts[coin_ticker] = self.ticker_contracts.get(coin_ticker, 0) + entry_count
                                 print(f"[{now.strftime('%H:%M:%S')}] {coin} BRTI-ENTRY(fast) {target_side.upper()} {entry_count}x @ {cost}c (dir {st['direction']}, strike ${st['strike']:,.2f})")
                                 self._post_buy(coin_ticker, coin, target_side, cost, target_contracts=entry_count, count=entry_count)
                         continue  # done with entry check for this coin
