@@ -49,7 +49,7 @@ BRTI_COIN_CONFIG = {
         "stop_loss_hard_c": 20,        # hard stop: max loss regardless (emergency exit, go flat)
         "momentum_flip_distance": 30,  # momentum flip: projected settlement $30+ past strike on wrong side
         "conviction_min_distance": 50,
-        "conviction_min_cycle_sec": 180,
+        "conviction_min_cycle_sec": 600,
         "conviction_max_adds": 2,
         "conviction_cooldown_sec": 60,
         "conviction_max_price": 85,
@@ -72,7 +72,7 @@ BRTI_COIN_CONFIG = {
         "stop_loss_hard_c": 35,          # ETH: wider hard stop — 50/50 contracts swing 30c on noise
         "momentum_flip_distance": 1.00,  # ETH: $1+ wrong side to flip (proportional to BTC $30)
         "conviction_min_distance": 2.00, # ETH: $2+ past strike to add
-        "conviction_min_cycle_sec": 180,
+        "conviction_min_cycle_sec": 600,
         "conviction_max_adds": 2,
         "conviction_cooldown_sec": 60,
         "conviction_max_price": 85,
@@ -225,6 +225,7 @@ class Crypto15mAgent:
                 "conviction_adds": 0,     # conviction buys this cycle
                 "last_conviction_ts": 0.0, # last conviction buy timestamp
                 "flip_confirm_ticks": 0,  # sustained flip signal counter (need 4 = ~2s)
+                "last_tp_ts": 0.0,        # timestamp of last take profit (re-entry cooldown)
             }
 
         # Exchange price feeds for synthetic index — keyed by (exchange, coin)
@@ -726,7 +727,7 @@ class Crypto15mAgent:
                             if total_exposure >= 10:
                                 continue
                             entry_count = cfg.get("entry_contracts", 1)
-                            if 1 <= cost <= entry_max:
+                            if 10 <= cost <= entry_max and time.time() - st.get("last_tp_ts", 0) > 90:
                                 st["entry_made"] = True
                                 st["held_side"] = target_side
                                 st["entry_price"] = cost
@@ -802,6 +803,15 @@ class Crypto15mAgent:
                         safe_sell_count = max(1, min(held, entry_contracts + st.get("conviction_adds", 0)))
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] 💰 {coin} TAKE PROFIT: {old_side.upper()} {safe_sell_count}x @ {current_value}c (entry:{st['entry_price']}c pnl:+{profit}c)")
                         if self.client and not DRY_RUN:
+                            # Reset state BEFORE order — prevents infinite storm if create_order throws
+                            self.ticker_contracts[coin_ticker] = 0
+                            self.positions[coin_ticker] = []
+                            st["held_side"] = ""
+                            st["entry_made"] = False
+                            st["peak_value"] = 0
+                            st["entry_price"] = 0
+                            st["direction"] = ""      # stale direction causes wrong re-entry at extreme prices
+                            st["last_tp_ts"] = time.time()  # cooldown: block re-entry for 90s post-TP
                             try:
                                 tp_id = f"tp-{coin_ticker}-{int(time.time()*1000)}"
                                 self.client.create_order(
@@ -810,15 +820,9 @@ class Crypto15mAgent:
                                     yes_price=yes_bid if old_side == "yes" else None,
                                     no_price=(100 - yes_ask) if old_side == "no" else None,
                                 )
-                                self.ticker_contracts[coin_ticker] = 0
-                                self.positions[coin_ticker] = []
-                                st["held_side"] = ""
-                                st["entry_made"] = False  # allow re-entry if price dips back
-                                st["peak_value"] = 0
-                                st["entry_price"] = 0
-                                print(f"  → {coin} Sold {held}x @ {current_value}c — watching for re-entry")
+                                print(f"  → {coin} Sold {held}x @ {current_value}c — direction reset, 90s re-entry cooldown")
                             except Exception as e:
-                                print(f"  → {coin} Take profit error: {e}")
+                                print(f"  → {coin} Take profit error (state already cleared): {e}")
                         continue
 
                     latest_brti = st["ticks"][-1][1]
@@ -906,6 +910,15 @@ class Crypto15mAgent:
                                     pnl_val = sell_price - st["entry_price"]
                                     print(f"[{datetime.now().strftime('%H:%M:%S')}] 📉 {coin} PROTECT PROFIT: SELL {old_side.upper()} @ {sell_price}c (peak:{st['peak_value']}c pnl:{pnl_val:+d}c) — flat, watching")
                                     if self.client and not DRY_RUN:
+                                        # Reset state BEFORE order — prevents infinite storm if create_order throws
+                                        self.ticker_contracts[coin_ticker] = 0
+                                        self.positions[coin_ticker] = []
+                                        st["held_side"] = ""
+                                        st["entry_made"] = False
+                                        st["peak_value"] = 0
+                                        st["entry_price"] = 0
+                                        st["last_flip_ts"] = time.time()
+                                        st["direction"] = ""  # re-evaluate before re-entry
                                         try:
                                             tp_id = f"prot-{coin_ticker}-{int(time.time()*1000)}"
                                             self.client.create_order(
@@ -914,16 +927,8 @@ class Crypto15mAgent:
                                                 yes_price=yes_bid if old_side == "yes" else None,
                                                 no_price=(100 - yes_ask) if old_side == "no" else None,
                                             )
-                                            self.ticker_contracts[coin_ticker] = 0
-                                            self.positions[coin_ticker] = []
-                                            st["held_side"] = ""
-                                            st["entry_made"] = False
-                                            st["peak_value"] = 0
-                                            st["entry_price"] = 0
-                                            st["last_flip_ts"] = time.time()
-                                            st["direction"] = ""  # re-evaluate before re-entry
                                         except Exception as e:
-                                            print(f"  → {coin} Protect profit error: {e}")
+                                            print(f"  → {coin} Protect profit error (state already cleared): {e}")
                     else:
                         # ── SCENARIO 2: Never profitable — three tiers ──
                         hard_stop = cfg.get("stop_loss_hard_c", 20)
@@ -953,14 +958,24 @@ class Crypto15mAgent:
                             new_side = "no" if st["held_side"] == "yes" else "yes"
                             reason = f"MOMENTUM FLIP (proj ${wrong_side_distance:,.0f} past strike + momentum confirms)"
 
-                        # Tier B: HARD STOP — emergency cap, max loss regardless of projection
-                        # "We've lost too much, exit to preserve capital"
-                        elif loss_from_entry >= hard_stop:
+                        # Tier B: HARD STOP — emergency cap, only when projection also against us
+                        # "We've lost too much AND settlement projection has turned against us"
+                        # projected_winning guard: if sBRTI still favors our side, Tier C (hold) is correct
+                        elif loss_from_entry >= hard_stop and not projected_winning:
                             # Go flat, don't flip — we don't have conviction about the other side
                             old_side = st["held_side"]
                             pnl_val = current_value - st["entry_price"]
                             print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛑 {coin} HARD STOP: SELL {old_side.upper()} @ {current_value}c (entry:{st['entry_price']}c loss:{loss_from_entry}c) — flat")
                             if self.client and not DRY_RUN:
+                                # Reset state BEFORE order — prevents infinite storm if create_order throws
+                                self.ticker_contracts[coin_ticker] = 0
+                                self.positions[coin_ticker] = []
+                                st["held_side"] = ""
+                                st["entry_made"] = False
+                                st["peak_value"] = 0
+                                st["entry_price"] = 0
+                                st["last_flip_ts"] = time.time()
+                                st["direction"] = ""  # re-evaluate before re-entry
                                 try:
                                     hs_id = f"hstop-{coin_ticker}-{int(time.time()*1000)}"
                                     self.client.create_order(
@@ -969,18 +984,9 @@ class Crypto15mAgent:
                                         yes_price=yes_bid if old_side == "yes" else None,
                                         no_price=(100 - yes_ask) if old_side == "no" else None,
                                     )
-                                    self.ticker_contracts[coin_ticker] = 0
-                                    self.positions[coin_ticker] = []
-                                    st["held_side"] = ""
-                                    st["entry_made"] = False
-                                    st["peak_value"] = 0
-                                    st["entry_price"] = 0
-                                    st["last_flip_ts"] = time.time()
-                                    # Reset direction — stale direction caused re-entry on losing side
-                                    st["direction"] = ""
-                                    print(f"  → {coin} Direction reset — will re-evaluate before re-entry")
+                                    print(f"  → {coin} Hard stop executed — direction reset, re-evaluating")
                                 except Exception as e:
-                                    print(f"  → {coin} Hard stop error: {e}")
+                                    print(f"  → {coin} Hard stop error (state already cleared): {e}")
                             await asyncio.sleep(0.5)
                             continue
 
@@ -1003,6 +1009,16 @@ class Crypto15mAgent:
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 {coin} FLIP: {reason} | SELL {old_side.upper()} @ {sell_price}c (pnl:{pnl:+d}c) → BUY {new_side.upper()} @ {new_cost}c")
 
                         if self.client and not DRY_RUN:
+                            # Reset old position state BEFORE sell order — prevents storm if sell throws
+                            self.ticker_contracts[coin_ticker] = 0
+                            self.positions[coin_ticker] = []
+                            st["held_side"] = ""
+                            st["entry_made"] = False
+                            st["peak_value"] = 0
+                            st["entry_price"] = 0
+                            st["last_flip_ts"] = time.time()
+
+                            # Sell old side
                             try:
                                 sell_id = f"fflip-sell-{coin_ticker}-{int(time.time()*1000)}"
                                 self.client.create_order(
@@ -1011,11 +1027,13 @@ class Crypto15mAgent:
                                     yes_price=yes_bid if old_side == "yes" else None,
                                     no_price=(100 - yes_ask) if old_side == "no" else None,
                                 )
-                                self.ticker_contracts[coin_ticker] = 0
-                                self.positions[coin_ticker] = []
+                            except Exception as e:
+                                print(f"  → {coin} Flip sell error (state already cleared): {e}")
 
-                                flip_buy_count = held + 1  # sell N, buy N+1 — double down on new direction
-                                if new_cost <= entry_max:
+                            # Buy new side (separate try — sell failure doesn't block buy attempt)
+                            flip_buy_count = held + 1  # sell N, buy N+1 — double down on new direction
+                            if new_cost <= entry_max:
+                                try:
                                     buy_id = f"fflip-buy-{coin_ticker}-{int(time.time()*1000)}"
                                     self.client.create_order(
                                         ticker=coin_ticker, client_order_id=buy_id,
@@ -1023,16 +1041,16 @@ class Crypto15mAgent:
                                         yes_price=yes_ask if new_side == "yes" else None,
                                         no_price=(100 - yes_bid) if new_side == "no" else None,
                                     )
+                                    self.ticker_contracts[coin_ticker] = flip_buy_count
                                     st["held_side"] = new_side
                                     st["entry_price"] = new_cost
                                     st["peak_value"] = new_cost
+                                    st["entry_made"] = True
                                     print(f"  → {coin} Flipped to {new_side.upper()} {flip_buy_count}x @ {new_cost}c (was {held}x)")
-                                else:
-                                    st["held_side"] = ""
-                                    print(f"  → {coin} Sold, new side too expensive ({new_cost}c)")
-                                st["last_flip_ts"] = time.time()
-                            except Exception as e:
-                                print(f"  → {coin} Flip error: {e}")
+                                except Exception as e:
+                                    print(f"  → {coin} Flip buy error (staying flat): {e}")
+                            else:
+                                print(f"  → {coin} Sold, new side too expensive ({new_cost}c) — staying flat")
                 except Exception as e:
                     print(f"  Fast flip loop error ({coin}): {e}")
             await asyncio.sleep(0.5)
