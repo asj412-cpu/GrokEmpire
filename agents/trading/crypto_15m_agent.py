@@ -56,6 +56,7 @@ BRTI_COIN_CONFIG = {
         "take_profit_c": 95,
         "reentry_max_price": 59,
         "entry_max": 79,
+        "entry_contracts": 3,
         "momentum_window": 15,
         "ws_pairs": {"coinbase": "BTC-USD", "kraken": "XBT/USD", "bitstamp": "btcusd", "gemini": "BTCUSD"},
     },
@@ -78,6 +79,7 @@ BRTI_COIN_CONFIG = {
         "take_profit_c": 95,
         "reentry_max_price": 59,
         "entry_max": 79,
+        "entry_contracts": 1,
         "momentum_window": 15,
         "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD"},
     },
@@ -552,7 +554,8 @@ class Crypto15mAgent:
                 st["entry_price"] = cost
                 st["peak_value"] = cost
                 print(f"[{now.strftime('%H:%M:%S')}] {coin} BRTI-ENTRY {target_side.upper()} 1 @ {cost}c (dir {st['direction']}, strike ${st['strike']:,.2f})")
-                self._post_buy(ticker, coin, target_side, cost, target_contracts=1, count=1)
+                entry_count = cfg.get("entry_contracts", 1)
+                self._post_buy(ticker, coin, target_side, cost, target_contracts=entry_count, count=entry_count)
                 return
 
         # Phase 3 handled by brti_fast_flip_loop (500ms, trailing stop + stop loss)
@@ -720,7 +723,8 @@ class Crypto15mAgent:
                     else:
                         trailing_stop_c = cfg.get("trailing_stop_near_c", 5)
                     # Safe sell count: only sell what we actually bought this cycle (entry + conviction adds)
-                    safe_sell_count = max(1, min(held, 1 + st.get("conviction_adds", 0)))
+                    entry_contracts = cfg.get("entry_contracts", 1)
+                    safe_sell_count = max(1, min(held, entry_contracts + st.get("conviction_adds", 0)))
                     conviction_max_adds = cfg.get("conviction_max_adds", BRTI_CONVICTION_MAX_ADDS)
                     conviction_min_cycle_sec = cfg.get("conviction_min_cycle_sec", BRTI_CONVICTION_MIN_CYCLE_SEC)
                     conviction_cooldown_sec = cfg.get("conviction_cooldown_sec", BRTI_CONVICTION_COOLDOWN_SEC)
@@ -732,8 +736,9 @@ class Crypto15mAgent:
                     if current_value >= take_profit_c:
                         old_side = st["held_side"]
                         profit = current_value - st["entry_price"]
-                        # Cap sell count: 1 entry + conviction_adds — don't oversell from stale ticker_contracts
-                        safe_sell_count = max(1, min(held, 1 + st.get("conviction_adds", 0)))
+                        # Cap sell count: entry_contracts + conviction_adds — don't oversell
+                        entry_contracts = cfg.get("entry_contracts", 1)
+                        safe_sell_count = max(1, min(held, entry_contracts + st.get("conviction_adds", 0)))
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] 💰 {coin} TAKE PROFIT: {old_side.upper()} {safe_sell_count}x @ {current_value}c (entry:{st['entry_price']}c pnl:+{profit}c)")
                         if self.client and not DRY_RUN:
                             try:
