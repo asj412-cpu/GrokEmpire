@@ -764,8 +764,15 @@ class Crypto15mAgent:
 
                     # Dynamic trailing stop based on distance from strike
                     # Far from strike = wider stop (noise), near strike = tight stop (danger)
-                    latest_brti_val = st["ticks"][-1][1] if st["ticks"] else 0
-                    abs_distance = abs(latest_brti_val - st["strike"]) if latest_brti_val and st["strike"] else 0
+                    # Use SMOOTHED sBRTI for zone determination — prevents zone-hopping on tick noise
+                    # A momentary bounce toward strike shouldn't shrink our trailing stop
+                    now_ts = time.time()
+                    smooth_for_zone = [v for t, v in st["ticks"] if t > now_ts - 30]
+                    if smooth_for_zone:
+                        smoothed_for_zone = sum(smooth_for_zone) / len(smooth_for_zone)
+                    else:
+                        smoothed_for_zone = st["ticks"][-1][1] if st["ticks"] else 0
+                    abs_distance = abs(smoothed_for_zone - st["strike"]) if smoothed_for_zone and st["strike"] else 0
                     far_dist = cfg.get("trailing_stop_far_dist", 50)
                     mid_dist = cfg.get("trailing_stop_mid_dist", 20)
                     if abs_distance >= far_dist:
@@ -775,8 +782,7 @@ class Crypto15mAgent:
                     else:
                         trailing_stop_c = cfg.get("trailing_stop_near_c", 5)
                     # Safe sell count: only sell what we actually bought this cycle (entry + conviction adds)
-                    entry_contracts = cfg.get("entry_contracts", 1)
-                    safe_sell_count = max(1, min(held, entry_contracts + st.get("conviction_adds", 0)))
+                    safe_sell_count = held  # sell exactly what we hold — no more, no less
                     conviction_max_adds = cfg.get("conviction_max_adds", BRTI_CONVICTION_MAX_ADDS)
                     conviction_min_cycle_sec = cfg.get("conviction_min_cycle_sec", BRTI_CONVICTION_MIN_CYCLE_SEC)
                     conviction_cooldown_sec = cfg.get("conviction_cooldown_sec", BRTI_CONVICTION_COOLDOWN_SEC)
