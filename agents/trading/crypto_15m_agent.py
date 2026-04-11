@@ -1221,7 +1221,33 @@ class Crypto15mAgent:
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 {coin} FLIP: {reason} | SELL {old_side.upper()} @ {sell_price}c (pnl:{pnl:+d}c) → BUY {new_side.upper()} @ {new_cost}c")
 
                         if self.client and not DRY_RUN:
-                            # Reset old position state BEFORE sell order — prevents storm if sell throws
+                            # Sell guard: verify actual position against Kalshi before placing atomic flip
+                            _kal = self.kalshi_positions.get(coin_ticker)
+                            actual_held = held
+                            if _kal is not None:
+                                if _kal == 0:
+                                    print(f"  ⚠️ SELL GUARD: {coin} kalshi shows 0 held — skipping flip")
+                                    self.ticker_contracts[coin_ticker] = 0
+                                    self.positions[coin_ticker] = []
+                                    st["held_side"] = ""
+                                    st["entry_made"] = False
+                                    st["peak_value"] = 0
+                                    st["entry_price"] = 0
+                                    st["conviction_adds"] = 0
+                                    st["last_flip_ts"] = time.time()
+                                    await asyncio.sleep(0.5)
+                                    continue
+                                if _kal != actual_held:
+                                    print(f"  ⚠️ SELL GUARD: {coin} state={actual_held}x kalshi={_kal}x — using kalshi count")
+                                    actual_held = _kal
+
+                            # Single atomic flip: BUY new_side for (actual_held + flip_buy_count)
+                            # Kalshi auto-closes the old position and opens the new one in one order.
+                            flip_buy_count = actual_held + 1  # desired new position size
+                            flip_total = actual_held + flip_buy_count  # closes old + opens new
+                            taker_price = min(new_cost + 5, 99)  # aggressive limit for immediate taker fill
+
+                            # Reset state BEFORE order — prevents infinite flip storm if order throws
                             self.ticker_contracts[coin_ticker] = 0
                             self.positions[coin_ticker] = []
                             st["held_side"] = ""
@@ -1231,52 +1257,23 @@ class Crypto15mAgent:
                             st["conviction_adds"] = 0
                             st["last_flip_ts"] = time.time()
 
-                            # Sell old side
-                            sell_succeeded = False
                             try:
-                                sell_id = f"fflip-sell-{coin_ticker}-{int(time.time()*1000)}"
-                                _flip_count = safe_sell_count
-                                _kal = self.kalshi_positions.get(coin_ticker)
-                                if _kal is not None and _flip_count > _kal:
-                                    print(f"  ⚠️ SELL GUARD: {coin} flip capping {_flip_count}x → {_kal}x")
-                                    _flip_count = _kal
-                                if _flip_count > 0:
-                                    self.client.create_order(
-                                        ticker=coin_ticker, client_order_id=sell_id,
-                                        side=old_side, action="sell", count=_flip_count, type="limit",
-                                        yes_price=yes_bid if old_side == "yes" else None,
-                                        no_price=(100 - yes_ask) if old_side == "no" else None,
-                                    )
-                                    sell_succeeded = True
-                                else:
-                                    print(f"  ⚠️ SELL GUARD: {coin} skipping flip sell — kalshi shows 0 held")
+                                flip_id = f"fflip-{coin_ticker}-{int(time.time()*1000)}"
+                                self.client.create_order(
+                                    ticker=coin_ticker, client_order_id=flip_id,
+                                    side=new_side, action="buy", count=flip_total, type="limit",
+                                    yes_price=taker_price if new_side == "yes" else None,
+                                    no_price=taker_price if new_side == "no" else None,
+                                )
+                                st["held_side"] = new_side
+                                st["entry_price"] = new_cost
+                                st["peak_value"] = new_cost
+                                st["entry_made"] = True
+                                self.ticker_contracts[coin_ticker] = flip_buy_count
+                                print(f"  → {coin} Atomic flip → {new_side.upper()} {flip_buy_count}x @ {new_cost}c (order {flip_total}x, closed {actual_held}x {old_side})")
                             except Exception as e:
-                                print(f"  → {coin} Flip sell error (state already cleared): {e}")
-
-                            # Buy new side — only if sell succeeded
-                            flip_buy_count = held + 1  # sell N, buy N+1 — double down on new direction
-                            if not sell_succeeded:
                                 st["direction"] = ""
-                                print(f"  → {coin} Flip buy skipped (sell failed) — staying flat, direction reset")
-                            elif new_cost <= entry_max:
-                                try:
-                                    buy_id = f"fflip-buy-{coin_ticker}-{int(time.time()*1000)}"
-                                    self.client.create_order(
-                                        ticker=coin_ticker, client_order_id=buy_id,
-                                        side=new_side, action="buy", count=flip_buy_count, type="limit",
-                                        yes_price=yes_ask if new_side == "yes" else None,
-                                        no_price=(100 - yes_bid) if new_side == "no" else None,
-                                    )
-                                    st["held_side"] = new_side
-                                    st["entry_price"] = new_cost
-                                    st["peak_value"] = new_cost
-                                    st["entry_made"] = True
-                                    print(f"  → {coin} Flipped to {new_side.upper()} {flip_buy_count}x @ {new_cost}c (was {held}x)")
-                                except Exception as e:
-                                    print(f"  → {coin} Flip buy error (staying flat): {e}")
-                            else:
-                                st["direction"] = ""
-                                print(f"  → {coin} Sold, new side too expensive ({new_cost}c) — staying flat, direction reset")
+                                print(f"  → {coin} Atomic flip error (flat, direction reset): {e}")
                 except Exception as e:
                     print(f"  Fast flip loop error ({coin}): {e}")
             await asyncio.sleep(0.5)
