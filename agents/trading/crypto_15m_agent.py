@@ -1092,7 +1092,11 @@ class Crypto15mAgent:
                         #   - short-term momentum (10s avg vs 30s avg)
                         #   - 1-min BRTI smoothing factor (CF Benchmark averaging)
                         # Flips when P < flip_probability_threshold (default 38%).
-                        distance_from_strike = smoothed_brti - st["strike"]
+                        # Use 10s avg for fast flip detection — 60s smoothed is too slow
+                        # (a $78 drop in 60s only moves smoothed_brti ~$38, masking the real signal)
+                        recent_10s = [v for t, v in st["ticks"] if t > now_ts - 10]
+                        flip_brti = sum(recent_10s) / len(recent_10s) if recent_10s else smoothed_brti
+                        distance_from_strike = flip_brti - st["strike"]
                         flip_prob_threshold = cfg.get("flip_probability_threshold", FLIP_PROBABILITY_THRESHOLD)
                         p_above = self.estimate_settlement_probability(
                             coin, distance_from_strike, secs_remaining, momentum
