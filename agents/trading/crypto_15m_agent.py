@@ -91,7 +91,7 @@ BRTI_COIN_CONFIG = {
         "take_profit_c": 95,
         "reentry_max_price": 59,
         "entry_max": 79,
-        "entry_contracts": 1,
+        "entry_contracts": 2,
         "momentum_window": 15,
         "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD"},
         # Probability model — calibrated from 52 observed 15m cycles (Apr 2026)
@@ -571,7 +571,7 @@ class Crypto15mAgent:
             max_price = reentry_max if is_reentry else entry_max
             # Global exposure guard: max 10 contracts across current-cycle tickers only
             total_exposure = sum(self.ticker_contracts.get(t, 0) for t in self.current_tickers.values())
-            if total_exposure >= 10:
+            if total_exposure >= 15:
                 return
 
             if 10 <= cost <= max_price and time.time() - st.get("last_tp_ts", 0) > 90:
@@ -808,7 +808,7 @@ class Crypto15mAgent:
                                     continue
                             # Global exposure guard: current-cycle tickers only
                             total_exposure = sum(self.ticker_contracts.get(t, 0) for t in self.current_tickers.values())
-                            if total_exposure >= 10:
+                            if total_exposure >= 15:
                                 continue
                             entry_count = cfg.get("entry_contracts", 1)
                             if cycle_sec >= 120 and 10 <= cost <= entry_max and time.time() - st.get("last_tp_ts", 0) > 90:
@@ -915,7 +915,7 @@ class Crypto15mAgent:
                     if (st["conviction_adds"] < conviction_max_adds
                             and cycle_sec >= conviction_min_cycle_sec
                             and (time.time() - st["last_conviction_ts"]) > conviction_cooldown_sec
-                            and total_exposure < 10):
+                            and total_exposure < 15):
                         now_ts = time.time()
                         smooth_ticks = [v for t, v in st["ticks"] if t > now_ts - BRTI_SMOOTHING_WINDOW]
                         if smooth_ticks:
