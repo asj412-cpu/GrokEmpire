@@ -678,17 +678,69 @@ class Crypto15mAgent:
     # ─── Fast BRTI Flip Check Loop ─────────────────────────────
 
     async def brti_fast_flip_loop(self):
-        """Every 500ms: update trailing stop + check flip conditions for all BRTI coins."""
+        """Every 500ms: check entry (if no position) + trailing stop + flip conditions."""
         while self.running:
             for coin, cfg in BRTI_COIN_CONFIG.items():
                 try:
                     st = self.brti_state[coin]
-                    if not st["held_side"] or st["strike"] <= 0 or not st["ticks"]:
+                    if st["strike"] <= 0 or not st["ticks"]:
                         continue
                     coin_ticker = self.current_tickers.get(coin, "")
+                    if not coin_ticker:
+                        continue
+
+                    # ── Entry check (when Kalshi WS is quiet) ──
+                    if st["direction"] and not st["entry_made"] and st["direction"] != "flat" and not st["held_side"]:
+                        # Fetch prices via API since WS may not be sending ticks
+                        prices = self.ws_prices.get(coin_ticker, {})
+                        yes_ask = prices.get("yes_ask", 0)
+                        yes_bid = prices.get("yes_bid", 0)
+                        if yes_ask <= 0 or yes_bid <= 0:
+                            try:
+                                series = cfg.get("series", "")
+                                md = self.client.get_markets(series_ticker=series, status="open", limit=1) if self.client else {}
+                                mkt = md.get("markets", [{}])[0]
+                                yes_ask = int(float(mkt.get("yes_ask_dollars", "0")) * 100)
+                                yes_bid = int(float(mkt.get("yes_bid_dollars", "0")) * 100)
+                            except Exception:
+                                pass
+                        if yes_ask > 0 and yes_bid > 0:
+                            target_side = "yes" if st["direction"] == "up" else "no"
+                            cost = yes_ask if target_side == "yes" else (100 - yes_bid)
+                            entry_max = cfg.get("entry_max", 79)
+                            now = datetime.now()
+                            cycle_sec = (now.minute % 15) * 60 + now.second
+                            secs_remaining = max(1, 900 - cycle_sec)
+                            # Late-cycle guard
+                            if secs_remaining <= 120:
+                                smooth_ticks = [v for t, v in st["ticks"] if t > now.timestamp() - BRTI_SMOOTHING_WINDOW]
+                                if smooth_ticks:
+                                    smoothed = sum(smooth_ticks) / len(smooth_ticks)
+                                    dist_past = smoothed - st["strike"] if target_side == "yes" else st["strike"] - smoothed
+                                    if dist_past < cfg.get("conviction_min_distance", 50):
+                                        continue
+                                else:
+                                    continue
+                            # Global exposure guard
+                            total_exposure = sum(self.ticker_contracts.values())
+                            if total_exposure >= 10:
+                                continue
+                            entry_count = cfg.get("entry_contracts", 1)
+                            if 1 <= cost <= entry_max:
+                                st["entry_made"] = True
+                                st["held_side"] = target_side
+                                st["entry_price"] = cost
+                                st["peak_value"] = cost
+                                print(f"[{now.strftime('%H:%M:%S')}] {coin} BRTI-ENTRY(fast) {target_side.upper()} {entry_count}x @ {cost}c (dir {st['direction']}, strike ${st['strike']:,.2f})")
+                                self._post_buy(coin_ticker, coin, target_side, cost, target_contracts=entry_count, count=entry_count)
+                        continue  # done with entry check for this coin
+
+                    # ── Flip/stop checks (only when holding) ──
+                    if not st["held_side"]:
+                        continue
                     held = self.ticker_contracts.get(coin_ticker, 0)
                     flip_cooldown = cfg.get("flip_cooldown_sec", BRTI_FLIP_COOLDOWN_SEC)
-                    if not coin_ticker or held <= 0 or (time.time() - st["last_flip_ts"]) <= flip_cooldown:
+                    if held <= 0 or (time.time() - st["last_flip_ts"]) <= flip_cooldown:
                         continue
                     # Get current position value from Kalshi WS prices
                     prices = self.ws_prices.get(coin_ticker, {})
