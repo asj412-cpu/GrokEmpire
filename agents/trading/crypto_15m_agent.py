@@ -12,6 +12,7 @@ import os
 import csv
 import time
 import json
+import math
 import base64
 from datetime import datetime
 from typing import Dict
@@ -31,6 +32,13 @@ load_dotenv(override=True)
 BASE_CASH_FLOOR = 40.0
 RATCHET_PERCENT = 0.80
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
+
+# ─── Probability model config ───
+# Flip when P(held side settles profitably) drops below this.
+# Calibrated from 78 BTC / 52 ETH observed cycles (Apr 10-11 2026).
+# 0.38 = conservative: only flip when we're clearly losing (~62% chance against us).
+FLIP_PROBABILITY_THRESHOLD = float(os.getenv('FLIP_PROB_THRESHOLD', '0.38'))
+SETTLEMENT_SMOOTHING_FACTOR = 0.55  # CF Benchmark 1-min VWAP reduces effective vol by ~sqrt(1/3)
 
 # ─── BRTI Config ───
 BRTI_SMOOTHING_WINDOW = 60    # 60-second rolling average to simulate settlement smoothing
@@ -59,6 +67,10 @@ BRTI_COIN_CONFIG = {
         "entry_contracts": 3,
         "momentum_window": 15,
         "ws_pairs": {"coinbase": "BTC-USD", "kraken": "XBT/USD", "bitstamp": "btcusd", "gemini": "BTCUSD"},
+        # Probability model — calibrated from 78 observed 15m cycles (Apr 2026)
+        # σ_15m=$66 => σ_per_sec=$66/sqrt(900)=$2.20/sec
+        "volatility_per_sec": 2.20,
+        "flip_probability_threshold": FLIP_PROBABILITY_THRESHOLD,
     },
     "ETH": {
         "series": "KXETH15M",
@@ -82,6 +94,10 @@ BRTI_COIN_CONFIG = {
         "entry_contracts": 1,
         "momentum_window": 15,
         "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD"},
+        # Probability model — calibrated from 52 observed 15m cycles (Apr 2026)
+        # σ_15m=$2.14 => σ_per_sec=$2.14/sqrt(900)=$0.071/sec
+        "volatility_per_sec": 0.071,
+        "flip_probability_threshold": FLIP_PROBABILITY_THRESHOLD,
     },
 }
 
@@ -561,6 +577,62 @@ class Crypto15mAgent:
 
         # Phase 3 handled by brti_fast_flip_loop (500ms, trailing stop + stop loss)
 
+    def estimate_settlement_probability(
+        self,
+        coin: str,
+        distance_from_strike: float,  # sBRTI - strike (signed: + = above, - = below)
+        secs_remaining: float,
+        momentum: float = 0.0,         # (10s_avg - 30s_avg) in raw price units
+    ) -> float:
+        """
+        Returns P(settlement ABOVE strike) using a normal distribution model.
+
+        The CF Benchmark BRTI settles as the 1-minute VWAP of trades in seconds
+        840-900 of each cycle. This smoothing reduces effective settlement variance
+        vs spot by ~sqrt(1/3). We use SETTLEMENT_SMOOTHING_FACTOR = 0.55.
+
+        Model:
+            projected_mean  = distance_from_strike + momentum_adjustment
+            momentum_adj    = momentum * min(60, T) * 0.015
+            effective_sigma = σ_per_sec * sqrt(T) * smoothing_factor
+
+        For T < 60s (inside the settlement window), variance further reduced:
+            effective_sigma = σ_per_sec * sqrt(T/3) * smoothing_factor * 0.8
+
+        P(above strike) = Φ(projected_mean / effective_sigma)
+        where Φ = standard normal CDF.
+
+        To get P(held side wins):
+            P(YES wins) = P(above strike)
+            P(NO wins)  = 1 - P(above strike)
+        """
+        cfg = BRTI_COIN_CONFIG.get(coin, {})
+        sigma_per_sec = cfg.get("volatility_per_sec", 2.20 if coin == "BTC" else 0.071)
+        flip_smoothing = SETTLEMENT_SMOOTHING_FACTOR
+
+        T = max(1.0, float(secs_remaining))
+
+        # Momentum adjustment: current short-term trend, heavily damped
+        # min(60, T) prevents over-extrapolating momentum far into the future
+        momentum_adj = momentum * min(60.0, T) * 0.015
+
+        projected_mean = distance_from_strike + momentum_adj
+
+        if T >= 60:
+            # Standard: settlement is still > 1 min away, full random walk model
+            effective_sigma = sigma_per_sec * math.sqrt(T) * flip_smoothing
+        else:
+            # Inside the settlement window: price averaging has started.
+            # Remaining uncertainty is only for the not-yet-averaged fraction.
+            effective_sigma = sigma_per_sec * math.sqrt(T / 3.0) * flip_smoothing * 0.8
+
+        if effective_sigma <= 0:
+            return 1.0 if projected_mean > 0 else 0.0
+
+        # Φ(z) using math.erf: Φ(z) = 0.5 * (1 + erf(z / sqrt(2)))
+        z = projected_mean / (effective_sigma * math.sqrt(2))
+        return 0.5 * (1.0 + math.erf(z))
+
     def _post_buy(self, ticker, coin, side, price, target_contracts, count=1):
         """Post a limit buy order. count=number of contracts in this single order."""
         client_order_id = f"brti-{side}-{ticker}-{int(time.time())}"
@@ -909,16 +981,16 @@ class Crypto15mAgent:
                                     sell_price = current_value
                                     pnl_val = sell_price - st["entry_price"]
                                     print(f"[{datetime.now().strftime('%H:%M:%S')}] 📉 {coin} PROTECT PROFIT: SELL {old_side.upper()} @ {sell_price}c (peak:{st['peak_value']}c pnl:{pnl_val:+d}c) — flat, watching")
+                                    # ALWAYS reset state — prevents storm in paper mode too
+                                    self.ticker_contracts[coin_ticker] = 0
+                                    self.positions[coin_ticker] = []
+                                    st["held_side"] = ""
+                                    st["entry_made"] = False
+                                    st["peak_value"] = 0
+                                    st["entry_price"] = 0
+                                    st["last_flip_ts"] = time.time()
+                                    st["direction"] = ""  # re-evaluate before re-entry
                                     if self.client and not DRY_RUN:
-                                        # Reset state BEFORE order — prevents infinite storm if create_order throws
-                                        self.ticker_contracts[coin_ticker] = 0
-                                        self.positions[coin_ticker] = []
-                                        st["held_side"] = ""
-                                        st["entry_made"] = False
-                                        st["peak_value"] = 0
-                                        st["entry_price"] = 0
-                                        st["last_flip_ts"] = time.time()
-                                        st["direction"] = ""  # re-evaluate before re-entry
                                         try:
                                             tp_id = f"prot-{coin_ticker}-{int(time.time()*1000)}"
                                             self.client.create_order(
@@ -929,34 +1001,40 @@ class Crypto15mAgent:
                                             )
                                         except Exception as e:
                                             print(f"  → {coin} Protect profit error (state already cleared): {e}")
+                                    else:
+                                        print(f"  📄 PAPER: {coin} protect profit — flat, direction reset")
                     else:
-                        # ── SCENARIO 2: Never profitable — three tiers ──
+                        # ── SCENARIO 2: Never profitable — two tiers ──
                         hard_stop = cfg.get("stop_loss_hard_c", 20)
-                        momentum_flip_dist = cfg.get("momentum_flip_distance", conviction_min_distance)
 
-                        # How far is projected settlement past strike on the WRONG side?
-                        if st["held_side"] == "yes":
-                            wrong_side_distance = st["strike"] - projected_settlement  # positive = losing
-                        else:
-                            wrong_side_distance = projected_settlement - st["strike"]
+                        # Tier A: PROBABILITY MODEL FLIP
+                        # Replaces the old fixed $30 BTC / $1.00 ETH threshold.
+                        # Computes P(held side settles profitably) from:
+                        #   - signed distance of sBRTI from strike
+                        #   - seconds remaining in cycle
+                        #   - short-term momentum (10s avg vs 30s avg)
+                        #   - 1-min BRTI smoothing factor (CF Benchmark averaging)
+                        # Flips when P < flip_probability_threshold (default 38%).
+                        distance_from_strike = smoothed_brti - st["strike"]
+                        flip_prob_threshold = cfg.get("flip_probability_threshold", FLIP_PROBABILITY_THRESHOLD)
+                        p_above = self.estimate_settlement_probability(
+                            coin, distance_from_strike, secs_remaining, momentum
+                        )
+                        p_held_wins = p_above if st["held_side"] == "yes" else (1.0 - p_above)
 
-                        # Tier A: MOMENTUM FLIP — projected settlement is conviction-level wrong
-                        # Requires 1.2x the conviction distance + momentum direction confirming
-                        # "sBRTI clearly moved AND is still moving to the other side"
-                        ticks_10s = [v for t, v in st["ticks"] if t > now_ts - 10]
-                        ticks_30s = [v for t, v in st["ticks"] if t > now_ts - 30]
-                        if len(ticks_10s) >= 2 and len(ticks_30s) >= 2:
-                            short_momentum = sum(ticks_10s) / len(ticks_10s) - sum(ticks_30s) / len(ticks_30s)
-                        else:
-                            short_momentum = 0
-                        # For YES holder, negative momentum = bad. For NO holder, positive = bad.
-                        momentum_confirms = (st["held_side"] == "yes" and short_momentum < 0) or \
-                                           (st["held_side"] == "no" and short_momentum > 0)
-
-                        if wrong_side_distance >= momentum_flip_dist and momentum_confirms:
+                        if p_held_wins < flip_prob_threshold:
                             should_flip = True
                             new_side = "no" if st["held_side"] == "yes" else "yes"
-                            reason = f"MOMENTUM FLIP (proj ${wrong_side_distance:,.0f} past strike + momentum confirms)"
+                            reason = (
+                                f"PROB MODEL FLIP (P(win)={p_held_wins:.1%}<{flip_prob_threshold:.0%}, "
+                                f"dist={distance_from_strike:+.0f}, T={secs_remaining:.0f}s, mom={momentum:+.1f})"
+                            )
+                            if st["flip_confirm_ticks"] == 0:  # log only on first confirmation tick
+                                print(
+                                    f"[{datetime.now().strftime('%H:%M:%S')}] {coin} prob flip signal: "
+                                    f"P({st['held_side']}_wins)={p_held_wins:.1%} < {flip_prob_threshold:.0%} "
+                                    f"(d={distance_from_strike:+.0f}, T={secs_remaining:.0f}s, mom={momentum:+.1f})"
+                                )
 
                         # Tier B: HARD STOP — emergency cap, only when projection also against us
                         # "We've lost too much AND settlement projection has turned against us"
@@ -964,18 +1042,17 @@ class Crypto15mAgent:
                         elif loss_from_entry >= hard_stop and not projected_winning:
                             # Go flat, don't flip — we don't have conviction about the other side
                             old_side = st["held_side"]
-                            pnl_val = current_value - st["entry_price"]
                             print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛑 {coin} HARD STOP: SELL {old_side.upper()} @ {current_value}c (entry:{st['entry_price']}c loss:{loss_from_entry}c) — flat")
+                            # ALWAYS reset state first — prevents infinite hard-stop storm in paper mode
+                            self.ticker_contracts[coin_ticker] = 0
+                            self.positions[coin_ticker] = []
+                            st["held_side"] = ""
+                            st["entry_made"] = False
+                            st["peak_value"] = 0
+                            st["entry_price"] = 0
+                            st["last_flip_ts"] = time.time()
+                            st["direction"] = ""  # re-evaluate direction before re-entry
                             if self.client and not DRY_RUN:
-                                # Reset state BEFORE order — prevents infinite storm if create_order throws
-                                self.ticker_contracts[coin_ticker] = 0
-                                self.positions[coin_ticker] = []
-                                st["held_side"] = ""
-                                st["entry_made"] = False
-                                st["peak_value"] = 0
-                                st["entry_price"] = 0
-                                st["last_flip_ts"] = time.time()
-                                st["direction"] = ""  # re-evaluate before re-entry
                                 try:
                                     hs_id = f"hstop-{coin_ticker}-{int(time.time()*1000)}"
                                     self.client.create_order(
@@ -987,6 +1064,8 @@ class Crypto15mAgent:
                                     print(f"  → {coin} Hard stop executed — direction reset, re-evaluating")
                                 except Exception as e:
                                     print(f"  → {coin} Hard stop error (state already cleared): {e}")
+                            else:
+                                print(f"  📄 PAPER: {coin} hard stop — flat, direction reset")
                             await asyncio.sleep(0.5)
                             continue
 
@@ -1280,7 +1359,8 @@ class Crypto15mAgent:
         print(f"🚀 Crypto 15m Agent — BRTI Momentum — {coins_str}")
         print(f"   Signal: BRTI momentum | {coins_str} | synthetic index from 4 exchanges")
         for _coin, _cfg in BRTI_COIN_CONFIG.items():
-            print(f"   {_coin}: entry≤{_cfg['entry_max']}c | trail:dynamic(5-15c) | hard_stop:{_cfg['stop_loss_hard_c']}c | mom_flip:{_cfg['momentum_flip_distance']} | TP:{_cfg['take_profit_c']}c | conv:{_cfg['conviction_min_distance']} | cd:{_cfg['flip_cooldown_sec']}s")
+            print(f"   {_coin}: entry≤{_cfg['entry_max']}c | trail:dynamic(5-15c) | hard_stop:{_cfg['stop_loss_hard_c']}c | TP:{_cfg['take_profit_c']}c | conv:{_cfg['conviction_min_distance']} | cd:{_cfg['flip_cooldown_sec']}s")
+            print(f"   {_coin}: prob_flip_threshold={_cfg.get('flip_probability_threshold', FLIP_PROBABILITY_THRESHOLD):.0%} | σ_per_sec=${_cfg.get('volatility_per_sec', 2.20):.3f} | smoothing={SETTLEMENT_SMOOTHING_FACTOR}")
         print(f"   Source: synthetic (Coinbase+Kraken+Bitstamp+Gemini WebSockets)")
         print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
 
