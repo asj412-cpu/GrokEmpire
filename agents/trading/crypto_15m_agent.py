@@ -359,7 +359,7 @@ class Crypto15mAgent:
                 # never rolled back, so stale counts survive into the new cycle and
                 # push total_exposure >= 10, blocking all new entries)
                 old_ticker = self.current_tickers.get(_coin, "")
-                if old_ticker and not st.get("held_side"):
+                if old_ticker:
                     self.ticker_contracts[old_ticker] = 0
                 st["direction"] = ""
                 st["entry_made"] = False
@@ -369,6 +369,8 @@ class Crypto15mAgent:
                 st["peak_value"] = 0
                 st["conviction_adds"] = 0
                 st["last_conviction_ts"] = 0
+                st["last_tp_ts"] = 0.0
+                st["flip_confirm_ticks"] = 0
                 print(f"  🔄 {_coin} BRTI cycle reset (strike: ${st['strike']:,.2f})")
 
         if tickers and self.ws_connected:
@@ -531,7 +533,7 @@ class Crypto15mAgent:
                         print(f"[{now.strftime('%H:%M:%S')}] {coin} direction (vs strike): {st['direction']} (index ${recent_avg:,.2f} vs strike ${st['strike']:,.2f})")
 
         # ── Phase 2: Initial entry ──
-        if st["direction"] and not st["entry_made"] and st["direction"] != "flat":
+        if st["direction"] and not st["entry_made"] and st["direction"] != "flat" and cycle_sec >= 120:
             target_side = "yes" if st["direction"] == "up" else "no"
 
             # Late-cycle guard: in final 2 min, only enter on regime change
@@ -567,12 +569,12 @@ class Crypto15mAgent:
             reentry_max = cfg.get("reentry_max_price", entry_max)
             is_reentry = st["conviction_adds"] > 0 or st["peak_value"] > 0
             max_price = reentry_max if is_reentry else entry_max
-            # Global exposure guard: max 5 contracts across all coins
-            total_exposure = sum(self.ticker_contracts.values())
+            # Global exposure guard: max 10 contracts across current-cycle tickers only
+            total_exposure = sum(self.ticker_contracts.get(t, 0) for t in self.current_tickers.values())
             if total_exposure >= 10:
                 return
 
-            if 1 <= cost <= max_price:
+            if 10 <= cost <= max_price and time.time() - st.get("last_tp_ts", 0) > 90:
                 st["entry_made"] = True
                 st["held_side"] = target_side
                 st["entry_price"] = cost
@@ -634,7 +636,7 @@ class Crypto15mAgent:
             effective_sigma = sigma_per_sec * math.sqrt(T / 3.0) * flip_smoothing * 0.8
 
         if effective_sigma <= 0:
-            return 1.0 if projected_mean > 0 else 0.0
+            return 1.0 if projected_mean > 0 else (0.0 if projected_mean < 0 else 0.5)
 
         # Φ(z) using math.erf: Φ(z) = 0.5 * (1 + erf(z / sqrt(2)))
         z = projected_mean / (effective_sigma * math.sqrt(2))
@@ -804,19 +806,16 @@ class Crypto15mAgent:
                                         continue
                                 else:
                                     continue
-                            # Global exposure guard
-                            total_exposure = sum(self.ticker_contracts.values())
+                            # Global exposure guard: current-cycle tickers only
+                            total_exposure = sum(self.ticker_contracts.get(t, 0) for t in self.current_tickers.values())
                             if total_exposure >= 10:
                                 continue
                             entry_count = cfg.get("entry_contracts", 1)
-                            if 10 <= cost <= entry_max and time.time() - st.get("last_tp_ts", 0) > 90:
+                            if cycle_sec >= 120 and 10 <= cost <= entry_max and time.time() - st.get("last_tp_ts", 0) > 90:
                                 st["entry_made"] = True
                                 st["held_side"] = target_side
                                 st["entry_price"] = cost
                                 st["peak_value"] = cost
-                                # Set ticker_contracts immediately — don't wait for WS fill
-                                # (WS may be quiet during low-liquidity hours)
-                                self.ticker_contracts[coin_ticker] = self.ticker_contracts.get(coin_ticker, 0) + entry_count
                                 print(f"[{now.strftime('%H:%M:%S')}] {coin} BRTI-ENTRY(fast) {target_side.upper()} {entry_count}x @ {cost}c (dir {st['direction']}, strike ${st['strike']:,.2f})")
                                 self._post_buy(coin_ticker, coin, target_side, cost, target_contracts=entry_count, count=entry_count)
                         continue  # done with entry check for this coin
@@ -890,6 +889,7 @@ class Crypto15mAgent:
                             st["entry_made"] = False
                             st["peak_value"] = 0
                             st["entry_price"] = 0
+                            st["conviction_adds"] = 0
                             st["direction"] = ""      # stale direction causes wrong re-entry at extreme prices
                             st["last_tp_ts"] = time.time()  # cooldown: block re-entry for 90s post-TP
                             try:
@@ -902,17 +902,16 @@ class Crypto15mAgent:
                                 )
                                 print(f"  → {coin} Sold {held}x @ {current_value}c — direction reset, 90s re-entry cooldown")
                             except Exception as e:
-                                print(f"  → {coin} Take profit error (state already cleared): {e}")
+                                print(f"  ⚠️ {coin} TP order failed — state cleared, LEAKED {safe_sell_count}x {old_side}. Error: {e}")
                         continue
 
                     latest_brti = st["ticks"][-1][1]
                     distance = latest_brti - st["strike"]
-                    drop_from_peak = st["peak_value"] - current_value
 
                     # ── Conviction buy: add when projected settlement is locked ──
                     cycle_now = datetime.now()
                     cycle_sec = (cycle_now.minute % 15) * 60 + cycle_now.second
-                    total_exposure = sum(self.ticker_contracts.values())
+                    total_exposure = sum(self.ticker_contracts.get(t, 0) for t in self.current_tickers.values())
                     if (st["conviction_adds"] < conviction_max_adds
                             and cycle_sec >= conviction_min_cycle_sec
                             and (time.time() - st["last_conviction_ts"]) > conviction_cooldown_sec
@@ -940,13 +939,13 @@ class Crypto15mAgent:
                                             no_price=(100 - yes_bid) if st["held_side"] == "no" else None,
                                         )
                                     except Exception as e:
-                                        print(f"  → {coin} Conviction buy error: {e}")
+                                        st["conviction_adds"] -= 1  # rollback — order didn't go through
+                                        print(f"  → {coin} Conviction buy error (rolled back): {e}")
 
                     # ── Check trailing stop / stop loss ──
                     should_flip = False
                     new_side = ""
                     reason = ""
-                    was_profitable = st["peak_value"] > st["entry_price"]
                     loss_from_entry = st["entry_price"] - current_value
 
                     # ── Compute projected settlement value ──
@@ -1074,6 +1073,7 @@ class Crypto15mAgent:
                             st["entry_made"] = False
                             st["peak_value"] = 0
                             st["entry_price"] = 0
+                            st["conviction_adds"] = 0
                             st["last_flip_ts"] = time.time()
                             st["direction"] = ""  # re-evaluate direction before re-entry
                             if self.client and not DRY_RUN:
@@ -1119,9 +1119,11 @@ class Crypto15mAgent:
                             st["entry_made"] = False
                             st["peak_value"] = 0
                             st["entry_price"] = 0
+                            st["conviction_adds"] = 0
                             st["last_flip_ts"] = time.time()
 
                             # Sell old side
+                            sell_succeeded = False
                             try:
                                 sell_id = f"fflip-sell-{coin_ticker}-{int(time.time()*1000)}"
                                 self.client.create_order(
@@ -1130,12 +1132,16 @@ class Crypto15mAgent:
                                     yes_price=yes_bid if old_side == "yes" else None,
                                     no_price=(100 - yes_ask) if old_side == "no" else None,
                                 )
+                                sell_succeeded = True
                             except Exception as e:
                                 print(f"  → {coin} Flip sell error (state already cleared): {e}")
 
-                            # Buy new side (separate try — sell failure doesn't block buy attempt)
+                            # Buy new side — only if sell succeeded
                             flip_buy_count = held + 1  # sell N, buy N+1 — double down on new direction
-                            if new_cost <= entry_max:
+                            if not sell_succeeded:
+                                st["direction"] = ""
+                                print(f"  → {coin} Flip buy skipped (sell failed) — staying flat, direction reset")
+                            elif new_cost <= entry_max:
                                 try:
                                     buy_id = f"fflip-buy-{coin_ticker}-{int(time.time()*1000)}"
                                     self.client.create_order(
@@ -1144,7 +1150,6 @@ class Crypto15mAgent:
                                         yes_price=yes_ask if new_side == "yes" else None,
                                         no_price=(100 - yes_bid) if new_side == "no" else None,
                                     )
-                                    self.ticker_contracts[coin_ticker] = flip_buy_count
                                     st["held_side"] = new_side
                                     st["entry_price"] = new_cost
                                     st["peak_value"] = new_cost
@@ -1153,7 +1158,8 @@ class Crypto15mAgent:
                                 except Exception as e:
                                     print(f"  → {coin} Flip buy error (staying flat): {e}")
                             else:
-                                print(f"  → {coin} Sold, new side too expensive ({new_cost}c) — staying flat")
+                                st["direction"] = ""
+                                print(f"  → {coin} Sold, new side too expensive ({new_cost}c) — staying flat, direction reset")
                 except Exception as e:
                     print(f"  Fast flip loop error ({coin}): {e}")
             await asyncio.sleep(0.5)
@@ -1383,7 +1389,7 @@ class Crypto15mAgent:
         print(f"🚀 Crypto 15m Agent — BRTI Momentum — {coins_str}")
         print(f"   Signal: BRTI momentum | {coins_str} | synthetic index from 4 exchanges")
         for _coin, _cfg in BRTI_COIN_CONFIG.items():
-            print(f"   {_coin}: entry≤{_cfg['entry_max']}c | trail:dynamic(5-15c) | hard_stop:{_cfg['stop_loss_hard_c']}c | TP:{_cfg['take_profit_c']}c | conv:{_cfg['conviction_min_distance']} | cd:{_cfg['flip_cooldown_sec']}s")
+            print(f"   {_coin}: entry≤{_cfg['entry_max']}c | trail:DISABLED | hard_stop:{_cfg['stop_loss_hard_c']}c | TP:{_cfg['take_profit_c']}c | conv:{_cfg['conviction_min_distance']} | cd:{_cfg['flip_cooldown_sec']}s")
             print(f"   {_coin}: prob_flip_threshold={_cfg.get('flip_probability_threshold', FLIP_PROBABILITY_THRESHOLD):.0%} | σ_per_sec=${_cfg.get('volatility_per_sec', 2.20):.3f} | smoothing={SETTLEMENT_SMOOTHING_FACTOR}")
         print(f"   Source: synthetic (Coinbase+Kraken+Bitstamp+Gemini WebSockets)")
         print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
