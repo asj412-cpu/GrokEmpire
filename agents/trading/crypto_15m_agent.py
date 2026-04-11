@@ -354,6 +354,13 @@ class Crypto15mAgent:
             # Reset BRTI cycle state for all coins
             for _coin in BRTI_COIN_CONFIG:
                 st = self.brti_state[_coin]
+                # Zero out the outgoing ticker's contract count — prevents phantom
+                # accumulation when a buy 404s at cycle boundary (pre-increment is
+                # never rolled back, so stale counts survive into the new cycle and
+                # push total_exposure >= 10, blocking all new entries)
+                old_ticker = self.current_tickers.get(_coin, "")
+                if old_ticker and not st.get("held_side"):
+                    self.ticker_contracts[old_ticker] = 0
                 st["direction"] = ""
                 st["entry_made"] = False
                 st["held_side"] = ""
@@ -656,6 +663,9 @@ class Crypto15mAgent:
                 self.resting_buys[ticker] = {"order_id": client_order_id, "side": side, "price": price, "coin": coin}
             except Exception as e:
                 print(f"  → Buy error: {e}")
+                # Roll back the pre-increment so a failed order doesn't phantom-accumulate
+                # ticker_contracts and push total_exposure >= 10 (which blocks all entries)
+                self.ticker_contracts[ticker] = max(0, self.ticker_contracts.get(ticker, 0) - count)
         elif DRY_RUN:
             self.resting_buys[ticker] = {"order_id": client_order_id, "side": side, "price": price, "coin": coin}
             print(f"  📄 PAPER: → buy {side} @ {price}c (HOLD to settlement)")
