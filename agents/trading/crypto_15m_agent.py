@@ -543,7 +543,7 @@ class Crypto15mAgent:
             max_price = reentry_max if is_reentry else entry_max
             # Global exposure guard: max 5 contracts across all coins
             total_exposure = sum(self.ticker_contracts.values())
-            if total_exposure >= 5:
+            if total_exposure >= 10:
                 return
 
             if 1 <= cost <= max_price:
@@ -766,7 +766,7 @@ class Crypto15mAgent:
                     if (st["conviction_adds"] < conviction_max_adds
                             and cycle_sec >= conviction_min_cycle_sec
                             and (time.time() - st["last_conviction_ts"]) > conviction_cooldown_sec
-                            and total_exposure < 5):
+                            and total_exposure < 10):
                         now_ts = time.time()
                         smooth_ticks = [v for t, v in st["ticks"] if t > now_ts - BRTI_SMOOTHING_WINDOW]
                         if smooth_ticks:
