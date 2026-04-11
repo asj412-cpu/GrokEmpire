@@ -848,25 +848,23 @@ class Crypto15mAgent:
                     take_profit_c = cfg.get("take_profit_c", BRTI_TAKE_PROFIT_C)
                     # stop_loss replaced by three-tier: momentum flip + hard stop + do nothing
 
-                    # Dynamic trailing stop based on distance from strike
-                    # Far from strike = wider stop (noise), near strike = tight stop (danger)
-                    # Use SMOOTHED sBRTI for zone determination — prevents zone-hopping on tick noise
-                    # A momentary bounce toward strike shouldn't shrink our trailing stop
-                    now_ts = time.time()
-                    smooth_for_zone = [v for t, v in st["ticks"] if t > now_ts - 30]
-                    if smooth_for_zone:
-                        smoothed_for_zone = sum(smooth_for_zone) / len(smooth_for_zone)
-                    else:
-                        smoothed_for_zone = st["ticks"][-1][1] if st["ticks"] else 0
-                    abs_distance = abs(smoothed_for_zone - st["strike"]) if smoothed_for_zone and st["strike"] else 0
-                    far_dist = cfg.get("trailing_stop_far_dist", 50)
-                    mid_dist = cfg.get("trailing_stop_mid_dist", 20)
-                    if abs_distance >= far_dist:
-                        trailing_stop_c = cfg.get("trailing_stop_far_c", 15)
-                    elif abs_distance >= mid_dist:
-                        trailing_stop_c = cfg.get("trailing_stop_mid_c", 10)
-                    else:
-                        trailing_stop_c = cfg.get("trailing_stop_near_c", 5)
+                    # TRAILING STOP DISABLED (2026-04-11) — relying on prob model flip + TP + hard stop only
+                    if False:  # zone-based trailing_stop_c calculation — disabled with trailing stop
+                        now_ts = time.time()
+                        smooth_for_zone = [v for t, v in st["ticks"] if t > now_ts - 30]
+                        if smooth_for_zone:
+                            smoothed_for_zone = sum(smooth_for_zone) / len(smooth_for_zone)
+                        else:
+                            smoothed_for_zone = st["ticks"][-1][1] if st["ticks"] else 0
+                        abs_distance = abs(smoothed_for_zone - st["strike"]) if smoothed_for_zone and st["strike"] else 0
+                        far_dist = cfg.get("trailing_stop_far_dist", 50)
+                        mid_dist = cfg.get("trailing_stop_mid_dist", 20)
+                        if abs_distance >= far_dist:
+                            trailing_stop_c = cfg.get("trailing_stop_far_c", 15)
+                        elif abs_distance >= mid_dist:
+                            trailing_stop_c = cfg.get("trailing_stop_mid_c", 10)
+                        else:
+                            trailing_stop_c = cfg.get("trailing_stop_near_c", 5)
                     # Safe sell count: only sell what we actually bought this cycle (entry + conviction adds)
                     safe_sell_count = held  # sell exactly what we hold — no more, no less
                     conviction_max_adds = cfg.get("conviction_max_adds", BRTI_CONVICTION_MAX_ADDS)
@@ -976,7 +974,7 @@ class Crypto15mAgent:
                     else:
                         projected_winning = projected_settlement < st["strike"]
 
-                    if was_profitable:
+                    if False:  # TRAILING STOP DISABLED (2026-04-11) — was: if was_profitable; prob model flip + TP + hard stop handle all exits
                         # Only activate trailing stop once we have +8c locked in
                         # Prevents selling on tiny peaks that barely exceeded entry
                         if drop_from_peak >= trailing_stop_c and current_value >= st["entry_price"] + 8:
