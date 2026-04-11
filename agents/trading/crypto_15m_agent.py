@@ -57,7 +57,7 @@ BRTI_COIN_CONFIG = {
         "stop_loss_hard_c": 20,        # hard stop: max loss regardless (emergency exit, go flat)
         "momentum_flip_distance": 30,  # momentum flip: projected settlement $30+ past strike on wrong side
         "conviction_min_distance": 50,
-        "conviction_min_cycle_sec": 600,
+        "conviction_min_cycle_sec": 180,
         "conviction_max_adds": 2,
         "conviction_cooldown_sec": 60,
         "conviction_max_price": 85,
@@ -84,7 +84,7 @@ BRTI_COIN_CONFIG = {
         "stop_loss_hard_c": 35,          # ETH: wider hard stop — 50/50 contracts swing 30c on noise
         "momentum_flip_distance": 1.00,  # ETH: $1+ wrong side to flip (proportional to BTC $30)
         "conviction_min_distance": 2.00, # ETH: $2+ past strike to add
-        "conviction_min_cycle_sec": 600,
+        "conviction_min_cycle_sec": 180,
         "conviction_max_adds": 2,
         "conviction_cooldown_sec": 60,
         "conviction_max_price": 85,
