@@ -255,6 +255,8 @@ class Crypto15mAgent:
 
         # Per-ticker contract count (max 3)
         self.ticker_contracts: Dict[str, int] = {}
+        # Kalshi-authoritative position count (from post_position_fp in fill messages)
+        self.kalshi_positions: Dict[str, int] = {}
 
         # Per-ticker: held contracts and resting sell orders
         self.positions: Dict[str, list] = defaultdict(list)
@@ -476,9 +478,13 @@ class Crypto15mAgent:
                     coin = c
                     break
 
-            # Convert raw yes_price into side-relative cost (what we actually paid)
+            # Convert raw yes_price into side-relative cost (what we actually paid/received)
             purchased_side = (msg.get("purchased_side") or side or "").lower()
-            cost_price = price if purchased_side == "yes" else (100 - price)
+            if action == "sell":
+                # For sell fills use the order side — purchased_side can refer to the counterparty
+                cost_price = price if side.lower() == "yes" else (100 - price)
+            else:
+                cost_price = price if purchased_side == "yes" else (100 - price)
 
             print(f"  💰 FILL: {action.upper()} {side.upper()} {coin or ticker} {count}x @ {cost_price}c (yes_px={price}c) | raw={msg}")
 
@@ -491,6 +497,15 @@ class Crypto15mAgent:
                 self.last_buy_ts[ticker] = int(datetime.now().timestamp() * 1000)
                 self.last_buy_price[ticker] = cost_price
                 print(f"  ✅ Bought! Now {self.ticker_contracts[ticker]} contracts @ {cost_price}c (HOLD to settlement)")
+                # Reconcile with Kalshi's authoritative position count
+                post_pos = msg.get("post_position_fp")
+                if post_pos is not None:
+                    actual_count = abs(int(round(float(post_pos))))
+                    tracked_count = self.ticker_contracts.get(ticker, 0)
+                    if actual_count != tracked_count:
+                        print(f"  ⚠️ POSITION SYNC: {ticker} tracked={tracked_count} kalshi={actual_count} — correcting")
+                        self.ticker_contracts[ticker] = actual_count
+                    self.kalshi_positions[ticker] = actual_count
 
             elif action == "sell":
                 self.resting_sells[ticker] = max(0, self.resting_sells.get(ticker, 0) - count)
@@ -499,6 +514,17 @@ class Crypto15mAgent:
                         self.positions[ticker].pop(0)
                 self.ticker_contracts[ticker] = max(0, self.ticker_contracts.get(ticker, 0) - count)
                 print(f"  ✅ Exit filled! Held: {self.ticker_contracts[ticker]} | Resting sells: {self.resting_sells.get(ticker, 0)}")
+                # Reconcile with Kalshi's authoritative position count
+                post_pos = msg.get("post_position_fp")
+                if post_pos is not None:
+                    actual_count = abs(int(round(float(post_pos))))
+                    tracked_count = self.ticker_contracts.get(ticker, 0)
+                    if actual_count != tracked_count:
+                        print(f"  ⚠️ POSITION SYNC: {ticker} tracked={tracked_count} kalshi={actual_count} — correcting")
+                        self.ticker_contracts[ticker] = actual_count
+                    self.kalshi_positions[ticker] = actual_count
+                    if actual_count == 0:
+                        self.positions[ticker] = []
 
         elif msg_type == "subscribed":
             channel = data.get("msg", {}).get("channel", "")
@@ -934,6 +960,15 @@ class Crypto15mAgent:
                         # Cap sell count: entry_contracts + conviction_adds — don't oversell
                         entry_contracts = cfg.get("entry_contracts", 1)
                         safe_sell_count = max(1, min(held, entry_contracts + st.get("conviction_adds", 0)))
+                        # SELL GUARD: cap against Kalshi's authoritative position to prevent oversell
+                        _kal = self.kalshi_positions.get(coin_ticker)
+                        if _kal is not None:
+                            if safe_sell_count > _kal:
+                                print(f"  ⚠️ SELL GUARD: {coin} TP capping {safe_sell_count}x → {_kal}x (kalshi holds {_kal})")
+                                safe_sell_count = _kal
+                            if safe_sell_count <= 0:
+                                print(f"  ⚠️ SELL GUARD: {coin} kalshi shows 0 held — skipping TP")
+                                continue
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] 💰 {coin} TAKE PROFIT: {old_side.upper()} {safe_sell_count}x @ {current_value}c (entry:{st['entry_price']}c pnl:+{profit}c)")
                         if self.client and not DRY_RUN:
                             # Reset state BEFORE order — prevents infinite storm if create_order throws
@@ -1070,12 +1105,20 @@ class Crypto15mAgent:
                                         if self.client and not DRY_RUN:
                                             try:
                                                 tp_id = f"prot-{coin_ticker}-{int(time.time()*1000)}"
-                                                self.client.create_order(
-                                                    ticker=coin_ticker, client_order_id=tp_id,
-                                                    side=old_side, action="sell", count=safe_sell_count, type="limit",
-                                                    yes_price=yes_bid if old_side == "yes" else None,
-                                                    no_price=(100 - yes_ask) if old_side == "no" else None,
-                                                )
+                                                _pp_count = safe_sell_count
+                                                _kal = self.kalshi_positions.get(coin_ticker)
+                                                if _kal is not None and _pp_count > _kal:
+                                                    print(f"  ⚠️ SELL GUARD: {coin} prot capping {_pp_count}x → {_kal}x")
+                                                    _pp_count = _kal
+                                                if _pp_count > 0:
+                                                    self.client.create_order(
+                                                        ticker=coin_ticker, client_order_id=tp_id,
+                                                        side=old_side, action="sell", count=_pp_count, type="limit",
+                                                        yes_price=yes_bid if old_side == "yes" else None,
+                                                        no_price=(100 - yes_ask) if old_side == "no" else None,
+                                                    )
+                                                else:
+                                                    print(f"  ⚠️ SELL GUARD: {coin} skipping prot sell — kalshi shows 0 held")
                                             except Exception as e:
                                                 print(f"  → {coin} Protect profit error (state already cleared): {e}")
                                         else:
@@ -1137,12 +1180,20 @@ class Crypto15mAgent:
                             if self.client and not DRY_RUN:
                                 try:
                                     hs_id = f"hstop-{coin_ticker}-{int(time.time()*1000)}"
-                                    self.client.create_order(
-                                        ticker=coin_ticker, client_order_id=hs_id,
-                                        side=old_side, action="sell", count=safe_sell_count, type="limit",
-                                        yes_price=yes_bid if old_side == "yes" else None,
-                                        no_price=(100 - yes_ask) if old_side == "no" else None,
-                                    )
+                                    _hs_count = safe_sell_count
+                                    _kal = self.kalshi_positions.get(coin_ticker)
+                                    if _kal is not None and _hs_count > _kal:
+                                        print(f"  ⚠️ SELL GUARD: {coin} hard stop capping {_hs_count}x → {_kal}x")
+                                        _hs_count = _kal
+                                    if _hs_count > 0:
+                                        self.client.create_order(
+                                            ticker=coin_ticker, client_order_id=hs_id,
+                                            side=old_side, action="sell", count=_hs_count, type="limit",
+                                            yes_price=yes_bid if old_side == "yes" else None,
+                                            no_price=(100 - yes_ask) if old_side == "no" else None,
+                                        )
+                                    else:
+                                        print(f"  ⚠️ SELL GUARD: {coin} skipping hard stop sell — kalshi shows 0 held")
                                     print(f"  → {coin} Hard stop executed — direction reset, re-evaluating")
                                 except Exception as e:
                                     print(f"  → {coin} Hard stop error (state already cleared): {e}")
@@ -1184,13 +1235,21 @@ class Crypto15mAgent:
                             sell_succeeded = False
                             try:
                                 sell_id = f"fflip-sell-{coin_ticker}-{int(time.time()*1000)}"
-                                self.client.create_order(
-                                    ticker=coin_ticker, client_order_id=sell_id,
-                                    side=old_side, action="sell", count=safe_sell_count, type="limit",
-                                    yes_price=yes_bid if old_side == "yes" else None,
-                                    no_price=(100 - yes_ask) if old_side == "no" else None,
-                                )
-                                sell_succeeded = True
+                                _flip_count = safe_sell_count
+                                _kal = self.kalshi_positions.get(coin_ticker)
+                                if _kal is not None and _flip_count > _kal:
+                                    print(f"  ⚠️ SELL GUARD: {coin} flip capping {_flip_count}x → {_kal}x")
+                                    _flip_count = _kal
+                                if _flip_count > 0:
+                                    self.client.create_order(
+                                        ticker=coin_ticker, client_order_id=sell_id,
+                                        side=old_side, action="sell", count=_flip_count, type="limit",
+                                        yes_price=yes_bid if old_side == "yes" else None,
+                                        no_price=(100 - yes_ask) if old_side == "no" else None,
+                                    )
+                                    sell_succeeded = True
+                                else:
+                                    print(f"  ⚠️ SELL GUARD: {coin} skipping flip sell — kalshi shows 0 held")
                             except Exception as e:
                                 print(f"  → {coin} Flip sell error (state already cleared): {e}")
 
