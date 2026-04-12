@@ -920,9 +920,31 @@ class Crypto15mAgent:
                                            (st["held_side"] == "no" and short_momentum > 0)
 
                         if wrong_side_distance >= momentum_flip_dist and momentum_confirms:
-                            should_flip = True
-                            new_side = "no" if st["held_side"] == "yes" else "yes"
-                            reason = f"MOMENTUM FLIP (proj ${wrong_side_distance:,.0f} past strike + momentum confirms)"
+                            # Regime change: sell and go FLAT — re-evaluate before re-entering
+                            old_side = st["held_side"]
+                            pnl_val = current_value - st["entry_price"]
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 {coin} REGIME EXIT: SELL {old_side.upper()} @ {current_value}c (pnl:{pnl_val:+d}c, proj ${wrong_side_distance:,.0f} wrong side) — flat, re-evaluating")
+                            if self.client and not DRY_RUN:
+                                try:
+                                    re_id = f"regime-{coin_ticker}-{int(time.time()*1000)}"
+                                    self.client.create_order(
+                                        ticker=coin_ticker, client_order_id=re_id,
+                                        side=old_side, action="sell", count=safe_sell_count, type="limit",
+                                        yes_price=yes_bid if old_side == "yes" else None,
+                                        no_price=(100 - yes_ask) if old_side == "no" else None,
+                                    )
+                                    self.ticker_contracts[coin_ticker] = 0
+                                    self.positions[coin_ticker] = []
+                                    st["held_side"] = ""
+                                    st["entry_made"] = False
+                                    st["peak_value"] = 0
+                                    st["entry_price"] = 0
+                                    st["last_flip_ts"] = time.time()
+                                    st["direction"] = ""  # re-evaluate market before re-entry
+                                except Exception as e:
+                                    print(f"  → {coin} Regime exit error: {e}")
+                            await asyncio.sleep(0.5)
+                            continue
 
                         # Tier B: HARD STOP — emergency cap, max loss regardless of projection
                         # "We've lost too much, exit to preserve capital"
@@ -957,7 +979,8 @@ class Crypto15mAgent:
 
                         # Tier C: small loss, projection unclear → DO NOTHING, let it play out
 
-                    # Flip confirmation: require 4 sustained ticks (~2s) before executing
+                    # Old flip logic disabled — regime exit goes flat instead
+                    should_flip = False
                     if should_flip:
                         st["flip_confirm_ticks"] += 1
                         if st["flip_confirm_ticks"] < 4:
