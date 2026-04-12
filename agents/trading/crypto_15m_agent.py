@@ -415,6 +415,7 @@ class Crypto15mAgent:
                 st["flipped_this_cycle"] = False
                 st["original_entry_count"] = 0
                 print(f"  🔄 {_coin} BRTI cycle reset (strike: ${st['strike']:,.2f})")
+            self._mid_cycle_startup = False  # clear entry block on new cycle
 
         if tickers and self.ws_connected:
             await self.ws.send(json.dumps({
@@ -761,7 +762,7 @@ class Crypto15mAgent:
                         continue
 
                     # ── Phase 2: Entry check (when no position) ──
-                    if st["direction"] and not st["entry_made"] and st["direction"] != "flat" and not st["held_side"]:
+                    if st["direction"] and not st["entry_made"] and st["direction"] != "flat" and not st["held_side"] and not self._mid_cycle_startup:
                         target_side = "yes" if st["direction"] == "up" else "no"
                         cost = yes_ask if target_side == "yes" else (100 - yes_bid)
 
@@ -1264,15 +1265,14 @@ class Crypto15mAgent:
         print(f"   Source: synthetic (Coinbase+Kraken+Bitstamp+Gemini WebSockets)")
         print(f"   DRY_RUN: {DRY_RUN} | No trailing stop | No protect profit | Lock safety: {LOCK_SAFETY_FACTOR}x")
 
-        # Startup guard: if mid-cycle (min 1-14), wait for next cycle boundary
-        # Prevents double-buying on restarts within the same cycle
+        # Startup guard: if mid-cycle, block NEW ENTRIES but still run protection loops
         now = datetime.now()
         cycle_sec = (now.minute % 15) * 60 + now.second
-        if 60 < cycle_sec < 840:  # between min 1 and min 14
-            wait_secs = 900 - cycle_sec + 5  # wait until ~5s into next cycle
-            print(f"⏳ Mid-cycle startup detected (min {cycle_sec//60}). Waiting {wait_secs}s for next cycle to avoid double-entry...")
-            await asyncio.sleep(wait_secs)
-            print(f"✅ New cycle started — proceeding")
+        if 60 < cycle_sec < 840:
+            self._mid_cycle_startup = True
+            print(f"⏳ Mid-cycle startup (min {cycle_sec//60}) — entries blocked until next cycle, protection active")
+        else:
+            self._mid_cycle_startup = False
 
         print("Seeding settlement history...")
         self.seed_settlement_history()
