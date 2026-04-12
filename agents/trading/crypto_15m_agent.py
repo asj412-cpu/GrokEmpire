@@ -52,10 +52,15 @@ BRTI_COIN_CONFIG = {
         "conviction_min_cycle_sec": 180,
         "conviction_max_adds": 2,
         "conviction_cooldown_sec": 60,
-        "conviction_max_price": 85,
+        "conviction_max_price": 75,    # lowered from 85 — 82-85c adds are net losers (45% WR, need 85%)
         "take_profit_c": 95,
         "reentry_max_price": 59,
-        "entry_max": 79,
+        # Tiered entry pricing: wait for value, don't chase at cycle open
+        "tier1_max": 35,               # Min 0-7: value entries only, sBRTI momentum confirms
+        "tier1_end_sec": 420,          # 7 minutes
+        "tier2_max": 49,               # Min 7-10: cap increases with more data
+        "tier2_end_sec": 600,          # 10 minutes
+        "tier3_max": 85,               # Min 10-14: high conviction only (sBRTI past conviction_min_distance)
         "entry_contracts": 3,
         "momentum_window": 15,
         "ws_pairs": {"coinbase": "BTC-USD", "kraken": "XBT/USD", "bitstamp": "btcusd", "gemini": "BTCUSD"},
@@ -75,10 +80,15 @@ BRTI_COIN_CONFIG = {
         "conviction_min_cycle_sec": 180,
         "conviction_max_adds": 2,
         "conviction_cooldown_sec": 60,
-        "conviction_max_price": 85,
+        "conviction_max_price": 75,      # lowered from 85 — 82-85c adds are net losers
         "take_profit_c": 95,
         "reentry_max_price": 59,
-        "entry_max": 79,
+        # Tiered entry pricing: wait for value, don't chase at cycle open
+        "tier1_max": 35,               # Min 0-7: value entries only, sBRTI momentum confirms
+        "tier1_end_sec": 420,          # 7 minutes
+        "tier2_max": 49,               # Min 7-10: cap increases with more data
+        "tier2_end_sec": 600,          # 10 minutes
+        "tier3_max": 85,               # Min 10-14: high conviction only
         "entry_contracts": 3,
         "momentum_window": 15,
         "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD"},
@@ -93,11 +103,32 @@ BRTI_CONVICTION_MIN_DISTANCE = 50
 BRTI_CONVICTION_MIN_CYCLE_SEC = 180
 BRTI_CONVICTION_MAX_ADDS = 2
 BRTI_CONVICTION_COOLDOWN_SEC = 60
-BRTI_CONVICTION_MAX_PRICE = 85
+BRTI_CONVICTION_MAX_PRICE = 75
 BRTI_TAKE_PROFIT_C = 95
-BRTI_REENTRY_MAX_PRICE = 79
-BRTI_ENTRY_MAX = 79
+BRTI_REENTRY_MAX_PRICE = 59
 BRTI_MOMENTUM_WINDOW = 15
+# Tiered entry defaults
+BRTI_TIER1_MAX = 35
+BRTI_TIER1_END_SEC = 420
+BRTI_TIER2_MAX = 49
+BRTI_TIER2_END_SEC = 600
+BRTI_TIER3_MAX = 85
+
+
+def _get_tiered_entry_max(cycle_sec, cfg):
+    """Return max entry price based on cycle phase.
+    Tier 1 (min 0-7):  35c — value entries, sBRTI momentum must confirm
+    Tier 2 (min 7-10): 49c — more data, wider cap
+    Tier 3 (min 10-14): 85c — high conviction only (requires sBRTI past conviction_min_distance)
+    """
+    tier1_end = cfg.get("tier1_end_sec", BRTI_TIER1_END_SEC)
+    tier2_end = cfg.get("tier2_end_sec", BRTI_TIER2_END_SEC)
+    if cycle_sec < tier1_end:
+        return cfg.get("tier1_max", BRTI_TIER1_MAX)
+    elif cycle_sec < tier2_end:
+        return cfg.get("tier2_max", BRTI_TIER2_MAX)
+    else:
+        return cfg.get("tier3_max", BRTI_TIER3_MAX)
 
 # Synthetic BRTI — real-time feed from constituent exchange WebSockets
 # Volume-weighted median of Coinbase, Kraken, Bitstamp, Gemini (~80%+ of BRTI weight)
@@ -506,7 +537,7 @@ class Crypto15mAgent:
                         st["direction"] = "up" if distance_from_strike > 0 else "down"
                         print(f"[{now.strftime('%H:%M:%S')}] {coin} direction (vs strike): {st['direction']} (index ${recent_avg:,.2f} vs strike ${st['strike']:,.2f})")
 
-        # ── Phase 2: Initial entry ──
+        # ── Phase 2: Initial entry (tiered pricing) ──
         if st["direction"] and not st["entry_made"] and st["direction"] != "flat":
             target_side = "yes" if st["direction"] == "up" else "no"
 
@@ -520,6 +551,18 @@ class Crypto15mAgent:
                     distance_past_strike = smoothed - st["strike"] if target_side == "yes" else st["strike"] - smoothed
                     if distance_past_strike < late_cycle_min_distance:
                         return
+                else:
+                    return
+
+            # Tier 3 conviction guard: min 10-14 requires sBRTI past conviction_min_distance
+            tier2_end = cfg.get("tier2_end_sec", BRTI_TIER2_END_SEC)
+            if cycle_sec >= tier2_end:
+                smooth_ticks = [v for t, v in st["ticks"] if t > now.timestamp() - BRTI_SMOOTHING_WINDOW]
+                if smooth_ticks:
+                    smoothed = sum(smooth_ticks) / len(smooth_ticks)
+                    dist_past = smoothed - st["strike"] if target_side == "yes" else st["strike"] - smoothed
+                    if dist_past < cfg.get("conviction_min_distance", BRTI_CONVICTION_MIN_DISTANCE):
+                        return  # not enough conviction for Tier 3 entry
                 else:
                     return
 
@@ -539,21 +582,23 @@ class Crypto15mAgent:
                         cost = 100 - yb if yb > 0 else 0
                 except Exception:
                     pass
-            entry_max = cfg.get("entry_max", 49)
+            # Tiered entry max: 35c (min 0-7) → 49c (min 7-10) → 85c (min 10-14)
+            entry_max = _get_tiered_entry_max(cycle_sec, cfg)
             reentry_max = cfg.get("reentry_max_price", entry_max)
             is_reentry = st["conviction_adds"] > 0 or st["peak_value"] > 0
-            max_price = reentry_max if is_reentry else entry_max
-            # Global exposure guard: max 5 contracts across all coins
+            max_price = min(reentry_max, entry_max) if is_reentry else entry_max
+            # Global exposure guard: max 10 contracts across all coins
             total_exposure = sum(self.ticker_contracts.values())
             if total_exposure >= 10:
                 return
 
+            tier_label = "T1" if cycle_sec < cfg.get("tier1_end_sec", BRTI_TIER1_END_SEC) else ("T2" if cycle_sec < tier2_end else "T3")
             if 1 <= cost <= max_price:
                 st["entry_made"] = True
                 st["held_side"] = target_side
                 st["entry_price"] = cost
                 st["peak_value"] = cost
-                print(f"[{now.strftime('%H:%M:%S')}] {coin} BRTI-ENTRY {target_side.upper()} 1 @ {cost}c (dir {st['direction']}, strike ${st['strike']:,.2f})")
+                print(f"[{now.strftime('%H:%M:%S')}] {coin} BRTI-ENTRY {target_side.upper()} 1 @ {cost}c [{tier_label}≤{max_price}c] (dir {st['direction']}, strike ${st['strike']:,.2f})")
                 entry_count = cfg.get("entry_contracts", 1)
                 self._post_buy(ticker, coin, target_side, cost, target_contracts=entry_count, count=entry_count)
                 return
@@ -714,7 +759,7 @@ class Crypto15mAgent:
                     if not coin_ticker:
                         continue
 
-                    # ── Entry check (WS prices only — no API blocking) ──
+                    # ── Entry check (WS prices only — no API blocking, tiered pricing) ──
                     if st["direction"] and not st["entry_made"] and st["direction"] != "flat" and not st["held_side"]:
                         prices = self.ws_prices.get(coin_ticker, {})
                         yes_ask = prices.get("yes_ask", 0)
@@ -724,7 +769,6 @@ class Crypto15mAgent:
                         if yes_ask > 0 and yes_bid > 0:
                             target_side = "yes" if st["direction"] == "up" else "no"
                             cost = yes_ask if target_side == "yes" else (100 - yes_bid)
-                            entry_max = cfg.get("entry_max", 79)
                             now = datetime.now()
                             cycle_sec = (now.minute % 15) * 60 + now.second
                             secs_remaining = max(1, 900 - cycle_sec)
@@ -738,11 +782,25 @@ class Crypto15mAgent:
                                         continue
                                 else:
                                     continue
+                            # Tier 3 conviction guard
+                            tier2_end = cfg.get("tier2_end_sec", BRTI_TIER2_END_SEC)
+                            if cycle_sec >= tier2_end and secs_remaining > 120:
+                                smooth_ticks = [v for t, v in st["ticks"] if t > now.timestamp() - BRTI_SMOOTHING_WINDOW]
+                                if smooth_ticks:
+                                    smoothed = sum(smooth_ticks) / len(smooth_ticks)
+                                    dist_past = smoothed - st["strike"] if target_side == "yes" else st["strike"] - smoothed
+                                    if dist_past < cfg.get("conviction_min_distance", BRTI_CONVICTION_MIN_DISTANCE):
+                                        continue
+                                else:
+                                    continue
                             # Global exposure guard
                             total_exposure = sum(self.ticker_contracts.values())
                             if total_exposure >= 10:
                                 continue
+                            # Tiered entry max: 35c (min 0-7) → 49c (min 7-10) → 85c (min 10-14)
+                            entry_max = _get_tiered_entry_max(cycle_sec, cfg)
                             entry_count = cfg.get("entry_contracts", 1)
+                            tier_label = "T1" if cycle_sec < cfg.get("tier1_end_sec", BRTI_TIER1_END_SEC) else ("T2" if cycle_sec < tier2_end else "T3")
                             if 1 <= cost <= entry_max:
                                 st["entry_made"] = True
                                 st["held_side"] = target_side
@@ -751,7 +809,7 @@ class Crypto15mAgent:
                                 # Set ticker_contracts immediately — don't wait for WS fill
                                 # (WS may be quiet during low-liquidity hours)
                                 self.ticker_contracts[coin_ticker] = self.ticker_contracts.get(coin_ticker, 0) + entry_count
-                                print(f"[{now.strftime('%H:%M:%S')}] {coin} BRTI-ENTRY(fast) {target_side.upper()} {entry_count}x @ {cost}c (dir {st['direction']}, strike ${st['strike']:,.2f})")
+                                print(f"[{now.strftime('%H:%M:%S')}] {coin} BRTI-ENTRY(fast) {target_side.upper()} {entry_count}x @ {cost}c [{tier_label}≤{entry_max}c] (dir {st['direction']}, strike ${st['strike']:,.2f})")
                                 await self._post_buy_async(coin_ticker, coin, target_side, cost, count=entry_count)
                         continue  # done with entry check for this coin
 
@@ -808,7 +866,10 @@ class Crypto15mAgent:
                     conviction_cooldown_sec = cfg.get("conviction_cooldown_sec", BRTI_CONVICTION_COOLDOWN_SEC)
                     conviction_min_distance = cfg.get("conviction_min_distance", BRTI_CONVICTION_MIN_DISTANCE)
                     conviction_max_price = cfg.get("conviction_max_price", BRTI_CONVICTION_MAX_PRICE)
-                    entry_max = cfg.get("entry_max", BRTI_ENTRY_MAX)
+                    # entry_max for flip re-buy: use current tier
+                    _now_flip = datetime.now()
+                    _cycle_sec_flip = (_now_flip.minute % 15) * 60 + _now_flip.second
+                    entry_max = _get_tiered_entry_max(_cycle_sec_flip, cfg)
 
                     # ── Take profit: exit at take_profit_c+ — lock in the win ──
                     if current_value >= take_profit_c:
@@ -954,7 +1015,9 @@ class Crypto15mAgent:
                             continue
 
                     # ── HARD STOP: emergency cap, max loss regardless ──
-                    if not was_profitable and loss_from_entry >= hard_stop:
+                    # Always fire at max loss — was_profitable bypass caused 3 catastrophic
+                    # losses (positions briefly profitable then collapsed with no stop)
+                    if loss_from_entry >= hard_stop:
                             # Go flat, don't flip — we don't have conviction about the other side
                             old_side = st["held_side"]
                             pnl_val = current_value - st["entry_price"]
@@ -1264,7 +1327,7 @@ class Crypto15mAgent:
         print(f"🚀 Crypto 15m Agent — BRTI Momentum — {coins_str}")
         print(f"   Signal: BRTI momentum | {coins_str} | synthetic index from 4 exchanges")
         for _coin, _cfg in BRTI_COIN_CONFIG.items():
-            print(f"   {_coin}: entry≤{_cfg['entry_max']}c | trail:dynamic(5-15c) | hard_stop:{_cfg['stop_loss_hard_c']}c | mom_flip:{_cfg['momentum_flip_distance']} | TP:{_cfg['take_profit_c']}c | conv:{_cfg['conviction_min_distance']} | cd:{_cfg['flip_cooldown_sec']}s")
+            print(f"   {_coin}: tiers={_cfg['tier1_max']}c/{_cfg['tier2_max']}c/{_cfg['tier3_max']}c (0-7/7-10/10-14m) | hard_stop:{_cfg['stop_loss_hard_c']}c | mom_flip:{_cfg['momentum_flip_distance']} | TP:{_cfg['take_profit_c']}c | conv:{_cfg['conviction_min_distance']}@≤{_cfg['conviction_max_price']}c | cd:{_cfg['flip_cooldown_sec']}s")
         print(f"   Source: synthetic (Coinbase+Kraken+Bitstamp+Gemini WebSockets)")
         print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
 
