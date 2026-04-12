@@ -678,9 +678,8 @@ class Crypto15mAgent:
     # ─── Fast Loop — Core Trading Logic ───────────────────────
 
     async def brti_fast_flip_loop(self):
-        """Every 500ms per coin: entry, lock detection, conviction adds, take profit,
-        one momentum flip, hard stop. No trailing stop. No protect profit.
-        Uses ONLY cached ws_prices — never blocks on API calls."""
+        """SIMPLIFIED: 1 contract, enter at min 10, hold to settlement. No stops, no flips, no conviction.
+        Take profit at 95c is the only exit. Uses ONLY cached ws_prices."""
         while self.running:
             for coin, cfg in BRTI_COIN_CONFIG.items():
                 try:
@@ -704,30 +703,15 @@ class Crypto15mAgent:
                     if now_ms - refreshed_ms > 60_000:
                         continue
 
-                    # ── Compute smoothed sBRTI ──
-                    smooth_ticks = [v for t, v in st["ticks"] if t > now_ts - BRTI_SMOOTHING_WINDOW]
-                    smoothed_brti = sum(smooth_ticks) / len(smooth_ticks) if smooth_ticks else 0
                     latest_brti = st["ticks"][-1][1] if st["ticks"] else 0
                     if latest_brti <= 0:
                         continue
 
-                    # ── Compute momentum (10s vs 30s) ──
-                    ticks_30s = [v for t, v in st["ticks"] if t > now_ts - 30]
-                    ticks_10s = [v for t, v in st["ticks"] if t > now_ts - 10]
-                    if len(ticks_30s) >= 2 and len(ticks_10s) >= 1:
-                        momentum = (sum(ticks_10s) / len(ticks_10s)) - (sum(ticks_30s) / len(ticks_30s))
-                    else:
-                        momentum = 0
-
-                    # ── Lock detection ──
-                    locked = self.is_locked(coin, smoothed_brti, st["strike"], secs_remaining)
-
-                    # ── Phase 1: Determine direction ──
-                    momentum_window = cfg.get("momentum_window", 15)
+                    # ── Determine direction (once per cycle) ──
                     direction_min_dist = cfg.get("direction_min_dist", 20.0)
                     direction_min_momentum = cfg.get("direction_min_momentum", 5.0)
 
-                    if not st["direction"] and cycle_sec >= momentum_window and len(st["ticks"]) >= 10:
+                    if not st["direction"] and len(st["ticks"]) >= 10:
                         recent_ticks = [v for _, v in st["ticks"][-10:]]
                         if recent_ticks:
                             recent_avg = sum(recent_ticks) / len(recent_ticks)
@@ -735,295 +719,61 @@ class Crypto15mAgent:
 
                             if abs(distance_from_strike) >= direction_min_dist:
                                 st["direction"] = "up" if distance_from_strike > 0 else "down"
-                                print(f"[{now.strftime('%H:%M:%S')}] {coin} direction (position): {st['direction']} (index ${recent_avg:,.2f} is ${distance_from_strike:+,.2f} from strike ${st['strike']:,.2f})")
+                                print(f"[{now.strftime('%H:%M:%S')}] {coin} direction: {st['direction']} (${distance_from_strike:+,.2f} from strike)")
                             else:
-                                cycle_start_ts = now_ts - cycle_sec
-                                start_ticks = [v for t, v in st["ticks"] if cycle_start_ts - 5 <= t <= cycle_start_ts + 10]
-                                if start_ticks:
-                                    start_avg = sum(start_ticks) / len(start_ticks)
-                                    delta = recent_avg - start_avg
-                                    if delta > direction_min_momentum:
-                                        st["direction"] = "up"
-                                    elif delta < -direction_min_momentum:
-                                        st["direction"] = "down"
-                                    else:
-                                        st["direction"] = "flat"
-                                    print(f"[{now.strftime('%H:%M:%S')}] {coin} direction (momentum): {st['direction']} (${start_avg:,.2f} → ${recent_avg:,.2f}, Δ${delta:+,.2f}, need ±${direction_min_momentum:,.4f}) | strike: ${st['strike']:,.2f}")
-                                else:
-                                    st["direction"] = "up" if distance_from_strike > 0 else "down"
-                                    print(f"[{now.strftime('%H:%M:%S')}] {coin} direction (vs strike): {st['direction']} (index ${recent_avg:,.2f} vs strike ${st['strike']:,.2f})")
+                                st["direction"] = "flat"
 
-                    # ── Get WS prices (cached only, no API fallback) ──
+                    # ── Get WS prices ──
                     prices = self.ws_prices.get(coin_ticker, {})
                     yes_ask = prices.get("yes_ask", 0)
                     yes_bid = prices.get("yes_bid", 0)
-                    # If prices are stale/zero, skip this tick
                     if yes_ask <= 0 or yes_bid <= 0:
                         continue
 
-                    # ── Phase 2: Entry check (when no position) ──
-                    if st["direction"] and not st["entry_made"] and st["direction"] != "flat" and not st["held_side"] and not self._mid_cycle_startup:
+                    # ── ENTRY: 1 contract at minute 10+, hold to settlement ──
+                    if (st["direction"] and st["direction"] != "flat"
+                            and not st["entry_made"] and not st["held_side"]
+                            and not self._mid_cycle_startup
+                            and cycle_sec >= 600):  # minute 10+
                         target_side = "yes" if st["direction"] == "up" else "no"
                         cost = yes_ask if target_side == "yes" else (100 - yes_bid)
-
-                        is_reentry = st.get("entered_this_cycle", False)
                         entry_max = cfg.get("entry_max", 79)
-                        reentry_max = cfg.get("reentry_max_price", 59)
-                        max_price = reentry_max if is_reentry else entry_max
 
-                        # No new entries after minute 14
-                        if cycle_sec > 840:
-                            continue
-
-                        # Global exposure guard: max 15 contracts across current-cycle tickers
-                        total_exposure = sum(self.ticker_contracts.get(t, 0) for t in self.current_tickers.values())
-                        if total_exposure >= 15:
-                            continue
-
-                        entry_count = cfg.get("entry_contracts", 2)
-                        if 15 <= cycle_sec <= 600 and 10 <= cost <= max_price and time.time() - st.get("last_tp_ts", 0) > 90:
+                        if 1 <= cost <= entry_max:
                             st["entry_made"] = True
-                            st["entered_this_cycle"] = True
                             st["held_side"] = target_side
                             st["entry_price"] = cost
-                            st["peak_value"] = cost
-                            st["original_entry_count"] = entry_count
-                            reentry_label = " (re-entry)" if is_reentry else ""
-                            print(f"[{now.strftime('%H:%M:%S')}] {coin} BRTI-ENTRY{reentry_label} {target_side.upper()} {entry_count}x @ {cost}c (dir {st['direction']}, strike ${st['strike']:,.2f})")
-                            await self._post_buy_async(coin_ticker, coin, target_side, cost, count=entry_count)
+                            self.ticker_contracts[coin_ticker] = 1
+                            print(f"[{now.strftime('%H:%M:%S')}] {coin} ENTRY {target_side.upper()} 1x @ {cost}c (dir {st['direction']}, strike ${st['strike']:,.2f})")
+                            await self._post_buy_async(coin_ticker, coin, target_side, cost, count=1)
                         continue
 
-                    # ── Holding checks (only when we have a position) ──
+                    # ── TAKE PROFIT at 95c (only exit) ──
                     if not st["held_side"]:
                         continue
                     held = self.ticker_contracts.get(coin_ticker, 0)
                     if held <= 0:
                         continue
 
-                    # Current value of our position
                     if st["held_side"] == "yes":
                         current_value = yes_bid
                     else:
                         current_value = 100 - yes_ask
 
-                    if current_value > st["peak_value"]:
-                        st["peak_value"] = current_value
-
-                    loss_from_entry = st["entry_price"] - current_value
-
-                    # ── Check 1: TAKE PROFIT at 95c ──
                     take_profit_c = cfg.get("take_profit_c", 95)
                     if current_value >= take_profit_c:
                         old_side = st["held_side"]
                         profit = current_value - st["entry_price"]
-                        entry_contracts = cfg.get("entry_contracts", 2)
-                        safe_sell_count = max(1, min(held, entry_contracts + st.get("conviction_adds", 0)))
-                        _kal = self.kalshi_positions.get(coin_ticker)
-                        if _kal is not None:
-                            if safe_sell_count > _kal:
-                                print(f"  ⚠️ SELL GUARD: {coin} TP capping {safe_sell_count}x → {_kal}x (kalshi holds {_kal})")
-                                safe_sell_count = _kal
-                            if safe_sell_count <= 0:
-                                print(f"  ⚠️ SELL GUARD: {coin} kalshi shows 0 held — skipping TP")
-                                continue
-                        print(f"[{now.strftime('%H:%M:%S')}] 💰 {coin} TAKE PROFIT: {old_side.upper()} {safe_sell_count}x @ {current_value}c (entry:{st['entry_price']}c pnl:+{profit}c)")
-                        # Reset state BEFORE order
+                        print(f"[{now.strftime('%H:%M:%S')}] 💰 {coin} TAKE PROFIT: {old_side.upper()} 1x @ {current_value}c (pnl:+{profit}c)")
                         self.ticker_contracts[coin_ticker] = 0
-                        self.positions[coin_ticker] = []
                         st["held_side"] = ""
-                        st["entry_made"] = False
-                        st["peak_value"] = 0
-                        st["entry_price"] = 0
-                        st["conviction_adds"] = 0
-                        st["direction"] = ""
-                        st["last_tp_ts"] = time.time()
-                        await self._sell_async(coin_ticker, coin, old_side, safe_sell_count, yes_bid, yes_ask, reason=f"TP +{profit}c")
+                        st["entry_made"] = True  # don't re-enter this cycle
+                        await self._sell_async(coin_ticker, coin, old_side, 1, yes_bid, yes_ask, reason=f"TP +{profit}c")
                         continue
 
-                    # ── Check 2: CONVICTION ADD (when locked or strong distance) ──
-                    conviction_max_adds = cfg.get("conviction_max_adds", 2)
-                    conviction_cooldown = cfg.get("conviction_cooldown_sec", 60)
-                    conviction_min_distance = cfg.get("conviction_min_distance", 50.0)
-                    conviction_max_price = cfg.get("conviction_max_price", 85)
-
-                    if (st["conviction_adds"] < conviction_max_adds
-                            and cycle_sec <= 840
-                            and (time.time() - st["last_conviction_ts"]) > conviction_cooldown):
-                        total_exposure = sum(self.ticker_contracts.get(t, 0) for t in self.current_tickers.values())
-                        if total_exposure < 15:
-                            if st["held_side"] == "yes":
-                                proj_distance = smoothed_brti - st["strike"]
-                            else:
-                                proj_distance = st["strike"] - smoothed_brti
-                            buy_price = yes_ask if st["held_side"] == "yes" else (100 - yes_bid)
-
-                            # Add aggressively when locked, or when distance is strong
-                            should_add = False
-                            add_reason = ""
-                            if locked and proj_distance > 0:
-                                should_add = True
-                                add_reason = "LOCKED"
-                            elif proj_distance >= conviction_min_distance and buy_price <= conviction_max_price:
-                                should_add = True
-                                add_reason = f"dist ${proj_distance:+,.2f}"
-
-                            if should_add:
-                                st["conviction_adds"] += 1
-                                st["last_conviction_ts"] = time.time()
-                                lock_str = "🔒" if locked else "open"
-                                print(f"[{now.strftime('%H:%M:%S')}] 💪 {coin} CONVICTION BUY [{add_reason}]: {st['held_side'].upper()} 1x @ {buy_price}c ({lock_str}, add {st['conviction_adds']}/{conviction_max_adds})")
-                                await self._post_buy_async(coin_ticker, coin, st["held_side"], buy_price, count=1)
-
-                    # ── Check 3: If LOCKED, hold — don't flip, don't stop ──
-                    if locked:
-                        # Settlement is guaranteed on our side. Hold to settlement.
-                        continue
-
-                    # ── Check 4: FLIP on regime change ──
-                    # Normally 1 flip max per cycle. BUT if a spike is detected
-                    # (>10x max_move in 5s), allow additional flips — the market
-                    # is in an extreme regime where double-reversals happen.
-                    flip_cooldown = cfg.get("flip_cooldown_sec", 90)
-                    momentum_flip_distance = cfg.get("momentum_flip_distance", 100.0)
-                    spike = self.detect_spike(coin)
-                    spike_threshold = cfg.get("max_spot_move_per_sec", 50.0) * 10
-                    is_spike = spike > spike_threshold
-
-                    # Allow flip if: (a) haven't flipped yet, OR (b) spike detected (double-reversal)
-                    flip_allowed = (not st["flipped_this_cycle"]) or is_spike
-
-                    if (flip_allowed
-                            and (time.time() - st["last_flip_ts"]) > flip_cooldown):
+                    # ── Otherwise: HOLD TO SETTLEMENT. No stops. No flips. ──
                         # Projected settlement on the wrong side?
-                        if st["held_side"] == "yes":
-                            wrong_side_distance = st["strike"] - smoothed_brti  # positive = below strike = wrong for YES
-                        else:
-                            wrong_side_distance = smoothed_brti - st["strike"]  # positive = above strike = wrong for NO
-
-                        # Momentum must confirm wrong-side movement for 10+ seconds
-                        # momentum > 0 means price going up; for YES holder that's good, for NO holder that's bad
-                        if st["held_side"] == "yes":
-                            momentum_confirms_wrong = momentum < -direction_min_momentum  # price dropping
-                        else:
-                            momentum_confirms_wrong = momentum > direction_min_momentum   # price rising
-
-                        # Check 10s sustained: use ticks_10s — all should be on wrong side
-                        all_10s_wrong = False
-                        if len(ticks_10s) >= 5:  # need at least 5 ticks in 10s
-                            if st["held_side"] == "yes":
-                                all_10s_wrong = all(v < st["strike"] for v in ticks_10s)
-                            else:
-                                all_10s_wrong = all(v > st["strike"] for v in ticks_10s)
-
-                        if (wrong_side_distance >= momentum_flip_distance
-                                and momentum_confirms_wrong
-                                and all_10s_wrong):
-                            new_side = "no" if st["held_side"] == "yes" else "yes"
-                            old_side = st["held_side"]
-                            new_cost = yes_ask if new_side == "yes" else (100 - yes_bid)
-                            reentry_max = cfg.get("reentry_max_price", 59)
-
-                            if new_cost > reentry_max:
-                                print(f"  ⚠️ {coin} Flip blocked — {new_cost}c > reentry_max {reentry_max}c")
-                            else:
-                                # Flip: sell current, buy original_count + 1 on flip side
-                                flip_buy_count = st.get("original_entry_count", 2) + 1
-                                _kal = self.kalshi_positions.get(coin_ticker)
-                                actual_held = held
-                                if _kal is not None:
-                                    if _kal == 0:
-                                        print(f"  ⚠️ SELL GUARD: {coin} kalshi shows 0 held — skipping flip")
-                                        self.ticker_contracts[coin_ticker] = 0
-                                        self.positions[coin_ticker] = []
-                                        st["held_side"] = ""
-                                        st["entry_made"] = False
-                                        continue
-                                    if _kal != actual_held:
-                                        print(f"  ⚠️ SELL GUARD: {coin} state={actual_held}x kalshi={_kal}x — using kalshi count")
-                                        actual_held = _kal
-
-                                # Atomic flip: buy new_side for (actual_held + flip_buy_count) to close old + open new
-                                flip_total = actual_held + flip_buy_count
-                                taker_price = min(new_cost + 5, reentry_max, 99)
-
-                                pnl = current_value - st["entry_price"]
-                                print(f"[{now.strftime('%H:%M:%S')}] 🔄 {coin} FLIP: wrong_side ${wrong_side_distance:+,.2f} | SELL {old_side.upper()} @ {current_value}c (pnl:{pnl:+d}c) → BUY {new_side.upper()} {flip_buy_count}x @ {new_cost}c")
-
-                                # Reset state BEFORE order
-                                self.ticker_contracts[coin_ticker] = 0
-                                self.positions[coin_ticker] = []
-                                st["held_side"] = ""
-                                st["entry_made"] = False
-                                st["peak_value"] = 0
-                                st["entry_price"] = 0
-                                st["conviction_adds"] = 0
-                                st["last_flip_ts"] = time.time()
-                                st["flipped_this_cycle"] = True
-
-                                if self.client and not DRY_RUN:
-                                    try:
-                                        # FAST PATH: synchronous order for minimum latency
-                                        # Regime change = stale orderbook = every ms counts
-                                        flip_id = f"fflip-{coin_ticker}-{int(time.time()*1000)}"
-                                        self.client.create_order(
-                                            ticker=coin_ticker,
-                                            client_order_id=flip_id,
-                                            side=new_side,
-                                            action="buy",
-                                            count=flip_total,
-                                            type="limit",
-                                            yes_price=taker_price if new_side == "yes" else None,
-                                            no_price=taker_price if new_side == "no" else None,
-                                        )
-                                        st["held_side"] = new_side
-                                        st["entry_price"] = new_cost
-                                        st["peak_value"] = new_cost
-                                        st["entry_made"] = True
-                                        st["original_entry_count"] = flip_buy_count
-                                        self.ticker_contracts[coin_ticker] = flip_buy_count
-                                        print(f"  → {coin} Atomic flip → {new_side.upper()} {flip_buy_count}x @ {new_cost}c (order {flip_total}x)")
-                                    except Exception as e:
-                                        st["direction"] = ""
-                                        print(f"  → {coin} Atomic flip error (flat, direction reset): {e}")
-                                else:
-                                    st["held_side"] = new_side
-                                    st["entry_price"] = new_cost
-                                    st["peak_value"] = new_cost
-                                    st["entry_made"] = True
-                                    st["original_entry_count"] = flip_buy_count
-                                    self.ticker_contracts[coin_ticker] = flip_buy_count
-                                    print(f"  📄 PAPER: {coin} atomic flip → {new_side.upper()} {flip_buy_count}x @ {new_cost}c")
-                            continue
-
-                    # ── Check 5: HARD STOP at 35c loss — emergency, go flat ──
-                    hard_stop = cfg.get("stop_loss_hard_c", 35)
-                    if loss_from_entry >= hard_stop:
-                        old_side = st["held_side"]
-                        safe_sell_count = held
-                        _kal = self.kalshi_positions.get(coin_ticker)
-                        if _kal is not None and safe_sell_count > _kal:
-                            print(f"  ⚠️ SELL GUARD: {coin} hard stop capping {safe_sell_count}x → {_kal}x")
-                            safe_sell_count = _kal
-                        if _kal is not None and _kal <= 0:
-                            print(f"  ⚠️ SELL GUARD: {coin} skipping hard stop — kalshi shows 0 held")
-                            self.ticker_contracts[coin_ticker] = 0
-                            self.positions[coin_ticker] = []
-                            st["held_side"] = ""
-                            st["entry_made"] = False
-                            continue
-
-                        print(f"[{now.strftime('%H:%M:%S')}] 🛑 {coin} HARD STOP: SELL {old_side.upper()} {safe_sell_count}x @ {current_value}c (entry:{st['entry_price']}c loss:{loss_from_entry}c) — flat, reset")
-                        self.ticker_contracts[coin_ticker] = 0
-                        self.positions[coin_ticker] = []
-                        st["held_side"] = ""
-                        st["entry_made"] = False
-                        st["peak_value"] = 0
-                        st["entry_price"] = 0
-                        st["conviction_adds"] = 0
-                        st["last_flip_ts"] = time.time()
-                        st["direction"] = ""  # re-evaluate direction before re-entry
-                        if safe_sell_count > 0:
-                            await self._sell_async(coin_ticker, coin, old_side, safe_sell_count, yes_bid, yes_ask, reason=f"HARD STOP -{loss_from_entry}c")
+                    # No flips. No stops. Hold to settlement.
                         continue
 
                 except Exception as e:
