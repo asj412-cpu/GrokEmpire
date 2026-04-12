@@ -56,13 +56,13 @@ BRTI_COIN_CONFIG = {
         "take_profit_c": 95,
         "reentry_max_price": 59,
         # Tiered entry pricing: wait for value, don't chase at cycle open
-        "tier1_max": 35,               # Min 0-7: value entries only, sBRTI momentum confirms
+        "tier1_max": 45,               # Min 0-7: value entries, sBRTI momentum confirms
         "tier1_end_sec": 420,          # 7 minutes
-        "tier2_max": 49,               # Min 7-10: cap increases with more data
+        "tier2_max": 65,               # Min 7-10: cap increases with more data
         "tier2_end_sec": 600,          # 10 minutes
         "tier3_max": 85,               # Min 10-14: high conviction only (sBRTI past conviction_min_distance)
         "entry_contracts": 3,
-        "momentum_window": 15,
+        "momentum_window": 5,          # 5s detection — catch sBRTI lead before Kalshi reprices
         "ws_pairs": {"coinbase": "BTC-USD", "kraken": "XBT/USD", "bitstamp": "btcusd", "gemini": "BTCUSD"},
     },
     "ETH": {
@@ -84,13 +84,13 @@ BRTI_COIN_CONFIG = {
         "take_profit_c": 95,
         "reentry_max_price": 59,
         # Tiered entry pricing: wait for value, don't chase at cycle open
-        "tier1_max": 35,               # Min 0-7: value entries only, sBRTI momentum confirms
+        "tier1_max": 45,               # Min 0-7: value entries, sBRTI momentum confirms
         "tier1_end_sec": 420,          # 7 minutes
-        "tier2_max": 49,               # Min 7-10: cap increases with more data
+        "tier2_max": 65,               # Min 7-10: cap increases with more data
         "tier2_end_sec": 600,          # 10 minutes
         "tier3_max": 85,               # Min 10-14: high conviction only
         "entry_contracts": 3,
-        "momentum_window": 15,
+        "momentum_window": 5,          # 5s detection — catch sBRTI lead before Kalshi reprices
         "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD"},
     },
 }
@@ -106,11 +106,11 @@ BRTI_CONVICTION_COOLDOWN_SEC = 60
 BRTI_CONVICTION_MAX_PRICE = 75
 BRTI_TAKE_PROFIT_C = 95
 BRTI_REENTRY_MAX_PRICE = 59
-BRTI_MOMENTUM_WINDOW = 15
+BRTI_MOMENTUM_WINDOW = 5
 # Tiered entry defaults
-BRTI_TIER1_MAX = 35
+BRTI_TIER1_MAX = 45
 BRTI_TIER1_END_SEC = 420
-BRTI_TIER2_MAX = 49
+BRTI_TIER2_MAX = 65
 BRTI_TIER2_END_SEC = 600
 BRTI_TIER3_MAX = 85
 
