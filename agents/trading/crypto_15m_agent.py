@@ -79,7 +79,7 @@ BRTI_COIN_CONFIG = {
         "momentum_window": 15,
         "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD"},
     },
-    "SOL": {
+    "SOL_DISABLED": {
         "series": "KXSOL15M",
         "direction_min_dist": 0.047,
         "direction_min_momentum": 0.012,
