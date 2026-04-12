@@ -907,36 +907,26 @@ class Crypto15mAgent:
                     else:
                         projected_winning = projected_settlement < st["strike"]
 
-                    if was_profitable:
-                        # DISABLED: protect profit was selling winners on noise dips.
-                        # 5 protect profits overnight, all sold winning positions.
-                        # Take profit at 95c handles upside. Hold to settlement for everything else.
-                        pass
+                    # ── REGIME EXIT: fires regardless of was_profitable ──
+                    # If projected settlement is $30+ wrong AND momentum confirms, sell and go flat
+                    hard_stop = cfg.get("stop_loss_hard_c", 20)
+                    momentum_flip_dist = cfg.get("momentum_flip_distance", conviction_min_distance)
+
+                    if st["held_side"] == "yes":
+                        wrong_side_distance = st["strike"] - projected_settlement
                     else:
-                        # ── SCENARIO 2: Never profitable — three tiers ──
-                        hard_stop = cfg.get("stop_loss_hard_c", 20)
-                        momentum_flip_dist = cfg.get("momentum_flip_distance", conviction_min_distance)
+                        wrong_side_distance = projected_settlement - st["strike"]
 
-                        # How far is projected settlement past strike on the WRONG side?
-                        if st["held_side"] == "yes":
-                            wrong_side_distance = st["strike"] - projected_settlement  # positive = losing
-                        else:
-                            wrong_side_distance = projected_settlement - st["strike"]
+                    ticks_10s_m = [v for t, v in st["ticks"] if t > now_ts - 10]
+                    ticks_30s_m = [v for t, v in st["ticks"] if t > now_ts - 30]
+                    if len(ticks_10s_m) >= 2 and len(ticks_30s_m) >= 2:
+                        short_momentum = sum(ticks_10s_m) / len(ticks_10s_m) - sum(ticks_30s_m) / len(ticks_30s_m)
+                    else:
+                        short_momentum = 0
+                    momentum_confirms = (st["held_side"] == "yes" and short_momentum < 0) or \
+                                       (st["held_side"] == "no" and short_momentum > 0)
 
-                        # Tier A: MOMENTUM FLIP — projected settlement is conviction-level wrong
-                        # Requires 1.2x the conviction distance + momentum direction confirming
-                        # "sBRTI clearly moved AND is still moving to the other side"
-                        ticks_10s = [v for t, v in st["ticks"] if t > now_ts - 10]
-                        ticks_30s = [v for t, v in st["ticks"] if t > now_ts - 30]
-                        if len(ticks_10s) >= 2 and len(ticks_30s) >= 2:
-                            short_momentum = sum(ticks_10s) / len(ticks_10s) - sum(ticks_30s) / len(ticks_30s)
-                        else:
-                            short_momentum = 0
-                        # For YES holder, negative momentum = bad. For NO holder, positive = bad.
-                        momentum_confirms = (st["held_side"] == "yes" and short_momentum < 0) or \
-                                           (st["held_side"] == "no" and short_momentum > 0)
-
-                        if wrong_side_distance >= momentum_flip_dist and momentum_confirms:
+                    if wrong_side_distance >= momentum_flip_dist and momentum_confirms:
                             # Regime change: sell and go FLAT — re-evaluate before re-entering
                             old_side = st["held_side"]
                             pnl_val = current_value - st["entry_price"]
@@ -963,9 +953,8 @@ class Crypto15mAgent:
                             await asyncio.sleep(0.5)
                             continue
 
-                        # Tier B: HARD STOP — emergency cap, max loss regardless of projection
-                        # "We've lost too much, exit to preserve capital"
-                        elif loss_from_entry >= hard_stop:
+                    # ── HARD STOP: emergency cap, max loss regardless ──
+                    if not was_profitable and loss_from_entry >= hard_stop:
                             # Go flat, don't flip — we don't have conviction about the other side
                             old_side = st["held_side"]
                             pnl_val = current_value - st["entry_price"]
