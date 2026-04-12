@@ -1271,6 +1271,16 @@ class Crypto15mAgent:
         print(f"   Source: synthetic (Coinbase+Kraken+Bitstamp+Gemini WebSockets)")
         print(f"   DRY_RUN: {DRY_RUN} | No trailing stop | No protect profit | Lock safety: {LOCK_SAFETY_FACTOR}x")
 
+        # Startup guard: if mid-cycle (min 1-14), wait for next cycle boundary
+        # Prevents double-buying on restarts within the same cycle
+        now = datetime.now()
+        cycle_sec = (now.minute % 15) * 60 + now.second
+        if 60 < cycle_sec < 840:  # between min 1 and min 14
+            wait_secs = 900 - cycle_sec + 5  # wait until ~5s into next cycle
+            print(f"⏳ Mid-cycle startup detected (min {cycle_sec//60}). Waiting {wait_secs}s for next cycle to avoid double-entry...")
+            await asyncio.sleep(wait_secs)
+            print(f"✅ New cycle started — proceeding")
+
         print("Seeding settlement history...")
         self.seed_settlement_history()
 
