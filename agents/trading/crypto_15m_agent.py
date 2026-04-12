@@ -780,9 +780,16 @@ class Crypto15mAgent:
             positions = self.client.get_positions()
             for p in positions.get("event_positions", []):
                 event_ticker = p.get("event_ticker", "")
-                count = int(float(p.get("total_cost_shares_fp", 0)))
-                if count <= 0:
+                # Skip settled positions — event_exposure_dollars is authoritative.
+                # total_cost_shares_fp is cumulative lifetime transaction volume (buys+sells),
+                # NOT current contract count, so we never use it for blocking decisions.
+                exposure = float(p.get("event_exposure_dollars", 0))
+                if exposure <= 0:
                     continue
+                # Estimate held contracts from exposure assuming ~50c avg price.
+                # This errs slightly high (conservative) which is correct for a block guard.
+                count = max(1, round(exposure / 0.50))
+                print(f"  📌 {event_ticker}: live exposure ${exposure:.2f} → ~{count} contracts (blocking) | raw={p}")
                 for series in COINS.values():
                     if event_ticker.startswith(series):
                         try:
@@ -791,7 +798,6 @@ class Crypto15mAgent:
                                 t = m.get("ticker", "")
                                 if t:
                                     self.ticker_contracts[t] = count
-                            print(f"  📌 {event_ticker}: {count} contracts (blocked)")
                         except Exception:
                             pass
                         break
