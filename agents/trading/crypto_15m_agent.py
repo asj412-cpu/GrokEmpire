@@ -1268,7 +1268,7 @@ class Crypto15mAgent:
 
                             # Single atomic flip: BUY new_side for (actual_held + flip_buy_count)
                             # Kalshi auto-closes the old position and opens the new one in one order.
-                            flip_buy_count = actual_held + 1  # desired new position size
+                            flip_buy_count = cfg.get("entry_contracts", 1)  # desired new position size
                             flip_total = actual_held + flip_buy_count  # closes old + opens new
                             reentry_max = cfg.get("reentry_max_price", 59)
                             if new_cost > reentry_max:
