@@ -613,7 +613,7 @@ class Crypto15mAgent:
                         print(f"[{now.strftime('%H:%M:%S')}] {coin} direction (vs strike): {st['direction']} (index ${recent_avg:,.2f} vs strike ${st['strike']:,.2f})")
 
         # ── Phase 2: Initial entry ──
-        if st["direction"] and not st["entry_made"] and st["direction"] != "flat" and cycle_sec >= 120:
+        if st["direction"] and not st["entry_made"] and st["direction"] != "flat" and 15 <= cycle_sec <= 600:
             target_side = "yes" if st["direction"] == "up" else "no"
 
             # Late-cycle guard: in final 2 min, only enter on regime change
@@ -649,15 +649,13 @@ class Crypto15mAgent:
             reentry_max = cfg.get("reentry_max_price", entry_max)
             is_reentry = st["conviction_adds"] > 0 or st["peak_value"] > 0
             max_price = reentry_max if is_reentry else entry_max
-            # Timing gates:
-            #   min 0-2:   no entries (existing 2-min guard upstream)
-            #   min 2-5:   initial entry only
-            #   min 5-10:  initial entry + re-entry (up to reentry_max)
-            #   min 10-14: conviction adds only (handled below)
-            #   min 14-15: no new entries
+            # Timing gates (enforced upstream by 15 <= cycle_sec <= 600 in _evaluate_brti):
+            #   cycle_sec 15-600  (min 0:15-10:00): initial entry + re-entry
+            #   cycle_sec 600-840 (min 10:00-14:00): conviction adds only (handled below)
+            #   cycle_sec > 840   (min 14:00-15:00): no new entries
+            # Note: this path is only reached when cycle_sec is already in 15-600 range.
+            # The > 840 guard below is a safety net for any clock drift edge cases.
             entry_cycle_sec = (now.minute % 15) * 60 + now.second
-            if is_reentry and not (300 <= entry_cycle_sec <= 600):
-                return
             if entry_cycle_sec > 840:  # no new entries after minute 14
                 return
             # Global exposure guard: max 10 contracts across current-cycle tickers only
@@ -908,7 +906,7 @@ class Crypto15mAgent:
                             if total_exposure >= 15:
                                 continue
                             entry_count = cfg.get("entry_contracts", 1)
-                            if cycle_sec >= 120 and 10 <= cost <= entry_max and time.time() - st.get("last_tp_ts", 0) > 90:
+                            if 15 <= cycle_sec <= 600 and 10 <= cost <= entry_max and time.time() - st.get("last_tp_ts", 0) > 90:
                                 st["entry_made"] = True
                                 st["held_side"] = target_side
                                 st["entry_price"] = cost
