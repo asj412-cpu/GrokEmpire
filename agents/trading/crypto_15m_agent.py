@@ -98,7 +98,9 @@ BRTI_COIN_CONFIG = {
         "momentum_window": 15,
         "ws_pairs": {"coinbase": "SOL-USD", "kraken": "SOL/USD", "bitstamp": "solusd", "gemini": "SOLUSD"},
     },
-    "XRP": {
+    # XRP DISABLED — direction_min_dist too small, enters on noise, instant hard stops
+    # Need to calibrate thresholds from live cycle data before enabling
+    "XRP_DISABLED": {
         "series": "KXXRP15M",
         "direction_min_dist": 0.00037,
         "direction_min_momentum": 0.000093,
@@ -484,17 +486,8 @@ class Crypto15mAgent:
                         print(f"  ⚠️ POSITION SYNC: {ticker} tracked={tracked_count} kalshi={actual_count} — correcting")
                         self.ticker_contracts[ticker] = actual_count
                     self.kalshi_positions[ticker] = actual_count
-                    # If Kalshi says 0, our buy was absorbed by residual positions — reset state
-                    if actual_count == 0 and coin:
-                        st = self.brti_state.get(coin, {})
-                        if st.get("held_side"):
-                            print(f"  ⚠️ {coin} position absorbed by residuals — resetting for re-entry")
-                            st["held_side"] = ""
-                            st["entry_made"] = False
-                            st["direction"] = ""  # re-evaluate direction
-                            st["peak_value"] = 0
-                            st["entry_price"] = 0
-                            st["conviction_adds"] = 0
+                    # Note: removed "absorbed by residuals" reset — positions don't
+                    # carry across 15-min cycles. Each cycle is a fresh market.
 
             elif action == "sell":
                 self.resting_sells[ticker] = max(0, self.resting_sells.get(ticker, 0) - count)
