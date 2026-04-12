@@ -891,6 +891,9 @@ class Crypto15mAgent:
                         projected_winning = projected_settlement < st["strike"]
 
                     if was_profitable:
+                        # Final 3 minutes: hold to settlement — smoothed average is locked
+                        if secs_remaining <= 180:
+                            continue
                         # Only activate trailing stop once we have +8c locked in
                         # Prevents selling on tiny peaks that barely exceeded entry
                         if drop_from_peak >= trailing_stop_c and current_value >= st["entry_price"] + 8:
