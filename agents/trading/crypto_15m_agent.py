@@ -561,30 +561,51 @@ class Crypto15mAgent:
         # Phase 3 handled by brti_fast_flip_loop (500ms, trailing stop + stop loss)
 
     def _post_buy(self, ticker, coin, side, price, target_contracts, count=1):
-        """Post a limit buy order. count=number of contracts in this single order."""
+        """Post a limit buy order (sync). count=number of contracts."""
         client_order_id = f"brti-{side}-{ticker}-{int(time.time())}"
-        decision = f"BUY {side.upper()}"
-        existing = self.ticker_contracts.get(ticker, 0)
-
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {coin} | {decision} {count} @ {price}c | held:{existing}/{target_contracts}")
-
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {coin} | BUY {side.upper()} {count} @ {price}c | held:{self.ticker_contracts.get(ticker, 0)}")
         if self.client and not DRY_RUN:
             try:
                 self.client.create_order(
-                    ticker=ticker,
-                    client_order_id=client_order_id,
-                    side=side,
-                    action="buy",
-                    count=count,
-                    type="limit",
+                    ticker=ticker, client_order_id=client_order_id,
+                    side=side, action="buy", count=count, type="limit",
                     yes_price=price if side == "yes" else None,
                     no_price=price if side == "no" else None,
                 )
-                self.resting_buys[ticker] = {"order_id": client_order_id, "side": side, "price": price, "coin": coin}
             except Exception as e:
                 print(f"  → Buy error: {e}")
-        elif DRY_RUN:
-            self.resting_buys[ticker] = {"order_id": client_order_id, "side": side, "price": price, "coin": coin}
+
+    async def _post_buy_async(self, ticker, coin, side, price, count=1):
+        """Non-blocking buy — runs create_order in thread so event loop stays responsive."""
+        client_order_id = f"brti-{side}-{ticker}-{int(time.time())}"
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {coin} | BUY {side.upper()} {count} @ {price}c")
+        if self.client and not DRY_RUN:
+            try:
+                await asyncio.to_thread(
+                    self.client.create_order,
+                    ticker=ticker, client_order_id=client_order_id,
+                    side=side, action="buy", count=count, type="limit",
+                    yes_price=price if side == "yes" else None,
+                    no_price=price if side == "no" else None,
+                )
+            except Exception as e:
+                print(f"  → Buy error: {e}")
+
+    async def _sell_async(self, ticker, coin, side, count, yes_bid, yes_ask, reason=""):
+        """Non-blocking sell."""
+        sell_id = f"sell-{coin.lower()}-{ticker}-{int(time.time()*1000)}"
+        if self.client and not DRY_RUN:
+            try:
+                await asyncio.to_thread(
+                    self.client.create_order,
+                    ticker=ticker, client_order_id=sell_id,
+                    side=side, action="sell", count=count, type="limit",
+                    yes_price=yes_bid if side == "yes" else None,
+                    no_price=(100 - yes_ask) if side == "no" else None,
+                )
+                print(f"  → {coin} Sell {count}x {side.upper()} ({reason})")
+            except Exception as e:
+                print(f"  → {coin} Sell error: {e}")
             print(f"  📄 PAPER: → buy {side} @ {price}c (HOLD to settlement)")
 
         with open(self.log_file, "a", newline="") as f:
@@ -685,25 +706,21 @@ class Crypto15mAgent:
                     st = self.brti_state[coin]
                     if st["strike"] <= 0 or not st["ticks"]:
                         continue
+                    # Only process when new exchange data arrived (event-driven)
+                    if not st.get("_tick_pending", False):
+                        continue
+                    st["_tick_pending"] = False
                     coin_ticker = self.current_tickers.get(coin, "")
                     if not coin_ticker:
                         continue
 
-                    # ── Entry check (when Kalshi WS is quiet) ──
+                    # ── Entry check (WS prices only — no API blocking) ──
                     if st["direction"] and not st["entry_made"] and st["direction"] != "flat" and not st["held_side"]:
-                        # Fetch prices via API since WS may not be sending ticks
                         prices = self.ws_prices.get(coin_ticker, {})
                         yes_ask = prices.get("yes_ask", 0)
                         yes_bid = prices.get("yes_bid", 0)
                         if yes_ask <= 0 or yes_bid <= 0:
-                            try:
-                                series = cfg.get("series", "")
-                                md = self.client.get_markets(series_ticker=series, status="open", limit=1) if self.client else {}
-                                mkt = md.get("markets", [{}])[0]
-                                yes_ask = int(float(mkt.get("yes_ask_dollars", "0")) * 100)
-                                yes_bid = int(float(mkt.get("yes_bid_dollars", "0")) * 100)
-                            except Exception:
-                                pass
+                            continue  # WS prices stale — skip, don't block on API
                         if yes_ask > 0 and yes_bid > 0:
                             target_side = "yes" if st["direction"] == "up" else "no"
                             cost = yes_ask if target_side == "yes" else (100 - yes_bid)
@@ -735,7 +752,7 @@ class Crypto15mAgent:
                                 # (WS may be quiet during low-liquidity hours)
                                 self.ticker_contracts[coin_ticker] = self.ticker_contracts.get(coin_ticker, 0) + entry_count
                                 print(f"[{now.strftime('%H:%M:%S')}] {coin} BRTI-ENTRY(fast) {target_side.upper()} {entry_count}x @ {cost}c (dir {st['direction']}, strike ${st['strike']:,.2f})")
-                                self._post_buy(coin_ticker, coin, target_side, cost, target_contracts=entry_count, count=entry_count)
+                                await self._post_buy_async(coin_ticker, coin, target_side, cost, count=entry_count)
                         continue  # done with entry check for this coin
 
                     # ── Flip/stop checks (only when holding) ──
@@ -804,7 +821,7 @@ class Crypto15mAgent:
                         if self.client and not DRY_RUN:
                             try:
                                 tp_id = f"tp-{coin_ticker}-{int(time.time()*1000)}"
-                                self.client.create_order(
+                                await asyncio.to_thread(self.client.create_order,
                                     ticker=coin_ticker, client_order_id=tp_id,
                                     side=old_side, action="sell", count=safe_sell_count, type="limit",
                                     yes_price=yes_bid if old_side == "yes" else None,
@@ -849,7 +866,7 @@ class Crypto15mAgent:
                                 if self.client and not DRY_RUN:
                                     try:
                                         conv_id = f"conv-{coin_ticker}-{int(time.time()*1000)}"
-                                        self.client.create_order(
+                                        await asyncio.to_thread(self.client.create_order,
                                             ticker=coin_ticker, client_order_id=conv_id,
                                             side=st["held_side"], action="buy", count=1, type="limit",
                                             yes_price=yes_ask if st["held_side"] == "yes" else None,
@@ -927,7 +944,7 @@ class Crypto15mAgent:
                             if self.client and not DRY_RUN:
                                 try:
                                     re_id = f"regime-{coin_ticker}-{int(time.time()*1000)}"
-                                    self.client.create_order(
+                                    await asyncio.to_thread(self.client.create_order,
                                         ticker=coin_ticker, client_order_id=re_id,
                                         side=old_side, action="sell", count=safe_sell_count, type="limit",
                                         yes_price=yes_bid if old_side == "yes" else None,
@@ -956,7 +973,7 @@ class Crypto15mAgent:
                             if self.client and not DRY_RUN:
                                 try:
                                     hs_id = f"hstop-{coin_ticker}-{int(time.time()*1000)}"
-                                    self.client.create_order(
+                                    await asyncio.to_thread(self.client.create_order,
                                         ticker=coin_ticker, client_order_id=hs_id,
                                         side=old_side, action="sell", count=safe_sell_count, type="limit",
                                         yes_price=yes_bid if old_side == "yes" else None,
@@ -999,7 +1016,7 @@ class Crypto15mAgent:
                         if self.client and not DRY_RUN:
                             try:
                                 sell_id = f"fflip-sell-{coin_ticker}-{int(time.time()*1000)}"
-                                self.client.create_order(
+                                await asyncio.to_thread(self.client.create_order,
                                     ticker=coin_ticker, client_order_id=sell_id,
                                     side=old_side, action="sell", count=safe_sell_count, type="limit",
                                     yes_price=yes_bid if old_side == "yes" else None,
@@ -1011,7 +1028,7 @@ class Crypto15mAgent:
                                 flip_buy_count = held + 1  # sell N, buy N+1 — double down on new direction
                                 if new_cost <= entry_max:
                                     buy_id = f"fflip-buy-{coin_ticker}-{int(time.time()*1000)}"
-                                    self.client.create_order(
+                                    await asyncio.to_thread(self.client.create_order,
                                         ticker=coin_ticker, client_order_id=buy_id,
                                         side=new_side, action="buy", count=flip_buy_count, type="limit",
                                         yes_price=yes_ask if new_side == "yes" else None,
@@ -1029,7 +1046,9 @@ class Crypto15mAgent:
                                 print(f"  → {coin} Flip error: {e}")
                 except Exception as e:
                     print(f"  Fast flip loop error ({coin}): {e}")
-            await asyncio.sleep(0.5)
+            # Event-driven: sleep only 50ms (yield to event loop for WS ticks)
+            # Trading logic only fires when st["_tick_pending"] is True
+            await asyncio.sleep(0.05)
 
     # ─── Periodic Tasks ───────────────────────────────────────
 
@@ -1075,12 +1094,12 @@ class Crypto15mAgent:
         if synthetic:
             now = time.time()
             st = self.brti_state[coin]
-            # Only append if at least 0.5s since last tick (avoid flooding)
-            if not st["ticks"] or now - st["ticks"][-1][0] >= 0.5:
-                st["ticks"].append((now, synthetic))
-                # Trim to last 16 min
-                cutoff = now - 960
-                st["ticks"] = [(t, v) for t, v in st["ticks"] if t > cutoff]
+            st["ticks"].append((now, synthetic))
+            # Trim to last 16 min
+            cutoff = now - 960
+            st["ticks"] = [(t, v) for t, v in st["ticks"] if t > cutoff]
+            # Signal that new data is available for this coin
+            st["_tick_pending"] = True
 
     async def _coinbase_ws(self):
         """Coinbase Exchange WebSocket — ticker channel for all BRTI coins."""
