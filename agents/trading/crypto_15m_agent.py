@@ -298,6 +298,7 @@ class Crypto15mAgent:
                 "last_conviction_ts": 0.0, # last conviction buy timestamp
                 "flip_confirm_ticks": 0,  # sustained flip signal counter (need 4 = ~2s)
                 "last_tp_ts": 0.0,        # timestamp of last take profit (re-entry cooldown)
+                "entered_this_cycle": False,  # True once we enter; never reset mid-cycle (re-entry detection)
             }
 
         # Exchange price feeds for synthetic index — keyed by (exchange, coin)
@@ -427,6 +428,7 @@ class Crypto15mAgent:
                 st["last_conviction_ts"] = 0
                 st["last_tp_ts"] = 0.0
                 st["flip_confirm_ticks"] = 0
+                st["entered_this_cycle"] = False
                 print(f"  🔄 {_coin} BRTI cycle reset (strike: ${st['strike']:,.2f})")
 
         if tickers and self.ws_connected:
@@ -647,7 +649,7 @@ class Crypto15mAgent:
                     pass
             entry_max = cfg.get("entry_max", 49)
             reentry_max = cfg.get("reentry_max_price", entry_max)
-            is_reentry = st["conviction_adds"] > 0 or st["peak_value"] > 0
+            is_reentry = st.get("entered_this_cycle", False)  # True if we already entered this cycle (went flat, now re-entering)
             max_price = reentry_max if is_reentry else entry_max
             # Timing gates (enforced upstream by 15 <= cycle_sec <= 600 in _evaluate_brti):
             #   cycle_sec 15-600  (min 0:15-10:00): initial entry + re-entry
@@ -668,7 +670,9 @@ class Crypto15mAgent:
                 st["held_side"] = target_side
                 st["entry_price"] = cost
                 st["peak_value"] = cost
-                print(f"[{now.strftime('%H:%M:%S')}] {coin} BRTI-ENTRY {target_side.upper()} 1 @ {cost}c (dir {st['direction']}, strike ${st['strike']:,.2f})")
+                st["entered_this_cycle"] = True
+                reentry_label = " (re-entry)" if is_reentry else ""
+                print(f"[{now.strftime('%H:%M:%S')}] {coin} BRTI-ENTRY{reentry_label} {target_side.upper()} 1 @ {cost}c (dir {st['direction']}, strike ${st['strike']:,.2f})")
                 entry_count = cfg.get("entry_contracts", 1)
                 self._post_buy(ticker, coin, target_side, cost, target_contracts=entry_count, count=entry_count)
                 return
@@ -887,7 +891,8 @@ class Crypto15mAgent:
                         if yes_ask > 0 and yes_bid > 0:
                             target_side = "yes" if st["direction"] == "up" else "no"
                             cost = yes_ask if target_side == "yes" else (100 - yes_bid)
-                            entry_max = cfg.get("entry_max", 79)
+                            is_reentry_fast = st.get("entered_this_cycle", False)
+                            entry_max = cfg.get("reentry_max_price", cfg.get("entry_max", 59)) if is_reentry_fast else cfg.get("entry_max", 49)
                             now = datetime.now()
                             cycle_sec = (now.minute % 15) * 60 + now.second
                             secs_remaining = max(1, 900 - cycle_sec)
@@ -911,7 +916,9 @@ class Crypto15mAgent:
                                 st["held_side"] = target_side
                                 st["entry_price"] = cost
                                 st["peak_value"] = cost
-                                print(f"[{now.strftime('%H:%M:%S')}] {coin} BRTI-ENTRY(fast) {target_side.upper()} {entry_count}x @ {cost}c (dir {st['direction']}, strike ${st['strike']:,.2f})")
+                                st["entered_this_cycle"] = True
+                                reentry_label = "(fast,re-entry)" if is_reentry_fast else "(fast)"
+                                print(f"[{now.strftime('%H:%M:%S')}] {coin} BRTI-ENTRY {reentry_label} {target_side.upper()} {entry_count}x @ {cost}c (dir {st['direction']}, strike ${st['strike']:,.2f})")
                                 self._post_buy(coin_ticker, coin, target_side, cost, target_contracts=entry_count, count=entry_count)
                         continue  # done with entry check for this coin
 
