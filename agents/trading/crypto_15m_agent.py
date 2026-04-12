@@ -891,42 +891,10 @@ class Crypto15mAgent:
                         projected_winning = projected_settlement < st["strike"]
 
                     if was_profitable:
-                        # Final 3 minutes: hold to settlement — smoothed average is locked
-                        if secs_remaining <= 180:
-                            continue
-                        # Only activate trailing stop once we have +8c locked in
-                        # Prevents selling on tiny peaks that barely exceeded entry
-                        if drop_from_peak >= trailing_stop_c and current_value >= st["entry_price"] + 8:
-                            should_flip = True
-                            new_side = "no" if st["held_side"] == "yes" else "yes"
-                            profit = current_value - st["entry_price"]
-                            reason = f"TRAILING STOP (entry:{st['entry_price']}c peak:{st['peak_value']}c now:{current_value}c pnl:{profit:+d}c)"
-                            if projected_winning:
-                                should_flip = False
-                                if drop_from_peak >= trailing_stop_c:
-                                    old_side = st["held_side"]
-                                    sell_price = current_value
-                                    pnl_val = sell_price - st["entry_price"]
-                                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 📉 {coin} PROTECT PROFIT: SELL {old_side.upper()} @ {sell_price}c (peak:{st['peak_value']}c pnl:{pnl_val:+d}c) — flat, watching")
-                                    if self.client and not DRY_RUN:
-                                        try:
-                                            tp_id = f"prot-{coin_ticker}-{int(time.time()*1000)}"
-                                            self.client.create_order(
-                                                ticker=coin_ticker, client_order_id=tp_id,
-                                                side=old_side, action="sell", count=safe_sell_count, type="limit",
-                                                yes_price=yes_bid if old_side == "yes" else None,
-                                                no_price=(100 - yes_ask) if old_side == "no" else None,
-                                            )
-                                            self.ticker_contracts[coin_ticker] = 0
-                                            self.positions[coin_ticker] = []
-                                            st["held_side"] = ""
-                                            st["entry_made"] = False
-                                            st["peak_value"] = 0
-                                            st["entry_price"] = 0
-                                            st["last_flip_ts"] = time.time()
-                                            st["direction"] = ""  # re-evaluate before re-entry
-                                        except Exception as e:
-                                            print(f"  → {coin} Protect profit error: {e}")
+                        # DISABLED: protect profit was selling winners on noise dips.
+                        # 5 protect profits overnight, all sold winning positions.
+                        # Take profit at 95c handles upside. Hold to settlement for everything else.
+                        pass
                     else:
                         # ── SCENARIO 2: Never profitable — three tiers ──
                         hard_stop = cfg.get("stop_loss_hard_c", 20)
