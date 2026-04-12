@@ -64,7 +64,7 @@ BRTI_COIN_CONFIG = {
         "take_profit_c": 95,
         "reentry_max_price": 59,
         "entry_max": 49,
-        "entry_contracts": 3,
+        "entry_contracts": 2,
         "momentum_window": 15,
         "ws_pairs": {"coinbase": "BTC-USD", "kraken": "XBT/USD", "bitstamp": "btcusd", "gemini": "BTCUSD"},
         # Probability model — calibrated from 78 observed 15m cycles (Apr 2026)
