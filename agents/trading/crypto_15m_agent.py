@@ -57,7 +57,7 @@ BRTI_COIN_CONFIG = {
         "stop_loss_hard_c": 20,        # hard stop: max loss regardless (emergency exit, go flat)
         "momentum_flip_distance": 30,  # momentum flip: projected settlement $30+ past strike on wrong side
         "conviction_min_distance": 50,
-        "conviction_min_cycle_sec": 180,
+        "conviction_min_cycle_sec": 600,
         "conviction_max_adds": 2,
         "conviction_cooldown_sec": 60,
         "conviction_max_price": 72,
@@ -84,7 +84,7 @@ BRTI_COIN_CONFIG = {
         "stop_loss_hard_c": 35,          # ETH: wider hard stop — 50/50 contracts swing 30c on noise
         "momentum_flip_distance": 1.00,  # ETH: $1+ wrong side to flip (proportional to BTC $30)
         "conviction_min_distance": 2.00, # ETH: $2+ past strike to add
-        "conviction_min_cycle_sec": 180,
+        "conviction_min_cycle_sec": 600,
         "conviction_max_adds": 2,
         "conviction_cooldown_sec": 60,
         "conviction_max_price": 72,
@@ -111,7 +111,7 @@ BRTI_COIN_CONFIG = {
         "stop_loss_hard_c": 25,
         "momentum_flip_distance": 0.30,  # SOL: $0.30+ wrong side (proportional to BTC $30 at ~$150 price)
         "conviction_min_distance": 0.75, # SOL: $0.75 past strike to add (~0.5σ_15m)
-        "conviction_min_cycle_sec": 180,
+        "conviction_min_cycle_sec": 600,
         "conviction_max_adds": 2,
         "conviction_cooldown_sec": 60,
         "conviction_max_price": 72,
@@ -138,7 +138,7 @@ BRTI_COIN_CONFIG = {
         "stop_loss_hard_c": 25,
         "momentum_flip_distance": 0.02,  # XRP: $0.02+ wrong side (0.8% — proportional to BTC)
         "conviction_min_distance": 0.05, # XRP: $0.05 past strike to add (2% at $2.50)
-        "conviction_min_cycle_sec": 180,
+        "conviction_min_cycle_sec": 600,
         "conviction_max_adds": 2,
         "conviction_cooldown_sec": 60,
         "conviction_max_price": 72,
@@ -649,6 +649,17 @@ class Crypto15mAgent:
             reentry_max = cfg.get("reentry_max_price", entry_max)
             is_reentry = st["conviction_adds"] > 0 or st["peak_value"] > 0
             max_price = reentry_max if is_reentry else entry_max
+            # Timing gates:
+            #   min 0-2:   no entries (existing 2-min guard upstream)
+            #   min 2-5:   initial entry only
+            #   min 5-10:  initial entry + re-entry (up to reentry_max)
+            #   min 10-14: conviction adds only (handled below)
+            #   min 14-15: no new entries
+            entry_cycle_sec = (now.minute % 15) * 60 + now.second
+            if is_reentry and not (300 <= entry_cycle_sec <= 600):
+                return
+            if entry_cycle_sec > 840:  # no new entries after minute 14
+                return
             # Global exposure guard: max 10 contracts across current-cycle tickers only
             total_exposure = sum(self.ticker_contracts.get(t, 0) for t in self.current_tickers.values())
             if total_exposure >= 15:
@@ -1009,6 +1020,7 @@ class Crypto15mAgent:
                     total_exposure = sum(self.ticker_contracts.get(t, 0) for t in self.current_tickers.values())
                     if (st["conviction_adds"] < conviction_max_adds
                             and cycle_sec >= conviction_min_cycle_sec
+                            and cycle_sec <= 840  # no conviction adds after minute 14
                             and (time.time() - st["last_conviction_ts"]) > conviction_cooldown_sec
                             and total_exposure < 15):
                         now_ts = time.time()
@@ -1251,7 +1263,14 @@ class Crypto15mAgent:
                             # Kalshi auto-closes the old position and opens the new one in one order.
                             flip_buy_count = actual_held + 1  # desired new position size
                             flip_total = actual_held + flip_buy_count  # closes old + opens new
-                            taker_price = min(new_cost + 5, 99)  # aggressive limit for immediate taker fill
+                            reentry_max = cfg.get("reentry_max_price", 59)
+                            if new_cost > reentry_max:
+                                print(f"  ⚠️ {coin} Flip buy blocked — {new_cost}c > reentry_max {reentry_max}c — going flat only")
+                                st["direction"] = ""
+                                st["held_side"] = ""
+                                st["entry_made"] = False
+                                continue
+                            taker_price = min(new_cost + 5, reentry_max, 99)  # aggressive but capped at reentry_max
 
                             # Reset state BEFORE order — prevents infinite flip storm if order throws
                             self.ticker_contracts[coin_ticker] = 0
