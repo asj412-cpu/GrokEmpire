@@ -667,6 +667,7 @@ class Crypto15mAgent:
 
             if 10 <= cost <= max_price and time.time() - st.get("last_tp_ts", 0) > 90:
                 st["entry_made"] = True
+                st["entered_this_cycle"] = True
                 st["held_side"] = target_side
                 st["entry_price"] = cost
                 st["peak_value"] = cost
@@ -913,6 +914,7 @@ class Crypto15mAgent:
                             entry_count = cfg.get("entry_contracts", 1)
                             if 15 <= cycle_sec <= 600 and 10 <= cost <= entry_max and time.time() - st.get("last_tp_ts", 0) > 90:
                                 st["entry_made"] = True
+                                st["entered_this_cycle"] = True
                                 st["held_side"] = target_side
                                 st["entry_price"] = cost
                                 st["peak_value"] = cost
