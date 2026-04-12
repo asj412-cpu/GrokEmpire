@@ -484,6 +484,17 @@ class Crypto15mAgent:
                         print(f"  ⚠️ POSITION SYNC: {ticker} tracked={tracked_count} kalshi={actual_count} — correcting")
                         self.ticker_contracts[ticker] = actual_count
                     self.kalshi_positions[ticker] = actual_count
+                    # If Kalshi says 0, our buy was absorbed by residual positions — reset state
+                    if actual_count == 0 and coin:
+                        st = self.brti_state.get(coin, {})
+                        if st.get("held_side"):
+                            print(f"  ⚠️ {coin} position absorbed by residuals — resetting for re-entry")
+                            st["held_side"] = ""
+                            st["entry_made"] = False
+                            st["direction"] = ""  # re-evaluate direction
+                            st["peak_value"] = 0
+                            st["entry_price"] = 0
+                            st["conviction_adds"] = 0
 
             elif action == "sell":
                 self.resting_sells[ticker] = max(0, self.resting_sells.get(ticker, 0) - count)
@@ -614,6 +625,9 @@ class Crypto15mAgent:
     # ─── Settlement History ───────────────────────────────────
 
     def seed_open_positions(self):
+        """Log existing Kalshi positions but DON'T set ticker_contracts.
+        Residual positions from previous processes cause state confusion.
+        Let the fill handler reconcile via post_position_fp instead."""
         if not self.client:
             return
         try:
@@ -621,21 +635,8 @@ class Crypto15mAgent:
             for p in positions.get("event_positions", []):
                 event_ticker = p.get("event_ticker", "")
                 exposure = float(p.get("event_exposure_dollars", 0))
-                if exposure <= 0:
-                    continue
-                count = max(1, round(exposure / 0.50))
-                print(f"  📌 {event_ticker}: live exposure ${exposure:.2f} → ~{count} contracts (blocking) | raw={p}")
-                for series in COINS.values():
-                    if event_ticker.startswith(series):
-                        try:
-                            mkts = self.client.get_markets(event_ticker=event_ticker, limit=5)
-                            for m in mkts.get("markets", []):
-                                t = m.get("ticker", "")
-                                if t:
-                                    self.ticker_contracts[t] = count
-                        except Exception:
-                            pass
-                        break
+                if exposure > 0:
+                    print(f"  📌 {event_ticker}: live exposure ${exposure:.2f} (will reconcile on first fill)")
         except Exception as e:
             print(f"  Position seed error: {e}")
 
