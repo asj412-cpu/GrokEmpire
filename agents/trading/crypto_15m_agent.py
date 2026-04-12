@@ -79,7 +79,7 @@ BRTI_COIN_CONFIG = {
         "take_profit_c": 95,
         "reentry_max_price": 59,
         "entry_max": 79,
-        "entry_contracts": 1,
+        "entry_contracts": 3,
         "momentum_window": 15,
         "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD"},
     },
