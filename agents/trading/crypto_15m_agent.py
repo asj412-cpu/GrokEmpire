@@ -93,9 +93,9 @@ def get_tiered_price_bounds(cycle_sec: float) -> tuple:
     elif cycle_sec < 300:
         return 40, 60
     elif cycle_sec < 600:
-        return 35, 65
+        return 20, 80
     else:
-        return MM_QUOTE_MIN_C, MM_QUOTE_MAX_C
+        return 15, 93
 
 
 def get_tiered_edge(cycle_sec: float) -> int:
