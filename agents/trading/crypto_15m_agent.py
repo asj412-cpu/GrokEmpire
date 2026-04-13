@@ -62,7 +62,7 @@ BRTI_COIN_CONFIG = {
         "tier2_end_sec": 600,          # 10 minutes
         "tier3_max": 85,               # Min 10-14: high conviction only (sBRTI past conviction_min_distance)
         "entry_contracts": 3,
-        "momentum_window": 5,          # 5s detection — catch sBRTI lead before Kalshi reprices
+        "momentum_window": 8,          # 8s detection — catch sBRTI lead before Kalshi reprices
         "ws_pairs": {"coinbase": "BTC-USD", "kraken": "XBT/USD", "bitstamp": "btcusd", "gemini": "BTCUSD"},
     },
     "ETH": {
@@ -90,7 +90,7 @@ BRTI_COIN_CONFIG = {
         "tier2_end_sec": 600,          # 10 minutes
         "tier3_max": 85,               # Min 10-14: high conviction only
         "entry_contracts": 3,
-        "momentum_window": 5,          # 5s detection — catch sBRTI lead before Kalshi reprices
+        "momentum_window": 8,          # 8s detection — catch sBRTI lead before Kalshi reprices
         "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD"},
     },
 }
@@ -106,7 +106,7 @@ BRTI_CONVICTION_COOLDOWN_SEC = 60
 BRTI_CONVICTION_MAX_PRICE = 75
 BRTI_TAKE_PROFIT_C = 95
 BRTI_REENTRY_MAX_PRICE = 59
-BRTI_MOMENTUM_WINDOW = 5
+BRTI_MOMENTUM_WINDOW = 8
 # Tiered entry defaults
 BRTI_TIER1_MAX = 45
 BRTI_TIER1_END_SEC = 420
@@ -539,6 +539,11 @@ class Crypto15mAgent:
 
         # ── Phase 2: Initial entry (tiered pricing) ──
         if st["direction"] and not st["entry_made"] and st["direction"] != "flat":
+            # Re-entry cooldown: after any exit (regime/stop), wait before re-entering
+            flip_cooldown = cfg.get("flip_cooldown_sec", BRTI_FLIP_COOLDOWN_SEC)
+            if st["last_flip_ts"] and (time.time() - st["last_flip_ts"]) < flip_cooldown:
+                return
+
             target_side = "yes" if st["direction"] == "up" else "no"
 
             # Late-cycle guard: in final 2 min, only enter on regime change
@@ -760,7 +765,10 @@ class Crypto15mAgent:
                         continue
 
                     # ── Entry check (WS prices only — no API blocking, tiered pricing) ──
-                    if st["direction"] and not st["entry_made"] and st["direction"] != "flat" and not st["held_side"]:
+                    # Re-entry cooldown: after any exit (regime/stop), wait before re-entering
+                    flip_cooldown = cfg.get("flip_cooldown_sec", BRTI_FLIP_COOLDOWN_SEC)
+                    if st["direction"] and not st["entry_made"] and st["direction"] != "flat" and not st["held_side"] \
+                            and (not st["last_flip_ts"] or (time.time() - st["last_flip_ts"]) >= flip_cooldown):
                         prices = self.ws_prices.get(coin_ticker, {})
                         yes_ask = prices.get("yes_ask", 0)
                         yes_bid = prices.get("yes_bid", 0)
@@ -891,10 +899,10 @@ class Crypto15mAgent:
                                 self.ticker_contracts[coin_ticker] = 0
                                 self.positions[coin_ticker] = []
                                 st["held_side"] = ""
-                                st["entry_made"] = False  # allow re-entry if price dips back
+                                st["entry_made"] = True  # cycle done — don't re-buy what we just sold at 95c
                                 st["peak_value"] = 0
                                 st["entry_price"] = 0
-                                print(f"  → {coin} Sold {held}x @ {current_value}c — watching for re-entry")
+                                print(f"  → {coin} Sold {held}x @ {current_value}c — cycle done, no re-entry")
                             except Exception as e:
                                 print(f"  → {coin} Take profit error: {e}")
                         continue
