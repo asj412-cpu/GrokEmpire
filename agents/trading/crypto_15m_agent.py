@@ -96,6 +96,32 @@ def get_tiered_price_bounds(cycle_sec: float) -> tuple:
         return MM_QUOTE_MIN_C, MM_QUOTE_MAX_C
 
 
+def get_tiered_edge(cycle_sec: float) -> int:
+    """Tighter edge in the safe zone, wider when adverse selection risk is higher.
+      120–300s: 3c  (40-60 round trip zone — both sides uncertain, minimal AS)
+      300–600s: 5c  (direction forming, moderate caution)
+      600+    : 7c  (directional, maximum protection)
+    """
+    if cycle_sec < 300:
+        return 3
+    elif cycle_sec < 600:
+        return 5
+    else:
+        return MM_EDGE_C
+
+
+def get_tiered_contracts(cycle_sec: float) -> int:
+    """More size in the safe zone to increase fill probability.
+      120–300s: 2 contracts  (40-60 zone — aggressive, fills are safe)
+      300–600s: 1 contract   (transitional)
+      600+    : 1 contract   (directional, keep size small)
+    """
+    if cycle_sec < 300:
+        return 2
+    else:
+        return MM_MAX_CONTRACTS
+
+
 def _norm_cdf(x):
     """Standard normal CDF without scipy dependency."""
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
@@ -946,9 +972,10 @@ class Crypto15mAgent:
         r_yes = s - inv_term
         r_no = (100.0 - s) + inv_term  # = 100 − r_yes
 
-        # Optimal full spread δ with floor
+        # Optimal full spread δ with tiered floor (tighter in safe zone, wider when directional)
         as_delta = gamma * (sigma_c ** 2) * T_t + (2.0 / gamma) * math.log(1.0 + gamma / kappa)
-        half = max(float(MM_SPREAD_FLOOR_C), as_delta / 2.0)
+        tiered_floor = float(get_tiered_edge(cycle_sec))
+        half = max(tiered_floor, as_delta / 2.0)
 
         yes_bid = int(round(r_yes - half))
         no_bid = int(round(r_no - half))
@@ -1086,6 +1113,8 @@ class Crypto15mAgent:
 
         if self.client and not DRY_RUN:
             ts_ms = int(time.time() * 1000)
+            cycle_sec = (datetime.now().minute % 15) * 60 + datetime.now().second
+            quote_count = get_tiered_contracts(cycle_sec)
             batch = []
             yes_cid = None
             no_cid = None
@@ -1093,14 +1122,14 @@ class Crypto15mAgent:
                 yes_cid = f"mm-yes-{ticker}-{ts_ms}"
                 batch.append({
                     "ticker": ticker, "client_order_id": yes_cid,
-                    "side": "yes", "action": "buy", "count": MM_MAX_CONTRACTS,
+                    "side": "yes", "action": "buy", "count": quote_count,
                     "type": "limit", "yes_price": yes_bid,
                 })
             if no_bid > 0:
                 no_cid = f"mm-no-{ticker}-{ts_ms}"
                 batch.append({
                     "ticker": ticker, "client_order_id": no_cid,
-                    "side": "no", "action": "buy", "count": MM_MAX_CONTRACTS,
+                    "side": "no", "action": "buy", "count": quote_count,
                     "type": "limit", "no_price": no_bid,
                 })
 
@@ -1124,7 +1153,7 @@ class Crypto15mAgent:
                             r = await asyncio.to_thread(
                                 self.client.create_order,
                                 ticker=ticker, client_order_id=f"mm-yes-{ticker}-{ts_ms}f",
-                                side="yes", action="buy", count=MM_MAX_CONTRACTS,
+                                side="yes", action="buy", count=quote_count,
                                 type="limit", yes_price=yes_bid,
                             )
                             yes_oid = r.get("order", {}).get("order_id")
@@ -1135,7 +1164,7 @@ class Crypto15mAgent:
                             r = await asyncio.to_thread(
                                 self.client.create_order,
                                 ticker=ticker, client_order_id=f"mm-no-{ticker}-{ts_ms}f",
-                                side="no", action="buy", count=MM_MAX_CONTRACTS,
+                                side="no", action="buy", count=quote_count,
                                 type="limit", no_price=no_bid,
                             )
                             no_oid = r.get("order", {}).get("order_id")
