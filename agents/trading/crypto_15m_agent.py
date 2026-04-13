@@ -293,6 +293,7 @@ class Crypto15mAgent:
                 "no_price": 0,            # price of resting NO bid (cents)
                 "quotes_active": False,   # True when 2-sided quote is live
                 "requote_pending": False,  # signal from sBRTI tick to requote
+                "quoting_in_flight": False,  # True while API call in progress — prevents accumulation
             }
 
         # Exchange price feeds for synthetic index — keyed by (exchange, coin)
@@ -337,8 +338,8 @@ class Crypto15mAgent:
                     self.ws = ws
                     print("✅ Kalshi WS connected")
 
-                    # Subscribe to fills
-                    await ws.send(json.dumps({"id": 1, "cmd": "subscribe", "params": {"channels": ["fill"]}}))
+                    # Subscribe to fills + order updates (instant state change notifications)
+                    await ws.send(json.dumps({"id": 1, "cmd": "subscribe", "params": {"channels": ["fill", "user_orders"]}}))
 
                     # Subscribe to current open market tickers
                     await self._subscribe_open_markets()
@@ -803,7 +804,7 @@ class Crypto15mAgent:
         return yes_bid, no_bid
 
     async def mm_cancel_all_quotes(self, coin, reason=""):
-        """Cancel all resting MM orders for a coin. Clears state regardless of cancel success."""
+        """Cancel all resting MM orders for a coin. Uses batch cancel for speed. Clears state regardless."""
         ms = self.mm_state[coin]
         ids_to_cancel = []
         if ms["yes_order_id"]:
@@ -811,12 +812,17 @@ class Crypto15mAgent:
         if ms["no_order_id"]:
             ids_to_cancel.append(ms["no_order_id"])
 
-        for oid in ids_to_cancel:
-            if self.client and not DRY_RUN:
-                try:
-                    await asyncio.to_thread(self.client.cancel_order, oid)
-                except Exception:
-                    pass  # order may already be filled/cancelled
+        if ids_to_cancel and self.client and not DRY_RUN:
+            try:
+                # Batch cancel — single API call for both sides
+                await asyncio.to_thread(self.client.batch_cancel_orders, ids_to_cancel)
+            except Exception:
+                # Fallback: cancel individually
+                for oid in ids_to_cancel:
+                    try:
+                        await asyncio.to_thread(self.client.cancel_order, oid)
+                    except Exception:
+                        pass
 
         # Always clear local state — defensive
         if ids_to_cancel:
@@ -835,10 +841,19 @@ class Crypto15mAgent:
     async def mm_place_quotes(self, coin):
         """Place 2-sided quotes. ALWAYS cancel-before-replace to prevent accumulation."""
         ms = self.mm_state[coin]
+        if ms["quoting_in_flight"]:
+            return  # previous API call still pending — don't stack
         ticker = self.current_tickers.get(coin, "")
         if not ticker:
             return
+        ms["quoting_in_flight"] = True
+        try:
+            await self._mm_place_quotes_inner(coin, ticker, ms)
+        finally:
+            ms["quoting_in_flight"] = False
 
+    async def _mm_place_quotes_inner(self, coin, ticker, ms):
+        """Inner implementation — separated so quoting_in_flight guard wraps everything."""
         # Step 1: Cancel existing quotes FIRST (cancel-before-replace)
         if ms["quotes_active"]:
             await self.mm_cancel_all_quotes(coin, "requote")
@@ -854,42 +869,67 @@ class Crypto15mAgent:
             return
         yes_bid, no_bid = quotes
 
-        # Step 4: Place orders
+        # Step 4: Place BOTH orders in single batch API call (1 round-trip instead of 2)
         yes_oid = None
         no_oid = None
 
-        if yes_bid > 0 and self.client and not DRY_RUN:
-            try:
-                cid = f"mm-yes-{ticker}-{int(time.time()*1000)}"
-                result = await asyncio.to_thread(
-                    self.client.create_order,
-                    ticker=ticker, client_order_id=cid,
-                    side="yes", action="buy", count=MM_MAX_CONTRACTS, type="limit",
-                    yes_price=yes_bid,
-                )
-                yes_oid = result.get("order", {}).get("order_id")
-            except Exception as e:
-                print(f"  → {coin} MM YES bid error: {e}")
+        if self.client and not DRY_RUN:
+            ts_ms = int(time.time() * 1000)
+            batch = []
+            yes_cid = None
+            no_cid = None
+            if yes_bid > 0:
+                yes_cid = f"mm-yes-{ticker}-{ts_ms}"
+                batch.append({
+                    "ticker": ticker, "client_order_id": yes_cid,
+                    "side": "yes", "action": "buy", "count": MM_MAX_CONTRACTS,
+                    "type": "limit", "yes_price": yes_bid,
+                })
+            if no_bid > 0:
+                no_cid = f"mm-no-{ticker}-{ts_ms}"
+                batch.append({
+                    "ticker": ticker, "client_order_id": no_cid,
+                    "side": "no", "action": "buy", "count": MM_MAX_CONTRACTS,
+                    "type": "limit", "no_price": no_bid,
+                })
 
-        if no_bid > 0 and self.client and not DRY_RUN:
-            try:
-                cid = f"mm-no-{ticker}-{int(time.time()*1000)}"
-                result = await asyncio.to_thread(
-                    self.client.create_order,
-                    ticker=ticker, client_order_id=cid,
-                    side="no", action="buy", count=MM_MAX_CONTRACTS, type="limit",
-                    no_price=no_bid,
-                )
-                no_oid = result.get("order", {}).get("order_id")
-            except Exception as e:
-                print(f"  → {coin} MM NO bid error: {e}")
-                # If YES placed but NO failed, cancel YES to avoid 1-sided exposure
-                if yes_oid:
-                    try:
-                        await asyncio.to_thread(self.client.cancel_order, yes_oid)
-                    except Exception:
-                        pass
-                    yes_oid = None
+            if batch:
+                try:
+                    result = await asyncio.to_thread(self.client.batch_create_orders, batch)
+                    # Parse response: {"orders": [{"order": {"order_id": ..., "client_order_id": ...}}, ...]}
+                    for ro in result.get("orders", []):
+                        inner = ro.get("order", ro)  # handle both nested and flat formats
+                        cid = inner.get("client_order_id", "")
+                        oid = inner.get("order_id", "")
+                        if cid == yes_cid:
+                            yes_oid = oid
+                        elif cid == no_cid:
+                            no_oid = oid
+                except Exception as e:
+                    print(f"  → {coin} MM batch order error: {e}")
+                    # Fallback: if batch fails, try individual orders
+                    if yes_bid > 0:
+                        try:
+                            r = await asyncio.to_thread(
+                                self.client.create_order,
+                                ticker=ticker, client_order_id=f"mm-yes-{ticker}-{ts_ms}f",
+                                side="yes", action="buy", count=MM_MAX_CONTRACTS,
+                                type="limit", yes_price=yes_bid,
+                            )
+                            yes_oid = r.get("order", {}).get("order_id")
+                        except Exception:
+                            pass
+                    if no_bid > 0:
+                        try:
+                            r = await asyncio.to_thread(
+                                self.client.create_order,
+                                ticker=ticker, client_order_id=f"mm-no-{ticker}-{ts_ms}f",
+                                side="no", action="buy", count=MM_MAX_CONTRACTS,
+                                type="limit", no_price=no_bid,
+                            )
+                            no_oid = r.get("order", {}).get("order_id")
+                        except Exception:
+                            pass
 
         # Step 5: Update state
         ms["yes_order_id"] = yes_oid
