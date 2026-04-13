@@ -47,12 +47,63 @@ MM_QUOTE_MAX_C = 93            # allow quoting up to 93c — winning side needs 
 MM_RECONCILE_INTERVAL_SEC = 10 # safety reconciliation frequency
 MM_SIGMA = {"BTC": 2.20, "ETH": 0.071}   # calibrated σ/sec from backtest
 MM_SMOOTHING = 0.55            # CF BRTI 1-min average smoothing factor
-MM_MOMENTUM_WEIGHT = 0.015     # momentum adjustment weight
+
+# ─── Avellaneda-Stoikov MM Parameters ───
+MM_GAMMA = {"BTC": 0.3, "ETH": 0.3}        # risk aversion — 0.1 was too low, inventory ran to ±10
+MM_KAPPA_DEFAULT = 0.02                      # fills/sec bootstrap (before live data)
+MM_KAPPA_WINDOW_SEC = 60                     # rolling window for κ estimation
+MM_SPREAD_FLOOR_C = 3                        # minimum half-spread per side (cents)
+MM_MAX_INVENTORY = {"BTC": 7, "ETH": 7}     # max net contracts per coin — was 10, too much exposure
+
+
+def get_tiered_max_inventory(cycle_sec: float, max_inv_cap: int) -> int:
+    """Return inventory cap based on how far into the 15-min cycle we are.
+    Ramps up as we get deeper into the cycle (more info, less adverse-selection risk),
+    then drops to 0 near settlement to avoid last-second gamma exposure.
+      0–120s : 0  (no quoting — too early, price hasn't committed)
+      120–300s: 3  (toe in)
+      300–600s: 7  (mid-cycle main book)
+      600–840s: 10 (full book — well into cycle)
+      840s+   : 0  (settle guard — belt-and-suspenders)
+    """
+    if cycle_sec < 120:
+        return 0
+    elif cycle_sec < 300:
+        return min(3, max_inv_cap)
+    elif cycle_sec < 600:
+        return min(7, max_inv_cap)
+    elif cycle_sec < 840:
+        return min(10, max_inv_cap)
+    else:
+        return 0
+
+
+def get_tiered_price_bounds(cycle_sec: float) -> tuple:
+    """Return (min_price, max_price) for quotes based on cycle phase.
+    Early cycle: restrict to near-50 range (avoid adverse selection at extremes).
+    Late cycle: widen to allow quoting on established direction.
+      0–120s : no quotes (handled by inventory tier returning 0)
+      120–300s: 30–70c  (tight — only near-strike, both sides live)
+      300–600s: 20–80c  (mid — direction forming, still cautious)
+      600–780s: 15–93c  (wide — direction established, information rich)
+      780–840s: 15–93c  (same — last quoting window before guard)
+    """
+    if cycle_sec < 300:
+        return 30, 70
+    elif cycle_sec < 600:
+        return 20, 80
+    else:
+        return MM_QUOTE_MIN_C, MM_QUOTE_MAX_C
 
 
 def _norm_cdf(x):
     """Standard normal CDF without scipy dependency."""
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
+
+
+def _norm_pdf(x):
+    """Standard normal PDF."""
+    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
 
 # ─── BRTI Config ───
 BRTI_SMOOTHING_WINDOW = 60    # 60-second rolling average to simulate settlement smoothing
@@ -301,6 +352,16 @@ class Crypto15mAgent:
                 "quotes_active": False,   # True when 2-sided quote is live
                 "requote_pending": False,  # signal from sBRTI tick to requote
                 "quoting_in_flight": False,  # True while API call in progress — prevents accumulation
+                # Stoikov inventory tracking
+                "inventory": 0,           # net position: YES_bought − NO_bought (+ = long YES)
+                "total_yes_bought": 0,    # contracts bought YES this cycle
+                "total_no_bought": 0,     # contracts bought NO this cycle
+                "avg_yes_cost": 0.0,      # VWAP of YES fills this cycle
+                "avg_no_cost": 0.0,       # VWAP of NO fills this cycle
+                "fill_times": [],         # list of fill timestamps for κ estimation
+                "yes_fill_times": [],     # per-side fill timestamps for sweep detection
+                "no_fill_times": [],
+                "sweep_pause_until": {"yes": 0.0, "no": 0.0},
             }
 
         # Exchange price feeds for synthetic index — keyed by (exchange, coin)
@@ -413,6 +474,15 @@ class Crypto15mAgent:
             # Cancel all MM quotes on rotation — never carry quotes into new market
             if self.mm_mode:
                 asyncio.create_task(self.mm_cancel_all_coins("cycle rotation"))
+                # Reset per-cycle MM inventory (positions from prior cycle settled)
+                for _coin in BRTI_COIN_CONFIG:
+                    ms = self.mm_state[_coin]
+                    ms["inventory"] = 0
+                    ms["total_yes_bought"] = 0
+                    ms["total_no_bought"] = 0
+                    ms["avg_yes_cost"] = 0.0
+                    ms["avg_no_cost"] = 0.0
+                    ms["fill_times"] = []
             # Reset BRTI cycle state for all coins
             for _coin in BRTI_COIN_CONFIG:
                 st = self.brti_state[_coin]
@@ -749,7 +819,8 @@ class Crypto15mAgent:
     # ─── Market-Making Engine ─────────────────────────────────
 
     def mm_compute_fair_value(self, coin):
-        """Compute P(YES) from sBRTI probability model. Returns (yes_fair, no_fair) in cents."""
+        """Compute P(YES) from sBRTI probability model. Returns (yes_fair, no_fair) in cents.
+        Pure Stoikov: no momentum adjustment. Fair value = raw BRTI probability only."""
         st = self.brti_state[coin]
         cfg = BRTI_COIN_CONFIG[coin]
         if st["strike"] <= 0 or not st["ticks"]:
@@ -766,31 +837,19 @@ class Crypto15mAgent:
         smoothed_brti = sum(recent) / len(recent)
         distance = smoothed_brti - st["strike"]
 
-        # Momentum adjustment (same as backtest_prob_model.py)
-        ticks_10s = [v for t, v in st["ticks"] if t > now_ts - 10]
-        ticks_30s = [v for t, v in st["ticks"] if t > now_ts - 30]
-        if len(ticks_10s) >= 2 and len(ticks_30s) >= 2:
-            momentum = (sum(ticks_10s) / len(ticks_10s)) - (sum(ticks_30s) / len(ticks_30s))
-        else:
-            momentum = 0
-        mm_momentum_threshold = cfg.get("mm_momentum_threshold", 0.0)
-        if abs(momentum) < mm_momentum_threshold:
-            momentum = 0
-        momentum_adj = momentum * min(60, secs_remaining) * MM_MOMENTUM_WEIGHT
-
-        # Probability: Φ((distance + momentum_adj) / (σ × √T × smoothing))
+        # Pure probability: Φ(distance / (σ × √T × smoothing)) — no momentum tilt
         sigma = cfg.get("sigma_per_sec", MM_SIGMA.get(coin, 2.20))
         effective_sigma = sigma * (secs_remaining ** 0.5) * MM_SMOOTHING
         if effective_sigma <= 0:
             return 50, 50
 
-        p_yes = _norm_cdf((distance + momentum_adj) / effective_sigma)
+        p_yes = _norm_cdf(distance / effective_sigma)
         yes_fair = max(1, min(99, round(p_yes * 100)))
         no_fair = 100 - yes_fair
         return yes_fair, no_fair
 
     def mm_compute_quotes(self, coin):
-        """Compute bid prices for both sides. Returns (yes_bid, no_bid) or None."""
+        """Compute bid prices for both sides (legacy fixed-edge). Returns (yes_bid, no_bid) or None."""
         yes_fair, no_fair = self.mm_compute_fair_value(coin)
         cfg = BRTI_COIN_CONFIG[coin]
         edge = cfg.get("mm_edge_c", MM_EDGE_C)
@@ -813,6 +872,132 @@ class Crypto15mAgent:
 
         if yes_bid == 0 and no_bid == 0:
             return None
+        return yes_bid, no_bid
+
+    def mm_estimate_kappa(self, coin):
+        """Estimate order arrival rate κ (fills/sec) from rolling 60s window.
+        Returns MM_KAPPA_DEFAULT until enough live data accumulates."""
+        ms = self.mm_state[coin]
+        now = time.time()
+        cutoff = now - MM_KAPPA_WINDOW_SEC
+        ms["fill_times"] = [t for t in ms["fill_times"] if t > cutoff]
+        n = len(ms["fill_times"])
+        if n < 2:
+            return MM_KAPPA_DEFAULT
+        window = min(MM_KAPPA_WINDOW_SEC, now - ms["fill_times"][0])
+        if window <= 0:
+            return MM_KAPPA_DEFAULT
+        return max(MM_KAPPA_DEFAULT, n / window)
+
+    def mm_compute_quotes_as(self, coin):
+        """Avellaneda-Stoikov quote computation.
+        Returns (yes_bid, no_bid) in cents, or None if no valid quote can be placed.
+
+        Design:
+          r_yes = s − q·γ·σ_c²·T_t          (inventory-skewed reservation price)
+          r_no  = (100−s) + q·γ·σ_c²·T_t    (flips attractively when long YES)
+          δ     = γ·σ_c²·T_t + (2/γ)·ln(1+γ/κ)  (full A-S spread)
+          yes_bid = r_yes − δ/2
+          no_bid  = r_no  − δ/2
+        """
+        st = self.brti_state[coin]
+        cfg = BRTI_COIN_CONFIG[coin]
+        ms = self.mm_state[coin]
+
+        if st["strike"] <= 0 or not st["ticks"]:
+            return None
+
+        now_ts = time.time()
+        cycle_sec = (datetime.now().minute % 15) * 60 + datetime.now().second
+
+        # Clamp secs_remaining to settle guard to avoid σ_contract blowup near settlement
+        settle_guard = cfg.get("mm_settle_guard_sec", MM_SETTLE_GUARD_SEC)
+        secs_remaining = max(float(settle_guard), float(900 - cycle_sec))
+        T_t = secs_remaining / 900.0  # fraction of cycle remaining
+
+        # Fair value: pure BRTI probability — no momentum adjustment
+        recent = [v for t, v in st["ticks"] if t > now_ts - 10]
+        if not recent:
+            recent = [st["ticks"][-1][1]]
+        smoothed_brti = sum(recent) / len(recent)
+        distance = smoothed_brti - st["strike"]
+
+        sigma_brti = cfg.get("sigma_per_sec", MM_SIGMA.get(coin, 2.20))
+        effective_sigma = sigma_brti * math.sqrt(secs_remaining) * MM_SMOOTHING
+        if effective_sigma <= 0:
+            return None
+
+        p_yes = _norm_cdf(distance / effective_sigma)
+        s = max(1.0, min(99.0, p_yes * 100.0))  # fair YES price in cents
+
+        # σ_contract: volatility of contract price (cents/√sec-ish)
+        # Derived from delta of binary option: dP/dBRTI = 100·φ(z) / (σ·√T)
+        z = distance / (sigma_brti * math.sqrt(secs_remaining))
+        phi_z = _norm_pdf(z)
+        sigma_c = 100.0 * phi_z / math.sqrt(secs_remaining)
+
+        # A-S parameters
+        q = ms["inventory"]
+        gamma = MM_GAMMA.get(coin, 0.1)
+        kappa = self.mm_estimate_kappa(coin)
+
+        # Reservation prices (inventory skew)
+        inv_term = q * gamma * (sigma_c ** 2) * T_t
+        r_yes = s - inv_term
+        r_no = (100.0 - s) + inv_term  # = 100 − r_yes
+
+        # Optimal full spread δ with floor
+        as_delta = gamma * (sigma_c ** 2) * T_t + (2.0 / gamma) * math.log(1.0 + gamma / kappa)
+        half = max(float(MM_SPREAD_FLOOR_C), as_delta / 2.0)
+
+        yes_bid = int(round(r_yes - half))
+        no_bid = int(round(r_no - half))
+
+        # Inventory cap: tiered by cycle time, with inventory-reducing exception.
+        # If at/above the current tier's cap, suppress the accumulating side only —
+        # keep the opposite side live so existing inventory can be flattened.
+        tiered_max = get_tiered_max_inventory(cycle_sec, MM_MAX_INVENTORY.get(coin, 5))
+        if tiered_max == 0:
+            return None  # tier-0 window (first 2 min or post-settle-guard): no quotes at all
+        if abs(q) >= tiered_max:
+            if q > 0:
+                yes_bid = 0  # at/above YES cap — block YES; NO stays to reduce exposure
+            elif q < 0:
+                no_bid = 0   # at/above NO cap — block NO; YES stays to reduce exposure
+
+        # FIX B: Sweep pause — suppress side for 60s after rapid fills detected
+        now_check = time.time()
+        sweep_pause = ms.get("sweep_pause_until", {})
+        if sweep_pause.get("yes", 0.0) > now_check:
+            yes_bid = 0
+        if sweep_pause.get("no", 0.0) > now_check:
+            no_bid = 0
+
+        # Safety: combined cost < 100c (guaranteed loss otherwise) — same-time check
+        if yes_bid > 0 and no_bid > 0 and yes_bid + no_bid >= 100:
+            return None
+
+        # Cross-time pair cost guard: prevent quoting a side whose fill would combine
+        # with existing avg cost on the other side to lock in a guaranteed loss
+        # (yes_paid + no_paid >= 100c → lose money regardless of settlement outcome)
+        if yes_bid > 0 and ms['total_no_bought'] > 0 and yes_bid + ms['avg_no_cost'] >= 100:
+            yes_bid = 0
+        if no_bid > 0 and ms['total_yes_bought'] > 0 and no_bid + ms['avg_yes_cost'] >= 100:
+            no_bid = 0
+
+        if yes_bid == 0 and no_bid == 0:
+            return None
+
+        # Clamp to time-tiered quote range — tight early (avoid adverse selection), wide late
+        tier_min, tier_max = get_tiered_price_bounds(cycle_sec)
+        if not (tier_min <= yes_bid <= tier_max):
+            yes_bid = 0
+        if not (tier_min <= no_bid <= tier_max):
+            no_bid = 0
+
+        if yes_bid == 0 and no_bid == 0:
+            return None
+
         return yes_bid, no_bid
 
     async def mm_cancel_all_quotes(self, coin, reason=""):
@@ -866,22 +1051,12 @@ class Crypto15mAgent:
 
     async def _mm_place_quotes_inner(self, coin, ticker, ms):
         """Inner implementation — separated so quoting_in_flight guard wraps everything."""
-        # Cooldown guard: don't requote for 90s after a hard stop
-        st = self.brti_state[coin]
-        if time.time() < st.get("mm_requote_cooldown_until", 0):
-            return  # cooling off after a hard stop
-
-        # Step 1: Cancel existing quotes FIRST (cancel-before-replace)
+        # Step 1: Cancel existing quotes FIRST (cancel-before-replace — safety critical)
         if ms["quotes_active"]:
             await self.mm_cancel_all_quotes(coin, "requote")
 
-        # Step 2: Don't quote if we already hold a position
-        st = self.brti_state[coin]
-        if st["held_side"]:
-            return
-
-        # Step 3: Compute new quotes
-        quotes = self.mm_compute_quotes(coin)
+        # Step 2: Compute A-S quotes (inventory-skewed, both sides stay open after fills)
+        quotes = self.mm_compute_quotes_as(coin)
         if not quotes:
             return
         yes_bid, no_bid = quotes
@@ -976,99 +1151,82 @@ class Crypto15mAgent:
 
         yes_fair, no_fair = self.mm_compute_fair_value(coin)
         if ms["quotes_active"]:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 📊 {coin} MM QUOTE: YES bid {yes_bid}c / NO bid {no_bid}c (fair:{yes_fair}/{no_fair})")
+            q = ms["inventory"]
+            kappa = self.mm_estimate_kappa(coin)
+            gamma = MM_GAMMA.get(coin, 0.1)
+            cycle_sec = (datetime.now().minute % 15) * 60 + datetime.now().second
+            t_min, t_max = get_tiered_price_bounds(cycle_sec)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 📊 {coin} MM QUOTE [Stoikov]: YES bid {yes_bid}c / NO bid {no_bid}c | fair:{yes_fair}/{no_fair} | inv={q:+d} | γ={gamma} κ={kappa:.4f}/s | bounds:[{t_min}-{t_max}c]")
 
     async def mm_on_fill(self, coin, filled_side, fill_price):
-        """Handle MM fill: cancel opposite side, hand off to position management."""
+        """Handle MM fill — Avellaneda-Stoikov pure spread capture.
+        DOES NOT cancel the other side. DOES NOT hand off to directional exit logic.
+        Both sides stay open; inventory skew nudges quotes toward the flattening direction.
+        Positions ride to settlement."""
         ms = self.mm_state[coin]
+        now = time.time()
 
-        # IMMEDIATELY cancel opposite side — prevent holding both directions
-        if filled_side == "yes" and ms["no_order_id"]:
-            if self.client and not DRY_RUN:
-                try:
-                    await asyncio.to_thread(self.client.cancel_order, ms["no_order_id"])
-                except Exception:
-                    pass
-            ms["no_order_id"] = None
-        elif filled_side == "no" and ms["yes_order_id"]:
-            if self.client and not DRY_RUN:
-                try:
-                    await asyncio.to_thread(self.client.cancel_order, ms["yes_order_id"])
-                except Exception:
-                    pass
-            ms["yes_order_id"] = None
+        # Track fill time for κ (order arrival rate) self-calibration
+        ms["fill_times"].append(now)
 
-        ms["quotes_active"] = False
-        ms["yes_price"] = 0
-        ms["no_price"] = 0
+        # Sweep detection: per-side fill rate (FIX B)
+        side_times = ms[f"{filled_side}_fill_times"]
+        side_times.append(now)
+        side_times[:] = [t for t in side_times if now - t <= 2.0]
+        if len(side_times) >= 5:
+            ms["sweep_pause_until"][filled_side] = now + 60.0
+            print(f"  ⚠️ SWEEP DETECTED: {len(side_times)} fills in 2s on {filled_side.upper()} — MM paused 60s")
 
-        # Hand off to position management via brti_state
-        st = self.brti_state[coin]
-        st["held_side"] = filled_side
-        st["entry_made"] = True
-        st["entry_price"] = fill_price
-        st["peak_value"] = fill_price
-        st["direction"] = "up" if filled_side == "yes" else "down"
-
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 📊 {coin} MM FILL: {filled_side.upper()} @ {fill_price}c — managing position")
-
-        # Change 2: Momentum filter — exit immediately if 10s sBRTI momentum is adverse to fill
-        now_ts = time.time()
-        ticks_10s = [v for t, v in st["ticks"] if t > now_ts - 10]
-        ticks_30s = [v for t, v in st["ticks"] if t > now_ts - 30]
-        if len(ticks_10s) >= 2 and len(ticks_30s) >= 2:
-            momentum = sum(ticks_10s) / len(ticks_10s) - sum(ticks_30s) / len(ticks_30s)
+        # Update inventory and VWAP tracking
+        if filled_side == "yes":
+            ms["inventory"] += 1
+            ms["total_yes_bought"] += 1
+            prev_cost = ms["avg_yes_cost"] * (ms["total_yes_bought"] - 1)
+            ms["avg_yes_cost"] = (prev_cost + fill_price) / ms["total_yes_bought"]
         else:
-            momentum = 0
-        cfg = BRTI_COIN_CONFIG[coin]
-        mom_threshold = cfg.get("mm_momentum_threshold", 0.5)
-        adverse = (filled_side == "yes" and momentum < -mom_threshold) or \
-                  (filled_side == "no" and momentum > mom_threshold)
-        if adverse:
-            ticker_exit = self.current_tickers.get(coin, "")
-            prices_exit = self.ws_prices.get(ticker_exit, {})
-            yes_bid_exit = prices_exit.get("yes_bid", 0)
-            yes_ask_exit = prices_exit.get("yes_ask", 0)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️  {coin} MM adverse momentum ({momentum:+.3f}, threshold ±{mom_threshold}) — immediate exit")
-            if ticker_exit and self.client and not DRY_RUN and yes_bid_exit > 0 and yes_ask_exit > 0:
-                try:
-                    exit_id = f"mm-momexit-{coin.lower()}-{int(time.time()*1000)}"
-                    await asyncio.to_thread(
-                        self.client.create_order,
-                        ticker=ticker_exit, client_order_id=exit_id,
-                        side=filled_side, action="sell", count=1, type="limit",
-                        yes_price=yes_bid_exit if filled_side == "yes" else None,
-                        no_price=(100 - yes_ask_exit) if filled_side == "no" else None,
-                    )
-                    st["held_side"] = ""
-                    st["entry_made"] = False
-                    st["peak_value"] = 0
-                    st["entry_price"] = 0
-                    st["last_flip_ts"] = time.time()
-                    print(f"  → {coin} MM momentum exit posted")
-                except Exception as e:
-                    print(f"  → {coin} MM momentum exit error: {e}")
+            ms["inventory"] -= 1
+            ms["total_no_bought"] += 1
+            prev_cost = ms["avg_no_cost"] * (ms["total_no_bought"] - 1)
+            ms["avg_no_cost"] = (prev_cost + fill_price) / ms["total_no_bought"]
+
+        kappa = self.mm_estimate_kappa(coin)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 📊 {coin} MM FILL [Stoikov]: {filled_side.upper()} @ {fill_price}c | inventory={ms['inventory']:+d} | κ={kappa:.4f}/s")
+
+        # Log round-trip profit when both sides have fills this cycle
+        if ms["total_yes_bought"] > 0 and ms["total_no_bought"] > 0:
+            pairs = min(ms["total_yes_bought"], ms["total_no_bought"])
+            spread = 100.0 - ms["avg_yes_cost"] - ms["avg_no_cost"]
+            rt_emoji = "💚" if spread >= 0 else "🔴"
+            print(f"  {rt_emoji} {coin} ROUND-TRIP: {pairs}x pairs | avg spread captured={spread:.1f}c (YES@{ms['avg_yes_cost']:.1f}c + NO@{ms['avg_no_cost']:.1f}c)")
+
+        # FIX A: Inventory cap enforcement — cancel resting order on capped side immediately.
+        # mm_compute_quotes_as suppresses NEW quotes at cap, but in-flight resting orders
+        # can still fill. Cancel them the moment we hit the limit.
+        cycle_sec_now = (datetime.now().minute % 15) * 60 + datetime.now().second
+        max_inv = get_tiered_max_inventory(cycle_sec_now, MM_MAX_INVENTORY.get(coin, 5))
+        if abs(ms["inventory"]) >= max_inv and max_inv >= 0:
+            capped_side = "no" if ms["inventory"] <= -max_inv else "yes"
+            print(f"  🛑 INV CAP: {coin} inventory={ms['inventory']:+d} (max {max_inv}) — canceling resting {capped_side.upper()} order")
+            asyncio.create_task(self.mm_cancel_all_quotes(coin, f"inv_cap_{capped_side}"))
+            ms["requote_pending"] = False
+            return
+
+        # DO NOT cancel the other side — keep it live for spread capture + inventory flattening
+        # DO NOT set brti_state["held_side"] — that would trigger directional exit logic
+
+        # Trigger immediate requote so inventory skew updates both live quotes
+        ms["requote_pending"] = True
 
     async def mm_requote_loop(self):
-        """Main MM event loop: update quotes on every sBRTI tick. Runs alongside fast flip loop."""
+        """Main MM event loop: update A-S quotes on every sBRTI tick.
+        Quotes stay live even while holding inventory — that's the whole point of Stoikov."""
         while self.running:
             for coin, cfg in BRTI_COIN_CONFIG.items():
                 try:
                     ms = self.mm_state[coin]
                     st = self.brti_state[coin]
 
-                    # Skip if position held (fast flip loop handles exits)
-                    if st["held_side"]:
-                        if ms["quotes_active"]:
-                            await self.mm_cancel_all_quotes(coin, "position held")
-                        continue
-
-                    # Cooldown after exit: don't re-quote for 30s after hard stop/regime exit
-                    # Prevents immediately getting picked off on the same losing side
-                    if st["last_flip_ts"] and (time.time() - st["last_flip_ts"]) < 30:
-                        continue
-
-                    # Skip if no pending tick (event-driven)
+                    # Skip if no pending tick (event-driven — avoids needless API calls)
                     if not ms["requote_pending"]:
                         continue
                     ms["requote_pending"] = False
@@ -1081,10 +1239,15 @@ class Crypto15mAgent:
 
                     cycle_sec = (datetime.now().minute % 15) * 60 + datetime.now().second
 
-                    # Settlement guard: cancel all quotes per-coin settle window
+                    # Settlement guard: pull quotes N seconds before settlement
+                    # Positions are NOT exited — they settle naturally at 0 or 100
                     settle_guard = cfg.get("mm_settle_guard_sec", MM_SETTLE_GUARD_SEC)
                     if cycle_sec >= (900 - settle_guard):
                         if ms["quotes_active"]:
+                            inv = ms["inventory"]
+                            avg_y = ms["avg_yes_cost"]
+                            avg_n = ms["avg_no_cost"]
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] 📊 {coin} MM SETTLE GUARD: pulling quotes | YES={ms['total_yes_bought']}x@{avg_y:.1f}c NO={ms['total_no_bought']}x@{avg_n:.1f}c inv={inv:+d}")
                             await self.mm_cancel_all_quotes(coin, "settlement guard")
                         continue
 
@@ -1092,8 +1255,8 @@ class Crypto15mAgent:
                     if cycle_sec < ROLLOVER_GUARD_SEC:
                         continue
 
-                    # Compute new quotes
-                    quotes = self.mm_compute_quotes(coin)
+                    # Compute A-S quotes (inventory-skewed)
+                    quotes = self.mm_compute_quotes_as(coin)
                     if not quotes:
                         if ms["quotes_active"]:
                             await self.mm_cancel_all_quotes(coin, "no valid quote")
@@ -1334,6 +1497,10 @@ class Crypto15mAgent:
 
                     # ── Flip/stop checks (only when holding) ──
                     if not st["held_side"]:
+                        continue
+                    # MM mode: positions hold to settlement — no stops, no exits, no flips
+                    # Risk is managed by spread width + inventory cap, not directional exits
+                    if self.mm_mode:
                         continue
                     held = self.ticker_contracts.get(coin_ticker, 0)
                     flip_cooldown = cfg.get("flip_cooldown_sec", BRTI_FLIP_COOLDOWN_SEC)
@@ -1855,10 +2022,8 @@ class Crypto15mAgent:
         else:
             print(f"   Mode: Directional tiered entry (rollback: git checkout v1-directional-tiered)")
         for _coin, _cfg in BRTI_COIN_CONFIG.items():
-            _edge = _cfg.get("mm_edge_c", MM_EDGE_C)
             _guard = _cfg.get("mm_settle_guard_sec", MM_SETTLE_GUARD_SEC)
-            _mom_thr = _cfg.get("mm_momentum_threshold", "n/a")
-            print(f"   {_coin}: σ/sec={_cfg.get('sigma_per_sec', '?')} | hard_stop:{_cfg['stop_loss_hard_c']}c | TP:{_cfg['take_profit_c']}c | mm_edge:{_edge}c | settle_guard:{_guard}s | mom_thr:{_mom_thr}")
+            print(f"   {_coin}: σ/sec={_cfg.get('sigma_per_sec', '?')} | max_inv:{MM_MAX_INVENTORY.get(_coin, 5)} | γ={MM_GAMMA.get(_coin, 0.1)} | κ_default={MM_KAPPA_DEFAULT:.4f}/s | spread_floor:{MM_SPREAD_FLOOR_C}c | settle_guard:{_guard}s")
         print(f"   Source: synthetic (Coinbase+Kraken+Bitstamp+Gemini WebSockets)")
         print(f"   DRY_RUN: {DRY_RUN} | MM_MODE: {self.mm_mode}")
 
