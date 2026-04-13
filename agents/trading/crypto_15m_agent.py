@@ -43,7 +43,7 @@ MM_REQUOTE_THRESHOLD_C = 5     # re-quote if model moved ≥5c (was 2c, caused c
 MM_SETTLE_GUARD_SEC = 60       # cancel all quotes 60s before settlement
 MM_MAX_CONTRACTS = 1           # max contracts per quote side
 MM_QUOTE_MIN_C = 15            # don't quote below 15c — extreme prices = pure adverse selection
-MM_QUOTE_MAX_C = 85            # don't quote above 85c — same reason (87c NO fill lost 35c instantly)
+MM_QUOTE_MAX_C = 93            # allow quoting up to 93c — winning side needs to participate late cycle
 MM_RECONCILE_INTERVAL_SEC = 10 # safety reconciliation frequency
 MM_SIGMA = {"BTC": 2.20, "ETH": 0.071}   # calibrated σ/sec from backtest
 MM_SMOOTHING = 0.55            # CF BRTI 1-min average smoothing factor
