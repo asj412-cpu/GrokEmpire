@@ -505,7 +505,14 @@ class Crypto15mAgent:
         # Priority: position relative to strike > momentum
         # If sBRTI is clearly on one side of strike, that's the direction
         # regardless of tiny momentum noise. Only use momentum when near strike.
-        if not st["direction"] and cycle_sec >= momentum_window and len(st["ticks"]) >= 10:
+        # Re-evaluate if "flat" but sBRTI has since moved clearly past strike
+        needs_eval = not st["direction"]
+        if st["direction"] == "flat" and not st["entry_made"] and st["ticks"]:
+            latest = st["ticks"][-1][1]
+            min_clear = cfg.get("trailing_stop_mid_dist", 20)
+            if abs(latest - st["strike"]) >= min_clear:
+                needs_eval = True  # override flat — sBRTI moved clearly past strike
+        if needs_eval and cycle_sec >= momentum_window and len(st["ticks"]) >= 10:
             recent_ticks = [v for _, v in st["ticks"][-10:]]
             if recent_ticks:
                 recent_avg = sum(recent_ticks) / len(recent_ticks)
