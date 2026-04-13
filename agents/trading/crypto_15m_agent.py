@@ -994,13 +994,7 @@ class Crypto15mAgent:
             elif q < 0:
                 no_bid = 0   # at/above NO cap — block NO; YES stays to reduce exposure
 
-        # FIX B: Sweep pause — suppress side for 60s after rapid fills detected
-        now_check = time.time()
-        sweep_pause = ms.get("sweep_pause_until", {})
-        if sweep_pause.get("yes", 0.0) > now_check:
-            yes_bid = 0
-        if sweep_pause.get("no", 0.0) > now_check:
-            no_bid = 0
+        # Sweep pause removed — price bounds handle adverse selection, not cooldowns
 
         # Safety: combined cost < 100c (guaranteed loss otherwise) — same-time check
         if yes_bid > 0 and no_bid > 0 and yes_bid + no_bid >= 100:
@@ -1200,13 +1194,12 @@ class Crypto15mAgent:
         # Track fill time for κ (order arrival rate) self-calibration
         ms["fill_times"].append(now)
 
-        # Sweep detection: per-side fill rate (FIX B)
+        # Sweep detection: log only, don't pause — price bounds handle AS, not cooldowns
         side_times = ms[f"{filled_side}_fill_times"]
         side_times.append(now)
         side_times[:] = [t for t in side_times if now - t <= 2.0]
         if len(side_times) >= 5:
-            ms["sweep_pause_until"][filled_side] = now + 60.0
-            print(f"  ⚠️ SWEEP DETECTED: {len(side_times)} fills in 2s on {filled_side.upper()} — MM paused 60s")
+            print(f"  ⚡ RAPID FILLS: {len(side_times)} in 2s on {filled_side.upper()} (no pause — bounds protect)")
 
         # Update inventory and VWAP tracking
         if filled_side == "yes":
@@ -1755,7 +1748,7 @@ class Crypto15mAgent:
                                     st["peak_value"] = 0
                                     st["entry_price"] = 0
                                     st["last_flip_ts"] = time.time()
-                                    st["mm_requote_cooldown_until"] = time.time() + 90
+                                    # mm_requote_cooldown removed — A-S inventory skew handles re-entry risk
                                     # Reset direction — stale direction caused re-entry on losing side
                                     st["direction"] = ""
                                     print(f"  → {coin} Direction reset — will re-evaluate before re-entry")
