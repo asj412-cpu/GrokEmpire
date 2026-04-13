@@ -53,27 +53,27 @@ MM_GAMMA = {"BTC": 0.3, "ETH": 0.3}        # risk aversion — 0.1 was too low, 
 MM_KAPPA_DEFAULT = 0.02                      # fills/sec bootstrap (before live data)
 MM_KAPPA_WINDOW_SEC = 60                     # rolling window for κ estimation
 MM_SPREAD_FLOOR_C = 3                        # minimum half-spread per side (cents)
-MM_MAX_INVENTORY = {"BTC": 6, "ETH": 6}     # max net contracts per coin — even number for clean pairs
+MM_MAX_INVENTORY = {"BTC": 8, "ETH": 8}     # max net contracts per coin — even number for clean pairs
 
 
 def get_tiered_max_inventory(cycle_sec: float, max_inv_cap: int) -> int:
     """Return inventory cap based on how far into the 15-min cycle we are.
     Ramps up as we get deeper into the cycle (more info, less adverse-selection risk),
     then drops to 0 near settlement to avoid last-second gamma exposure.
-      0–120s : 2  (ultra-tight 42-52c window, pure coin-flip fills)
-      120–300s: 2  (40-60c round trip zone)
-      300–600s: 4  (mid-cycle main book)
-      600–840s: 6  (full book — well into cycle)
+      0–120s : 4  (42-58c bounds protect against AS, let model accumulate/unwind)
+      120–300s: 4  (40-60c round trip zone — room to work both sides)
+      300–600s: 6  (mid-cycle main book)
+      600–840s: 8  (full book — direction established)
       840s+   : 0  (settle guard — belt-and-suspenders)
     """
     if cycle_sec < 120:
-        return min(2, max_inv_cap)
-    elif cycle_sec < 300:
-        return min(2, max_inv_cap)
-    elif cycle_sec < 600:
         return min(4, max_inv_cap)
+    elif cycle_sec < 300:
+        return min(4, max_inv_cap)
+    elif cycle_sec < 600:
+        return min(6, max_inv_cap)
     elif cycle_sec < 840:
-        return min(max_inv_cap, 6)
+        return min(max_inv_cap, 8)
     else:
         return 0
 
@@ -99,20 +99,16 @@ def get_tiered_price_bounds(cycle_sec: float) -> tuple:
 
 
 def get_tiered_edge(cycle_sec: float) -> int:
-    """Tighter edge in the safe zone, wider when adverse selection risk is higher.
-      0–120s  : 2c  (42-58 ultra-tight — pure coin flip, minimal edge needed)
-      120–300s: 3c  (40-60 round trip zone — both sides uncertain, minimal AS)
-      300–600s: 5c  (direction forming, moderate caution)
-      600+    : 7c  (directional, maximum protection)
+    """Consistent tight edge — price bounds handle AS protection, not the edge.
+      0–120s  : 2c  (42-58 ultra-tight bounds)
+      120–300s: 3c  (40-60 round trip zone)
+      300–600s: 3c  (same — tighter edge = faster unwinds)
+      600+    : 3c  (direction clear, bounds are wide, keep edge tight for fills)
     """
     if cycle_sec < 120:
         return 2
-    elif cycle_sec < 300:
-        return 3
-    elif cycle_sec < 600:
-        return 5
     else:
-        return MM_EDGE_C
+        return 3
 
 
 def get_tiered_contracts(cycle_sec: float) -> int:
