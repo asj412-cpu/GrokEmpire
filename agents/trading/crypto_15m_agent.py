@@ -1,13 +1,17 @@
 """
-Crypto 15m Agent — BRTI Momentum Strategy + Kalshi WebSocket
-=============================================================
+Crypto 15m Agent — BRTI Market Maker + Kalshi WebSocket
+========================================================
 Trades BTC and ETH 15-minute Kalshi markets using a synthetic BRTI index
 built from real-time WebSocket feeds (Coinbase, Kraken, Bitstamp, Gemini).
-Entry from first 15s momentum direction, trailing stop + stop loss via
-500ms fast flip loop, conviction adds on strong projected settlement.
+
+Mode: MM_MODE=true  → Probability-based 2-sided quoting (market maker)
+      MM_MODE=false → Directional tiered entry (legacy, tag: v1-directional-tiered)
+
+Position management (TP, hard stop, regime exit) is shared across both modes.
 """
 
 import asyncio
+import math
 import os
 import csv
 import time
@@ -31,6 +35,24 @@ load_dotenv(override=True)
 BASE_CASH_FLOOR = 40.0
 RATCHET_PERCENT = 0.80
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
+MM_MODE = os.getenv('MM_MODE', 'false').lower() == 'true'
+
+# ─── Market-Making Config ───
+MM_EDGE_C = 7                  # edge below fair value per side (cents) — widened from 3, adverse selection was eating us
+MM_REQUOTE_THRESHOLD_C = 5     # re-quote if model moved ≥5c (was 2c, caused churn)
+MM_SETTLE_GUARD_SEC = 60       # cancel all quotes 60s before settlement
+MM_MAX_CONTRACTS = 1           # max contracts per quote side
+MM_QUOTE_MIN_C = 15            # don't quote below 15c — extreme prices = pure adverse selection
+MM_QUOTE_MAX_C = 85            # don't quote above 85c — same reason (87c NO fill lost 35c instantly)
+MM_RECONCILE_INTERVAL_SEC = 10 # safety reconciliation frequency
+MM_SIGMA = {"BTC": 2.20, "ETH": 0.071}   # calibrated σ/sec from backtest
+MM_SMOOTHING = 0.55            # CF BRTI 1-min average smoothing factor
+MM_MOMENTUM_WEIGHT = 0.015     # momentum adjustment weight
+
+
+def _norm_cdf(x):
+    """Standard normal CDF without scipy dependency."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
 
 # ─── BRTI Config ───
 BRTI_SMOOTHING_WINDOW = 60    # 60-second rolling average to simulate settlement smoothing
@@ -63,6 +85,7 @@ BRTI_COIN_CONFIG = {
         "tier3_max": 85,               # Min 10-14: high conviction only (sBRTI past conviction_min_distance)
         "entry_contracts": 3,
         "momentum_window": 8,          # 8s detection — catch sBRTI lead before Kalshi reprices
+        "sigma_per_sec": 2.20,         # calibrated BTC volatility for probability model
         "ws_pairs": {"coinbase": "BTC-USD", "kraken": "XBT/USD", "bitstamp": "btcusd", "gemini": "BTCUSD"},
     },
     "ETH": {
@@ -91,6 +114,7 @@ BRTI_COIN_CONFIG = {
         "tier3_max": 85,               # Min 10-14: high conviction only
         "entry_contracts": 3,
         "momentum_window": 8,          # 8s detection — catch sBRTI lead before Kalshi reprices
+        "sigma_per_sec": 0.071,        # calibrated ETH volatility for probability model
         "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD"},
     },
 }
@@ -258,6 +282,19 @@ class Crypto15mAgent:
                 "flip_confirm_ticks": 0,  # sustained flip signal counter (need 4 = ~2s)
             }
 
+        # ─── Market-Making State ───
+        self.mm_mode = MM_MODE
+        self.mm_state: Dict[str, dict] = {}
+        for _coin in BRTI_COIN_CONFIG:
+            self.mm_state[_coin] = {
+                "yes_order_id": None,     # resting YES bid order_id from Kalshi
+                "no_order_id": None,      # resting NO bid order_id from Kalshi
+                "yes_price": 0,           # price of resting YES bid (cents)
+                "no_price": 0,            # price of resting NO bid (cents)
+                "quotes_active": False,   # True when 2-sided quote is live
+                "requote_pending": False,  # signal from sBRTI tick to requote
+            }
+
         # Exchange price feeds for synthetic index — keyed by (exchange, coin)
         self.exchange_prices: Dict[str, Dict[str, float]] = defaultdict(dict)   # exchange -> {coin -> price}
         self.exchange_trades: Dict[str, Dict[str, list]] = defaultdict(lambda: defaultdict(list))  # exchange -> {coin -> [(ts, price, vol)]}
@@ -365,6 +402,9 @@ class Crypto15mAgent:
         if rotated:
             self.last_buy_ts.clear()
             self.last_buy_price.clear()
+            # Cancel all MM quotes on rotation — never carry quotes into new market
+            if self.mm_mode:
+                asyncio.create_task(self.mm_cancel_all_coins("cycle rotation"))
             # Reset BRTI cycle state for all coins
             for _coin in BRTI_COIN_CONFIG:
                 st = self.brti_state[_coin]
@@ -442,6 +482,11 @@ class Crypto15mAgent:
                 self.last_buy_ts[ticker] = int(datetime.now().timestamp() * 1000)
                 self.last_buy_price[ticker] = cost_price
                 print(f"  ✅ Bought! Now {self.ticker_contracts[ticker]} contracts @ {cost_price}c (HOLD to settlement)")
+
+                # MM fill detection: cancel opposite side immediately
+                order_cid = msg.get("client_order_id", "")
+                if self.mm_mode and order_cid.startswith("mm-") and coin:
+                    asyncio.create_task(self.mm_on_fill(coin, purchased_side, cost_price))
 
             elif action == "sell":
                 self.resting_sells[ticker] = max(0, self.resting_sells.get(ticker, 0) - count)
@@ -544,8 +589,8 @@ class Crypto15mAgent:
                         st["direction"] = "up" if distance_from_strike > 0 else "down"
                         print(f"[{now.strftime('%H:%M:%S')}] {coin} direction (vs strike): {st['direction']} (index ${recent_avg:,.2f} vs strike ${st['strike']:,.2f})")
 
-        # ── Phase 2: Initial entry (tiered pricing) ──
-        if st["direction"] and not st["entry_made"] and st["direction"] != "flat":
+        # ── Phase 2: Initial entry (tiered pricing) — directional mode only ──
+        if not self.mm_mode and st["direction"] and not st["entry_made"] and st["direction"] != "flat":
             # Re-entry cooldown: after any exit (regime/stop), wait before re-entering
             flip_cooldown = cfg.get("flip_cooldown_sec", BRTI_FLIP_COOLDOWN_SEC)
             if st["last_flip_ts"] and (time.time() - st["last_flip_ts"]) < flip_cooldown:
@@ -693,6 +738,322 @@ class Crypto15mAgent:
         if ticker in self.resting_buys:
             del self.resting_buys[ticker]
 
+    # ─── Market-Making Engine ─────────────────────────────────
+
+    def mm_compute_fair_value(self, coin):
+        """Compute P(YES) from sBRTI probability model. Returns (yes_fair, no_fair) in cents."""
+        st = self.brti_state[coin]
+        cfg = BRTI_COIN_CONFIG[coin]
+        if st["strike"] <= 0 or not st["ticks"]:
+            return 50, 50  # no data → 50/50
+
+        now_ts = time.time()
+        cycle_sec = (datetime.now().minute % 15) * 60 + datetime.now().second
+        secs_remaining = max(1, 900 - cycle_sec)
+
+        # Use 10-second smoothed sBRTI for stability
+        recent = [v for t, v in st["ticks"] if t > now_ts - 10]
+        if not recent:
+            recent = [st["ticks"][-1][1]]
+        smoothed_brti = sum(recent) / len(recent)
+        distance = smoothed_brti - st["strike"]
+
+        # Momentum adjustment (same as backtest_prob_model.py)
+        ticks_10s = [v for t, v in st["ticks"] if t > now_ts - 10]
+        ticks_30s = [v for t, v in st["ticks"] if t > now_ts - 30]
+        if len(ticks_10s) >= 2 and len(ticks_30s) >= 2:
+            momentum = (sum(ticks_10s) / len(ticks_10s)) - (sum(ticks_30s) / len(ticks_30s))
+        else:
+            momentum = 0
+        momentum_adj = momentum * min(60, secs_remaining) * MM_MOMENTUM_WEIGHT
+
+        # Probability: Φ((distance + momentum_adj) / (σ × √T × smoothing))
+        sigma = cfg.get("sigma_per_sec", MM_SIGMA.get(coin, 2.20))
+        effective_sigma = sigma * (secs_remaining ** 0.5) * MM_SMOOTHING
+        if effective_sigma <= 0:
+            return 50, 50
+
+        p_yes = _norm_cdf((distance + momentum_adj) / effective_sigma)
+        yes_fair = max(1, min(99, round(p_yes * 100)))
+        no_fair = 100 - yes_fair
+        return yes_fair, no_fair
+
+    def mm_compute_quotes(self, coin):
+        """Compute bid prices for both sides. Returns (yes_bid, no_bid) or None."""
+        yes_fair, no_fair = self.mm_compute_fair_value(coin)
+        yes_bid = yes_fair - MM_EDGE_C
+        no_bid = no_fair - MM_EDGE_C
+
+        # Safety: combined cost must be < 100c (otherwise guaranteed loss)
+        if yes_bid + no_bid >= 100:
+            return None
+
+        # Clamp to reasonable range
+        if yes_bid < MM_QUOTE_MIN_C:
+            yes_bid = 0  # don't quote
+        if yes_bid > MM_QUOTE_MAX_C:
+            yes_bid = 0
+        if no_bid < MM_QUOTE_MIN_C:
+            no_bid = 0
+        if no_bid > MM_QUOTE_MAX_C:
+            no_bid = 0
+
+        if yes_bid == 0 and no_bid == 0:
+            return None
+        return yes_bid, no_bid
+
+    async def mm_cancel_all_quotes(self, coin, reason=""):
+        """Cancel all resting MM orders for a coin. Clears state regardless of cancel success."""
+        ms = self.mm_state[coin]
+        ids_to_cancel = []
+        if ms["yes_order_id"]:
+            ids_to_cancel.append(ms["yes_order_id"])
+        if ms["no_order_id"]:
+            ids_to_cancel.append(ms["no_order_id"])
+
+        for oid in ids_to_cancel:
+            if self.client and not DRY_RUN:
+                try:
+                    await asyncio.to_thread(self.client.cancel_order, oid)
+                except Exception:
+                    pass  # order may already be filled/cancelled
+
+        # Always clear local state — defensive
+        if ids_to_cancel:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 📊 {coin} MM cancel {len(ids_to_cancel)} quotes ({reason})")
+        ms["yes_order_id"] = None
+        ms["no_order_id"] = None
+        ms["yes_price"] = 0
+        ms["no_price"] = 0
+        ms["quotes_active"] = False
+
+    async def mm_cancel_all_coins(self, reason=""):
+        """Cancel all MM quotes across all coins."""
+        for coin in BRTI_COIN_CONFIG:
+            await self.mm_cancel_all_quotes(coin, reason)
+
+    async def mm_place_quotes(self, coin):
+        """Place 2-sided quotes. ALWAYS cancel-before-replace to prevent accumulation."""
+        ms = self.mm_state[coin]
+        ticker = self.current_tickers.get(coin, "")
+        if not ticker:
+            return
+
+        # Step 1: Cancel existing quotes FIRST (cancel-before-replace)
+        if ms["quotes_active"]:
+            await self.mm_cancel_all_quotes(coin, "requote")
+
+        # Step 2: Don't quote if we already hold a position
+        st = self.brti_state[coin]
+        if st["held_side"]:
+            return
+
+        # Step 3: Compute new quotes
+        quotes = self.mm_compute_quotes(coin)
+        if not quotes:
+            return
+        yes_bid, no_bid = quotes
+
+        # Step 4: Place orders
+        yes_oid = None
+        no_oid = None
+
+        if yes_bid > 0 and self.client and not DRY_RUN:
+            try:
+                cid = f"mm-yes-{ticker}-{int(time.time()*1000)}"
+                result = await asyncio.to_thread(
+                    self.client.create_order,
+                    ticker=ticker, client_order_id=cid,
+                    side="yes", action="buy", count=MM_MAX_CONTRACTS, type="limit",
+                    yes_price=yes_bid,
+                )
+                yes_oid = result.get("order", {}).get("order_id")
+            except Exception as e:
+                print(f"  → {coin} MM YES bid error: {e}")
+
+        if no_bid > 0 and self.client and not DRY_RUN:
+            try:
+                cid = f"mm-no-{ticker}-{int(time.time()*1000)}"
+                result = await asyncio.to_thread(
+                    self.client.create_order,
+                    ticker=ticker, client_order_id=cid,
+                    side="no", action="buy", count=MM_MAX_CONTRACTS, type="limit",
+                    no_price=no_bid,
+                )
+                no_oid = result.get("order", {}).get("order_id")
+            except Exception as e:
+                print(f"  → {coin} MM NO bid error: {e}")
+                # If YES placed but NO failed, cancel YES to avoid 1-sided exposure
+                if yes_oid:
+                    try:
+                        await asyncio.to_thread(self.client.cancel_order, yes_oid)
+                    except Exception:
+                        pass
+                    yes_oid = None
+
+        # Step 5: Update state
+        ms["yes_order_id"] = yes_oid
+        ms["no_order_id"] = no_oid
+        ms["yes_price"] = yes_bid if yes_oid else 0
+        ms["no_price"] = no_bid if no_oid else 0
+        ms["quotes_active"] = bool(yes_oid or no_oid)
+
+        yes_fair, no_fair = self.mm_compute_fair_value(coin)
+        if ms["quotes_active"]:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 📊 {coin} MM QUOTE: YES bid {yes_bid}c / NO bid {no_bid}c (fair:{yes_fair}/{no_fair})")
+
+    async def mm_on_fill(self, coin, filled_side, fill_price):
+        """Handle MM fill: cancel opposite side, hand off to position management."""
+        ms = self.mm_state[coin]
+
+        # IMMEDIATELY cancel opposite side — prevent holding both directions
+        if filled_side == "yes" and ms["no_order_id"]:
+            if self.client and not DRY_RUN:
+                try:
+                    await asyncio.to_thread(self.client.cancel_order, ms["no_order_id"])
+                except Exception:
+                    pass
+            ms["no_order_id"] = None
+        elif filled_side == "no" and ms["yes_order_id"]:
+            if self.client and not DRY_RUN:
+                try:
+                    await asyncio.to_thread(self.client.cancel_order, ms["yes_order_id"])
+                except Exception:
+                    pass
+            ms["yes_order_id"] = None
+
+        ms["quotes_active"] = False
+        ms["yes_price"] = 0
+        ms["no_price"] = 0
+
+        # Hand off to position management via brti_state
+        st = self.brti_state[coin]
+        st["held_side"] = filled_side
+        st["entry_made"] = True
+        st["entry_price"] = fill_price
+        st["peak_value"] = fill_price
+        st["direction"] = "up" if filled_side == "yes" else "down"
+
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 📊 {coin} MM FILL: {filled_side.upper()} @ {fill_price}c — managing position")
+
+    async def mm_requote_loop(self):
+        """Main MM event loop: update quotes on every sBRTI tick. Runs alongside fast flip loop."""
+        while self.running:
+            for coin, cfg in BRTI_COIN_CONFIG.items():
+                try:
+                    ms = self.mm_state[coin]
+                    st = self.brti_state[coin]
+
+                    # Skip if position held (fast flip loop handles exits)
+                    if st["held_side"]:
+                        if ms["quotes_active"]:
+                            await self.mm_cancel_all_quotes(coin, "position held")
+                        continue
+
+                    # Cooldown after exit: don't re-quote for 30s after hard stop/regime exit
+                    # Prevents immediately getting picked off on the same losing side
+                    if st["last_flip_ts"] and (time.time() - st["last_flip_ts"]) < 30:
+                        continue
+
+                    # Skip if no pending tick (event-driven)
+                    if not ms["requote_pending"]:
+                        continue
+                    ms["requote_pending"] = False
+
+                    if st["strike"] <= 0 or not st["ticks"]:
+                        continue
+                    ticker = self.current_tickers.get(coin, "")
+                    if not ticker:
+                        continue
+
+                    cycle_sec = (datetime.now().minute % 15) * 60 + datetime.now().second
+
+                    # Settlement guard: cancel all quotes in last 60s
+                    if cycle_sec >= (900 - MM_SETTLE_GUARD_SEC):
+                        if ms["quotes_active"]:
+                            await self.mm_cancel_all_quotes(coin, "settlement guard")
+                        continue
+
+                    # Rollover guard: no quotes in first 5s
+                    if cycle_sec < ROLLOVER_GUARD_SEC:
+                        continue
+
+                    # Compute new quotes
+                    quotes = self.mm_compute_quotes(coin)
+                    if not quotes:
+                        if ms["quotes_active"]:
+                            await self.mm_cancel_all_quotes(coin, "no valid quote")
+                        continue
+
+                    yes_bid, no_bid = quotes
+
+                    # Only re-quote if price moved enough (avoid churning API)
+                    if ms["quotes_active"]:
+                        yes_moved = abs(yes_bid - ms["yes_price"]) >= MM_REQUOTE_THRESHOLD_C if yes_bid > 0 and ms["yes_price"] > 0 else yes_bid != ms["yes_price"]
+                        no_moved = abs(no_bid - ms["no_price"]) >= MM_REQUOTE_THRESHOLD_C if no_bid > 0 and ms["no_price"] > 0 else no_bid != ms["no_price"]
+                        if not yes_moved and not no_moved:
+                            continue  # prices haven't moved enough
+
+                    await self.mm_place_quotes(coin)
+                except Exception as e:
+                    print(f"  MM requote error ({coin}): {e}")
+
+            await asyncio.sleep(0.05)  # 50ms yield — same as fast flip loop
+
+    async def mm_safety_reconcile_loop(self):
+        """Every 10s: verify resting orders match local state. THE KEY SAFETY BACKSTOP.
+        Prevents the resting order accumulation bug that wiped out cash previously."""
+        while self.running:
+            if self.mm_mode and self.client and not DRY_RUN:
+                for coin in BRTI_COIN_CONFIG:
+                    ticker = self.current_tickers.get(coin, "")
+                    if not ticker:
+                        continue
+                    try:
+                        orders = await asyncio.to_thread(self.client.get_orders, ticker=ticker)
+                        resting_mm = [
+                            o for o in orders.get("orders", [])
+                            if o.get("status") == "resting"
+                            and (o.get("client_order_id") or "").startswith("mm-")
+                        ]
+                        ms = self.mm_state[coin]
+
+                        # SAFETY 1: More than 2 resting MM orders = ACCUMULATION — cancel all
+                        if len(resting_mm) > 2:
+                            print(f"  🚨 SAFETY: {coin} has {len(resting_mm)} resting MM orders (max 2) — canceling ALL")
+                            for o in resting_mm:
+                                try:
+                                    await asyncio.to_thread(self.client.cancel_order, o["order_id"])
+                                except Exception:
+                                    pass
+                            ms["yes_order_id"] = None
+                            ms["no_order_id"] = None
+                            ms["quotes_active"] = False
+
+                        # SAFETY 2: Local says no quotes, but exchange has resting — orphans
+                        elif not ms["quotes_active"] and resting_mm:
+                            print(f"  🚨 SAFETY: {coin} local=inactive but {len(resting_mm)} orphan orders — canceling")
+                            for o in resting_mm:
+                                try:
+                                    await asyncio.to_thread(self.client.cancel_order, o["order_id"])
+                                except Exception:
+                                    pass
+
+                        # SAFETY 3: Local says active but orders gone from exchange
+                        elif ms["quotes_active"]:
+                            resting_ids = {o["order_id"] for o in resting_mm}
+                            if ms["yes_order_id"] and ms["yes_order_id"] not in resting_ids:
+                                ms["yes_order_id"] = None
+                            if ms["no_order_id"] and ms["no_order_id"] not in resting_ids:
+                                ms["no_order_id"] = None
+                            if not ms["yes_order_id"] and not ms["no_order_id"]:
+                                ms["quotes_active"] = False
+
+                    except Exception as e:
+                        print(f"  Safety reconcile error ({coin}): {e}")
+
+            await asyncio.sleep(MM_RECONCILE_INTERVAL_SEC)
+
     # ─── Settlement History ───────────────────────────────────
 
     def seed_open_positions(self):
@@ -793,9 +1154,10 @@ class Crypto15mAgent:
                         continue
 
                     # ── Entry check (WS prices only — no API blocking, tiered pricing) ──
+                    # In MM mode, mm_requote_loop handles entries — skip directional logic
                     # Re-entry cooldown: after any exit (regime/stop), wait before re-entering
                     flip_cooldown = cfg.get("flip_cooldown_sec", BRTI_FLIP_COOLDOWN_SEC)
-                    if st["direction"] and not st["entry_made"] and st["direction"] != "flat" and not st["held_side"] \
+                    if not self.mm_mode and st["direction"] and not st["entry_made"] and st["direction"] != "flat" and not st["held_side"] \
                             and (not st["last_flip_ts"] or (time.time() - st["last_flip_ts"]) >= flip_cooldown):
                         prices = self.ws_prices.get(coin_ticker, {})
                         yes_ask = prices.get("yes_ask", 0)
@@ -1195,6 +1557,9 @@ class Crypto15mAgent:
             st["ticks"] = [(t, v) for t, v in st["ticks"] if t > cutoff]
             # Signal that new data is available for this coin
             st["_tick_pending"] = True
+            # Signal MM requote engine
+            if self.mm_mode and coin in self.mm_state:
+                self.mm_state[coin]["requote_pending"] = True
 
     async def _coinbase_ws(self):
         """Coinbase Exchange WebSocket — ticker channel for all BRTI coins."""
@@ -1367,12 +1732,17 @@ class Crypto15mAgent:
 
     async def run(self):
         coins_str = ", ".join(BRTI_COIN_CONFIG.keys())
-        print(f"🚀 Crypto 15m Agent — BRTI Momentum — {coins_str}")
-        print(f"   Signal: BRTI momentum | {coins_str} | synthetic index from 4 exchanges")
+        mode_str = "MARKET MAKER" if self.mm_mode else "DIRECTIONAL"
+        print(f"🚀 Crypto 15m Agent — {mode_str} — {coins_str}")
+        if self.mm_mode:
+            print(f"   Mode: MM | edge:{MM_EDGE_C}c | requote:{MM_REQUOTE_THRESHOLD_C}c | settle_guard:{MM_SETTLE_GUARD_SEC}s | contracts:{MM_MAX_CONTRACTS}")
+            print(f"   Safety: reconcile every {MM_RECONCILE_INTERVAL_SEC}s | max 2 resting/market | cancel-on-fill | cancel-on-rotate")
+        else:
+            print(f"   Mode: Directional tiered entry (rollback: git checkout v1-directional-tiered)")
         for _coin, _cfg in BRTI_COIN_CONFIG.items():
-            print(f"   {_coin}: tiers={_cfg['tier1_max']}c/{_cfg['tier2_max']}c/{_cfg['tier3_max']}c (0-7/7-10/10-14m) | hard_stop:{_cfg['stop_loss_hard_c']}c | mom_flip:{_cfg['momentum_flip_distance']} | TP:{_cfg['take_profit_c']}c | conv:{_cfg['conviction_min_distance']}@≤{_cfg['conviction_max_price']}c | cd:{_cfg['flip_cooldown_sec']}s")
+            print(f"   {_coin}: σ/sec={_cfg.get('sigma_per_sec', '?')} | hard_stop:{_cfg['stop_loss_hard_c']}c | TP:{_cfg['take_profit_c']}c")
         print(f"   Source: synthetic (Coinbase+Kraken+Bitstamp+Gemini WebSockets)")
-        print(f"   DRY_RUN: {DRY_RUN} | WebSocket mode")
+        print(f"   DRY_RUN: {DRY_RUN} | MM_MODE: {self.mm_mode}")
 
         print("Seeding settlement history...")
         self.seed_settlement_history()
@@ -1386,8 +1756,11 @@ class Crypto15mAgent:
         asyncio.create_task(self._bitstamp_ws())
         asyncio.create_task(self._gemini_ws())
         asyncio.create_task(self.brti_fast_flip_loop())
+        if self.mm_mode:
+            asyncio.create_task(self.mm_requote_loop())
+            asyncio.create_task(self.mm_safety_reconcile_loop())
         brti_coins_str = "+".join(BRTI_COIN_CONFIG.keys())
-        print(f"📡 Synthetic index feeds launching ({brti_coins_str}, 4 exchanges) + fast flip loop (500ms)")
+        print(f"📡 Synthetic index feeds launching ({brti_coins_str}, 4 exchanges) + fast flip loop + {'MM quoting' if self.mm_mode else 'directional entry'}")
 
         # Keep main alive
         while self.running:
