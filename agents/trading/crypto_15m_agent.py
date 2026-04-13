@@ -115,6 +115,7 @@ BRTI_COIN_CONFIG = {
         "entry_contracts": 3,
         "momentum_window": 8,          # 8s detection — catch sBRTI lead before Kalshi reprices
         "sigma_per_sec": 0.071,        # calibrated ETH volatility for probability model
+        "mm_momentum_threshold": 0.25, # ETH: only apply momentum adj if |momentum| >= $0.25 (filters noise)
         "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD"},
     },
 }
@@ -280,6 +281,7 @@ class Crypto15mAgent:
                 "conviction_adds": 0,     # conviction buys this cycle
                 "last_conviction_ts": 0.0, # last conviction buy timestamp
                 "flip_confirm_ticks": 0,  # sustained flip signal counter (need 4 = ~2s)
+                "mm_requote_cooldown_until": 0.0,  # don't requote until this timestamp (post hard-stop)
             }
 
         # ─── Market-Making State ───
@@ -766,6 +768,9 @@ class Crypto15mAgent:
             momentum = (sum(ticks_10s) / len(ticks_10s)) - (sum(ticks_30s) / len(ticks_30s))
         else:
             momentum = 0
+        mm_momentum_threshold = cfg.get("mm_momentum_threshold", 0.0)
+        if abs(momentum) < mm_momentum_threshold:
+            momentum = 0
         momentum_adj = momentum * min(60, secs_remaining) * MM_MOMENTUM_WEIGHT
 
         # Probability: Φ((distance + momentum_adj) / (σ × √T × smoothing))
@@ -854,6 +859,11 @@ class Crypto15mAgent:
 
     async def _mm_place_quotes_inner(self, coin, ticker, ms):
         """Inner implementation — separated so quoting_in_flight guard wraps everything."""
+        # Cooldown guard: don't requote for 90s after a hard stop
+        st = self.brti_state[coin]
+        if time.time() < st.get("mm_requote_cooldown_until", 0):
+            return  # cooling off after a hard stop
+
         # Step 1: Cancel existing quotes FIRST (cancel-before-replace)
         if ms["quotes_active"]:
             await self.mm_cancel_all_quotes(coin, "requote")
@@ -1352,7 +1362,7 @@ class Crypto15mAgent:
                     cycle_now = datetime.now()
                     cycle_sec = (cycle_now.minute % 15) * 60 + cycle_now.second
                     total_exposure = sum(self.ticker_contracts.values())
-                    if (st["conviction_adds"] < conviction_max_adds
+                    if not self.mm_mode and (st["conviction_adds"] < conviction_max_adds
                             and cycle_sec >= conviction_min_cycle_sec
                             and (time.time() - st["last_conviction_ts"]) > conviction_cooldown_sec
                             and total_exposure < 10):
@@ -1483,6 +1493,7 @@ class Crypto15mAgent:
                                     st["peak_value"] = 0
                                     st["entry_price"] = 0
                                     st["last_flip_ts"] = time.time()
+                                    st["mm_requote_cooldown_until"] = time.time() + 90
                                     # Reset direction — stale direction caused re-entry on losing side
                                     st["direction"] = ""
                                     print(f"  → {coin} Direction reset — will re-evaluate before re-entry")
