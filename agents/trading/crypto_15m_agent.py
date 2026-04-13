@@ -68,7 +68,7 @@ BRTI_COIN_CONFIG = {
         "trailing_stop_near_c": 5,     # trailing stop when <$20 from strike (danger zone)
         "trailing_stop_far_dist": 50,  # "far" = $50+ from strike
         "trailing_stop_mid_dist": 20,  # "mid" = $20-50 from strike
-        "stop_loss_hard_c": 20,        # hard stop: max loss regardless (emergency exit, go flat)
+        "stop_loss_hard_c": 28,        # hard stop: max loss regardless (emergency exit, go flat) — raised from 20
         "momentum_flip_distance": 30,  # momentum flip: projected settlement $30+ past strike on wrong side
         "conviction_min_distance": 50,
         "conviction_min_cycle_sec": 180,
@@ -86,6 +86,9 @@ BRTI_COIN_CONFIG = {
         "entry_contracts": 3,
         "momentum_window": 8,          # 8s detection — catch sBRTI lead before Kalshi reprices
         "sigma_per_sec": 2.20,         # calibrated BTC volatility for probability model
+        "mm_edge_c": 10,               # MM edge per side (cents) — widened from 7 for BTC adverse selection
+        "mm_settle_guard_sec": 90,     # cancel MM quotes 90s before settlement (BTC: wider guard)
+        "mm_momentum_threshold": 0.5,  # $0.50 BTC momentum threshold for adverse-fill filter
         "ws_pairs": {"coinbase": "BTC-USD", "kraken": "XBT/USD", "bitstamp": "btcusd", "gemini": "BTCUSD"},
     },
     "ETH": {
@@ -115,6 +118,8 @@ BRTI_COIN_CONFIG = {
         "entry_contracts": 3,
         "momentum_window": 8,          # 8s detection — catch sBRTI lead before Kalshi reprices
         "sigma_per_sec": 0.071,        # calibrated ETH volatility for probability model
+        "mm_edge_c": 7,                # MM edge per side (cents)
+        "mm_settle_guard_sec": 60,     # cancel MM quotes 60s before settlement (ETH: keep current)
         "mm_momentum_threshold": 0.25, # ETH: only apply momentum adj if |momentum| >= $0.25 (filters noise)
         "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD"},
     },
@@ -787,8 +792,10 @@ class Crypto15mAgent:
     def mm_compute_quotes(self, coin):
         """Compute bid prices for both sides. Returns (yes_bid, no_bid) or None."""
         yes_fair, no_fair = self.mm_compute_fair_value(coin)
-        yes_bid = yes_fair - MM_EDGE_C
-        no_bid = no_fair - MM_EDGE_C
+        cfg = BRTI_COIN_CONFIG[coin]
+        edge = cfg.get("mm_edge_c", MM_EDGE_C)
+        yes_bid = yes_fair - edge
+        no_bid = no_fair - edge
 
         # Safety: combined cost must be < 100c (otherwise guaranteed loss)
         if yes_bid + no_bid >= 100:
@@ -878,6 +885,25 @@ class Crypto15mAgent:
         if not quotes:
             return
         yes_bid, no_bid = quotes
+
+        # Step 3b: Taker-fill guard — ensure bids sit BELOW the current ask (passive maker only)
+        # If our bid >= best ask, we'd immediately cross and fill as a taker (not a maker).
+        # Reduce to ask - 1 so the order rests. If that drops below MM_QUOTE_MIN_C, skip it.
+        mkt = self.ws_prices.get(ticker, {})
+        mkt_yes_ask = mkt.get("yes_ask", 0)
+        mkt_yes_bid = mkt.get("yes_bid", 0)
+        if yes_bid > 0 and mkt_yes_ask > 0 and yes_bid >= mkt_yes_ask:
+            yes_bid = mkt_yes_ask - 1
+            if yes_bid < MM_QUOTE_MIN_C:
+                yes_bid = 0
+        # NO ask from the book = 100 - yes_bid (what NO sellers want)
+        no_ask = (100 - mkt_yes_bid) if mkt_yes_bid > 0 else 0
+        if no_bid > 0 and no_ask > 0 and no_bid >= no_ask:
+            no_bid = no_ask - 1
+            if no_bid < MM_QUOTE_MIN_C:
+                no_bid = 0
+        if yes_bid == 0 and no_bid == 0:
+            return
 
         # Step 4: Place BOTH orders in single batch API call (1 round-trip instead of 2)
         yes_oid = None
@@ -986,6 +1012,43 @@ class Crypto15mAgent:
 
         print(f"[{datetime.now().strftime('%H:%M:%S')}] 📊 {coin} MM FILL: {filled_side.upper()} @ {fill_price}c — managing position")
 
+        # Change 2: Momentum filter — exit immediately if 10s sBRTI momentum is adverse to fill
+        now_ts = time.time()
+        ticks_10s = [v for t, v in st["ticks"] if t > now_ts - 10]
+        ticks_30s = [v for t, v in st["ticks"] if t > now_ts - 30]
+        if len(ticks_10s) >= 2 and len(ticks_30s) >= 2:
+            momentum = sum(ticks_10s) / len(ticks_10s) - sum(ticks_30s) / len(ticks_30s)
+        else:
+            momentum = 0
+        cfg = BRTI_COIN_CONFIG[coin]
+        mom_threshold = cfg.get("mm_momentum_threshold", 0.5)
+        adverse = (filled_side == "yes" and momentum < -mom_threshold) or \
+                  (filled_side == "no" and momentum > mom_threshold)
+        if adverse:
+            ticker_exit = self.current_tickers.get(coin, "")
+            prices_exit = self.ws_prices.get(ticker_exit, {})
+            yes_bid_exit = prices_exit.get("yes_bid", 0)
+            yes_ask_exit = prices_exit.get("yes_ask", 0)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️  {coin} MM adverse momentum ({momentum:+.3f}, threshold ±{mom_threshold}) — immediate exit")
+            if ticker_exit and self.client and not DRY_RUN and yes_bid_exit > 0 and yes_ask_exit > 0:
+                try:
+                    exit_id = f"mm-momexit-{coin.lower()}-{int(time.time()*1000)}"
+                    await asyncio.to_thread(
+                        self.client.create_order,
+                        ticker=ticker_exit, client_order_id=exit_id,
+                        side=filled_side, action="sell", count=1, type="limit",
+                        yes_price=yes_bid_exit if filled_side == "yes" else None,
+                        no_price=(100 - yes_ask_exit) if filled_side == "no" else None,
+                    )
+                    st["held_side"] = ""
+                    st["entry_made"] = False
+                    st["peak_value"] = 0
+                    st["entry_price"] = 0
+                    st["last_flip_ts"] = time.time()
+                    print(f"  → {coin} MM momentum exit posted")
+                except Exception as e:
+                    print(f"  → {coin} MM momentum exit error: {e}")
+
     async def mm_requote_loop(self):
         """Main MM event loop: update quotes on every sBRTI tick. Runs alongside fast flip loop."""
         while self.running:
@@ -1018,8 +1081,9 @@ class Crypto15mAgent:
 
                     cycle_sec = (datetime.now().minute % 15) * 60 + datetime.now().second
 
-                    # Settlement guard: cancel all quotes in last 60s
-                    if cycle_sec >= (900 - MM_SETTLE_GUARD_SEC):
+                    # Settlement guard: cancel all quotes per-coin settle window
+                    settle_guard = cfg.get("mm_settle_guard_sec", MM_SETTLE_GUARD_SEC)
+                    if cycle_sec >= (900 - settle_guard):
                         if ms["quotes_active"]:
                             await self.mm_cancel_all_quotes(coin, "settlement guard")
                         continue
@@ -1786,12 +1850,15 @@ class Crypto15mAgent:
         mode_str = "MARKET MAKER" if self.mm_mode else "DIRECTIONAL"
         print(f"🚀 Crypto 15m Agent — {mode_str} — {coins_str}")
         if self.mm_mode:
-            print(f"   Mode: MM | edge:{MM_EDGE_C}c | requote:{MM_REQUOTE_THRESHOLD_C}c | settle_guard:{MM_SETTLE_GUARD_SEC}s | contracts:{MM_MAX_CONTRACTS}")
+            print(f"   Mode: MM | requote:{MM_REQUOTE_THRESHOLD_C}c | contracts:{MM_MAX_CONTRACTS}")
             print(f"   Safety: reconcile every {MM_RECONCILE_INTERVAL_SEC}s | max 2 resting/market | cancel-on-fill | cancel-on-rotate")
         else:
             print(f"   Mode: Directional tiered entry (rollback: git checkout v1-directional-tiered)")
         for _coin, _cfg in BRTI_COIN_CONFIG.items():
-            print(f"   {_coin}: σ/sec={_cfg.get('sigma_per_sec', '?')} | hard_stop:{_cfg['stop_loss_hard_c']}c | TP:{_cfg['take_profit_c']}c")
+            _edge = _cfg.get("mm_edge_c", MM_EDGE_C)
+            _guard = _cfg.get("mm_settle_guard_sec", MM_SETTLE_GUARD_SEC)
+            _mom_thr = _cfg.get("mm_momentum_threshold", "n/a")
+            print(f"   {_coin}: σ/sec={_cfg.get('sigma_per_sec', '?')} | hard_stop:{_cfg['stop_loss_hard_c']}c | TP:{_cfg['take_profit_c']}c | mm_edge:{_edge}c | settle_guard:{_guard}s | mom_thr:{_mom_thr}")
         print(f"   Source: synthetic (Coinbase+Kraken+Bitstamp+Gemini WebSockets)")
         print(f"   DRY_RUN: {DRY_RUN} | MM_MODE: {self.mm_mode}")
 
