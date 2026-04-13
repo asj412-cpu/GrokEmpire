@@ -53,7 +53,7 @@ MM_GAMMA = {"BTC": 0.3, "ETH": 0.3}        # risk aversion — 0.1 was too low, 
 MM_KAPPA_DEFAULT = 0.02                      # fills/sec bootstrap (before live data)
 MM_KAPPA_WINDOW_SEC = 60                     # rolling window for κ estimation
 MM_SPREAD_FLOOR_C = 3                        # minimum half-spread per side (cents)
-MM_MAX_INVENTORY = {"BTC": 7, "ETH": 7}     # max net contracts per coin — was 10, too much exposure
+MM_MAX_INVENTORY = {"BTC": 6, "ETH": 6}     # max net contracts per coin — even number for clean pairs
 
 
 def get_tiered_max_inventory(cycle_sec: float, max_inv_cap: int) -> int:
@@ -69,11 +69,11 @@ def get_tiered_max_inventory(cycle_sec: float, max_inv_cap: int) -> int:
     if cycle_sec < 120:
         return 0
     elif cycle_sec < 300:
-        return min(3, max_inv_cap)
+        return min(2, max_inv_cap)
     elif cycle_sec < 600:
-        return min(7, max_inv_cap)
+        return min(4, max_inv_cap)
     elif cycle_sec < 840:
-        return min(10, max_inv_cap)
+        return min(max_inv_cap, 6)
     else:
         return 0
 
