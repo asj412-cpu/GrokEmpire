@@ -546,6 +546,15 @@ class Crypto15mAgent:
 
             target_side = "yes" if st["direction"] == "up" else "no"
 
+            # Sanity check: don't enter a side that disagrees with current sBRTI
+            # Direction may be stale (set seconds ago) but sBRTI has since crossed strike
+            if st["ticks"]:
+                current_brti = st["ticks"][-1][1]
+                if target_side == "yes" and current_brti < st["strike"]:
+                    return  # direction says up but sBRTI is below strike — stale signal
+                if target_side == "no" and current_brti > st["strike"]:
+                    return  # direction says down but sBRTI is above strike — stale signal
+
             # Late-cycle guard: in final 2 min, only enter on regime change
             secs_remaining = max(1, 900 - cycle_sec)
             late_cycle_min_distance = cfg["conviction_min_distance"]
@@ -680,27 +689,39 @@ class Crypto15mAgent:
     # ─── Settlement History ───────────────────────────────────
 
     def seed_open_positions(self):
+        """On restart, detect and MANAGE inherited positions instead of blocking them."""
         if not self.client:
             return
         try:
-            positions = self.client.get_positions()
-            for p in positions.get("event_positions", []):
-                event_ticker = p.get("event_ticker", "")
-                count = int(float(p.get("total_cost_shares_fp", 0)))
-                if count <= 0:
+            positions = self.client.get_positions(count_filter="position", settlement_status="unsettled")
+            for mp in positions.get("market_positions", []):
+                ticker = mp.get("ticker", "")
+                position_fp = float(mp.get("position_fp", 0))
+                if position_fp == 0 or not ticker:
                     continue
-                for series in COINS.values():
-                    if event_ticker.startswith(series):
-                        try:
-                            mkts = self.client.get_markets(event_ticker=event_ticker, limit=5)
-                            for m in mkts.get("markets", []):
-                                t = m.get("ticker", "")
-                                if t:
-                                    self.ticker_contracts[t] = count
-                            print(f"  📌 {event_ticker}: {count} contracts (blocked)")
-                        except Exception:
-                            pass
+                # Match to a coin
+                coin = None
+                for c, cfg in BRTI_COIN_CONFIG.items():
+                    if ticker.startswith(cfg["series"]):
+                        coin = c
                         break
+                if not coin:
+                    continue
+                # Determine side and count
+                held_side = "yes" if position_fp > 0 else "no"
+                count = int(abs(position_fp))
+                # Estimate entry price from cost
+                exposure = float(mp.get("market_exposure_dollars", "0"))
+                entry_price = int(exposure / count * 100) if count > 0 else 50  # cents
+                # Set up brti_state so fast flip loop manages this position
+                st = self.brti_state[coin]
+                st["held_side"] = held_side
+                st["entry_made"] = True
+                st["entry_price"] = entry_price
+                st["peak_value"] = entry_price
+                self.ticker_contracts[ticker] = count
+                self.current_tickers[coin] = ticker
+                print(f"  📌 {coin} INHERITED: {held_side.upper()} {count}x @ ~{entry_price}c (ticker: {ticker}) — actively managing")
         except Exception as e:
             print(f"  Position seed error: {e}")
 
@@ -776,6 +797,13 @@ class Crypto15mAgent:
                             continue  # WS prices stale — skip, don't block on API
                         if yes_ask > 0 and yes_bid > 0:
                             target_side = "yes" if st["direction"] == "up" else "no"
+                            # Sanity check: don't enter a side that disagrees with current sBRTI
+                            if st["ticks"]:
+                                current_brti = st["ticks"][-1][1]
+                                if target_side == "yes" and current_brti < st["strike"]:
+                                    continue
+                                if target_side == "no" and current_brti > st["strike"]:
+                                    continue
                             cost = yes_ask if target_side == "yes" else (100 - yes_bid)
                             now = datetime.now()
                             cycle_sec = (now.minute % 15) * 60 + now.second
