@@ -998,7 +998,7 @@ class Crypto15mAgent:
                 except Exception as e:
                     print(f"  MM requote error ({coin}): {e}")
 
-            await asyncio.sleep(0.05)  # 50ms yield — same as fast flip loop
+            await asyncio.sleep(0.01)  # 10ms yield — faster requote cycle
 
     async def mm_safety_reconcile_loop(self):
         """Every 10s: verify resting orders match local state. THE KEY SAFETY BACKSTOP.
