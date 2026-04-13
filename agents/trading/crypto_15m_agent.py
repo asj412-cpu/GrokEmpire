@@ -89,9 +89,9 @@ def get_tiered_price_bounds(cycle_sec: float) -> tuple:
       780–840s: 15–93c  (same — last quoting window before guard)
     """
     if cycle_sec < 300:
-        return 30, 70
+        return 40, 60
     elif cycle_sec < 600:
-        return 20, 80
+        return 35, 65
     else:
         return MM_QUOTE_MIN_C, MM_QUOTE_MAX_C
 
