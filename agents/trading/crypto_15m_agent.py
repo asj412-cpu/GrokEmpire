@@ -499,6 +499,14 @@ class Crypto15mAgent:
             # Cancel all MM quotes on rotation — never carry quotes into new market
             if self.mm_mode:
                 asyncio.create_task(self.mm_cancel_all_coins("cycle rotation"))
+                # Cache balance at cycle start for 25% exposure cap
+                if self.client and not DRY_RUN:
+                    try:
+                        bal = self.client.get_balance()
+                        self.mm_cycle_balance = float(bal.get("balance_dollars", 55.0))
+                        print(f"  💰 Cycle balance: ${self.mm_cycle_balance:.2f} | max exposure: ${self.mm_cycle_balance * 0.25:.2f} ({int(self.mm_cycle_balance * 0.25 / 0.50)} contracts)")
+                    except Exception:
+                        self.mm_cycle_balance = getattr(self, 'mm_cycle_balance', 55.0)
                 # Reset per-cycle MM inventory (positions from prior cycle settled)
                 for _coin in BRTI_COIN_CONFIG:
                     ms = self.mm_state[_coin]
@@ -1056,9 +1064,8 @@ class Crypto15mAgent:
 
         # No hard inventory caps — A-S skew manages inventory naturally:
         # inv_term = q·γ·σ²·T pushes reservation price away from the loaded side
-        # At q=+8 the YES bid drops ~30-50c, making it nearly impossible to fill
-        # Only emergency brake at 20 contracts (account protection)
-        if abs(q) >= 20:
+        # Emergency brake per coin — half of global cap (14 per coin)
+        if abs(q) >= 14:
             if q > 0:
                 yes_bid = 0
             else:
@@ -1144,6 +1151,21 @@ class Crypto15mAgent:
 
     async def _mm_place_quotes_inner(self, coin, ticker, ms):
         """Inner implementation — separated so quoting_in_flight guard wraps everything."""
+        # Step 0: Global exposure cap — don't risk more than 25% of account balance
+        # Balance is cached at cycle start (self.mm_cycle_balance), not queried per tick
+        total_contracts = sum(self.ticker_contracts.values())
+        cycle_bal = getattr(self, 'mm_cycle_balance', 55.0)
+        max_exposure_dollars = cycle_bal * 0.25
+        max_exposure_contracts = max(4, int(max_exposure_dollars / 0.50))  # avg 50c per contract
+        if total_contracts >= max_exposure_contracts:
+            # Only allow quotes that REDUCE inventory, not increase it
+            q = ms.get("inventory", 0)
+            if q == 0:
+                # Flat — don't open new positions until exposure drops
+                if ms["quotes_active"]:
+                    await self.mm_cancel_all_quotes(coin, f"exposure cap ({total_contracts} contracts)")
+                return
+
         # Step 1: Cancel existing quotes FIRST (cancel-before-replace — safety critical)
         if ms["quotes_active"]:
             await self.mm_cancel_all_quotes(coin, "requote")
