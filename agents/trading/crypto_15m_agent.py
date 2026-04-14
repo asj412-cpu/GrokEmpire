@@ -50,7 +50,7 @@ MM_SMOOTHING = 0.55            # CF BRTI 1-min average smoothing factor
 
 # ─── Avellaneda-Stoikov MM Parameters ───
 MM_GAMMA = {"BTC": 0.3, "ETH": 0.3}        # risk aversion — 0.1 was too low, inventory ran to ±10
-MM_KAPPA_DEFAULT = 0.02                      # fills/sec bootstrap (before live data)
+MM_KAPPA_DEFAULT = 0.5                        # fills/sec bootstrap — 0.02 made spread too wide, only 1 side quoted
 MM_KAPPA_WINDOW_SEC = 60                     # rolling window for κ estimation
 MM_SPREAD_FLOOR_C = 3                        # minimum half-spread per side (cents)
 MM_MAX_INVENTORY = {"BTC": 8, "ETH": 8}     # max net contracts per coin — even number for clean pairs
@@ -516,6 +516,7 @@ class Crypto15mAgent:
             # Reset BRTI cycle state for all coins
             for _coin in BRTI_COIN_CONFIG:
                 st = self.brti_state[_coin]
+                st["ticks"] = []  # CLEAR ticks — old cycle momentum must not bleed into new cycle
                 st["direction"] = ""
                 st["entry_made"] = False
                 st["held_side"] = ""
@@ -524,6 +525,11 @@ class Crypto15mAgent:
                 st["peak_value"] = 0
                 st["conviction_adds"] = 0
                 st["last_conviction_ts"] = 0
+                # Reset MM fill times so κ starts fresh (0.02 bootstrap)
+                if self.mm_mode and _coin in self.mm_state:
+                    self.mm_state[_coin]["fill_times"] = []
+                    self.mm_state[_coin]["yes_fill_times"] = []
+                    self.mm_state[_coin]["no_fill_times"] = []
                 print(f"  🔄 {_coin} BRTI cycle reset (strike: ${st['strike']:,.2f})")
 
         if tickers and self.ws_connected:
