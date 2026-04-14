@@ -106,9 +106,11 @@ def get_tiered_edge(cycle_sec: float) -> int:
       600+    : 3c  (direction clear, bounds are wide, keep edge tight for fills)
     """
     if cycle_sec < 120:
-        return 2
-    else:
         return 3
+    elif cycle_sec < 300:
+        return 4
+    else:
+        return 5
 
 
 def get_tiered_contracts(cycle_sec: float) -> int:
