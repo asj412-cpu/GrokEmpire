@@ -1153,17 +1153,11 @@ class Crypto15mAgent:
 
     async def _mm_place_quotes_inner(self, coin, ticker, ms):
         """Inner implementation — separated so quoting_in_flight guard wraps everything."""
-        # Step 0: Global exposure cap — HARD LIMIT 10 contracts total, no exceptions
-        # Previous attempts at % balance caps failed because inventory tracking drifts.
-        # This is the nuclear option: count EVERYTHING and hard stop at 10.
-        total_from_ticker = sum(self.ticker_contracts.values())
-        total_from_inventory = sum(abs(self.mm_state[c].get("inventory", 0)) for c in BRTI_COIN_CONFIG)
-        total_contracts = max(total_from_ticker, total_from_inventory)
-        max_exposure_contracts = 10  # hard cap, ~$5 max risk
-        if total_contracts >= max_exposure_contracts:
-            # AT CAP: cancel all quotes, don't place new ones. Period.
+        # Step 0: Per-coin cap — 6 contracts max per coin
+        coin_inv = abs(ms.get("inventory", 0))
+        if coin_inv >= 6:
             if ms["quotes_active"]:
-                await self.mm_cancel_all_quotes(coin, f"hard cap ({total_contracts})")
+                await self.mm_cancel_all_quotes(coin, f"cap ({coin_inv})")
             return
 
         # Step 1: Cancel existing quotes FIRST (cancel-before-replace — safety critical)
@@ -1315,15 +1309,14 @@ class Crypto15mAgent:
             rt_emoji = "💚" if spread >= 0 else "🔴"
             print(f"  {rt_emoji} {coin} ROUND-TRIP: {pairs}x pairs | avg spread captured={spread:.1f}c (YES@{ms['avg_yes_cost']:.1f}c + NO@{ms['avg_no_cost']:.1f}c)")
 
-        # HARD CAP ENFORCEMENT — runs on EVERY fill, cannot be bypassed
-        # Cancel ALL resting orders across ALL coins the moment we hit 10 total
-        total_inv = sum(abs(self.mm_state[c].get("inventory", 0)) for c in BRTI_COIN_CONFIG)
-        if total_inv >= 10:
-            print(f"  🛑 HARD CAP: total inventory {total_inv} >= 10 — canceling ALL quotes ALL coins")
-            for c in BRTI_COIN_CONFIG:
-                asyncio.create_task(self.mm_cancel_all_quotes(c, f"hard cap {total_inv}"))
-                self.mm_state[c]["requote_pending"] = False  # don't re-quote
-            return  # don't trigger requote
+        # PER-COIN HARD CAP — runs on EVERY fill, cannot be bypassed
+        # Cancel THIS coin's quotes when it hits 6. Other coin keeps trading independently.
+        coin_inv = abs(ms.get("inventory", 0))
+        if coin_inv >= 6:
+            print(f"  🛑 HARD CAP: {coin} inventory {ms['inventory']:+d} (±6 max) — canceling {coin} quotes")
+            asyncio.create_task(self.mm_cancel_all_quotes(coin, f"hard cap {coin_inv}"))
+            ms["requote_pending"] = False
+            return  # don't trigger requote for this coin
 
         # Force immediate requote so inventory skew updates both live quotes
         ms["requote_pending"] = True
