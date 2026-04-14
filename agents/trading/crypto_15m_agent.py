@@ -1025,17 +1025,20 @@ class Crypto15mAgent:
         yes_bid = int(round(r_yes - half))
         no_bid = int(round(r_no - half))
 
-        # Inventory cap: tiered by cycle time, with inventory-reducing exception.
-        # If at/above the current tier's cap, suppress the accumulating side only —
-        # keep the opposite side live so existing inventory can be flattened.
-        tiered_max = get_tiered_max_inventory(cycle_sec, MM_MAX_INVENTORY.get(coin, 5))
+        # Settlement guard: no quotes in last 60-90s (tiered_max returns 0)
+        tiered_max = get_tiered_max_inventory(cycle_sec, MM_MAX_INVENTORY.get(coin, 8))
         if tiered_max == 0:
-            return None  # tier-0 window (first 2 min or post-settle-guard): no quotes at all
-        if abs(q) >= tiered_max:
+            return None  # settle guard or pre-open
+
+        # No hard inventory caps — A-S skew manages inventory naturally:
+        # inv_term = q·γ·σ²·T pushes reservation price away from the loaded side
+        # At q=+8 the YES bid drops ~30-50c, making it nearly impossible to fill
+        # Only emergency brake at 20 contracts (account protection)
+        if abs(q) >= 20:
             if q > 0:
-                yes_bid = 0  # at/above YES cap — block YES; NO stays to reduce exposure
-            elif q < 0:
-                no_bid = 0   # at/above NO cap — block NO; YES stays to reduce exposure
+                yes_bid = 0
+            else:
+                no_bid = 0
 
         # Sweep pause removed — price bounds handle adverse selection, not cooldowns
 
@@ -1266,21 +1269,11 @@ class Crypto15mAgent:
             rt_emoji = "💚" if spread >= 0 else "🔴"
             print(f"  {rt_emoji} {coin} ROUND-TRIP: {pairs}x pairs | avg spread captured={spread:.1f}c (YES@{ms['avg_yes_cost']:.1f}c + NO@{ms['avg_no_cost']:.1f}c)")
 
-        # FIX A: Inventory cap enforcement — cancel resting order on capped side immediately.
-        # mm_compute_quotes_as suppresses NEW quotes at cap, but in-flight resting orders
-        # can still fill. Cancel them the moment we hit the limit.
-        cycle_sec_now = (datetime.now().minute % 15) * 60 + datetime.now().second
-        max_inv = get_tiered_max_inventory(cycle_sec_now, MM_MAX_INVENTORY.get(coin, 5))
-        # Use real position count for cap enforcement, not just internal counter
-        ticker_now = self.current_tickers.get(coin, "")
-        real_pos = self.ticker_contracts.get(ticker_now, 0)
-        effective_inv = max(abs(ms["inventory"]), real_pos)  # whichever is larger
-        if effective_inv >= max_inv and max_inv >= 0:
-            capped_side = "no" if ms["inventory"] <= -max_inv else "yes"
-            print(f"  🛑 INV CAP: {coin} inv={ms['inventory']:+d} real={real_pos} (max {max_inv}) — canceling resting {capped_side.upper()} order")
-            asyncio.create_task(self.mm_cancel_all_quotes(coin, f"inv_cap_{capped_side}"))
-            ms["requote_pending"] = False
-            return
+        # Inventory management: A-S skew handles it — no hard caps.
+        # On next requote, the model widens the loaded side and tightens the unwind side.
+        # Emergency brake only at 20 contracts (in mm_compute_quotes_as).
+        # Force immediate requote so skew adjusts to new inventory level
+        ms["requote_pending"] = True
 
         # DO NOT cancel the other side — keep it live for spread capture + inventory flattening
         # DO NOT set brti_state["held_side"] — that would trigger directional exit logic
