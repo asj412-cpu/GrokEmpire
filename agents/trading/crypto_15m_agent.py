@@ -1094,9 +1094,11 @@ class Crypto15mAgent:
             s_check = max(1.0, min(99.0, raw_p * 100.0))
         else:
             s_check = s
-        if s_check >= 80:
+        # 90/10 suppression — wider than 80/20, allows more round trips in 80-90 zone
+        # WATCH: if adverse fills appear in this zone, revert to 80/20
+        if s_check >= 90:
             no_bid = 0
-        if s_check <= 20:
+        if s_check <= 10:
             yes_bid = 0
 
         # Settlement guard: no quotes in last 60-90s (tiered_max returns 0)
