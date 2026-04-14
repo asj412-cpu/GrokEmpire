@@ -1409,55 +1409,8 @@ class Crypto15mAgent:
                                         print(f"  → {coin} MM TP error: {e}")
                                 continue  # skip to next tick — re-quote on next iteration
 
-                    # ── MM Active Exit: sBRTI moving against us → cross the spread to get out NOW ──
-                    if inv != 0 and abs(inv) >= 3 and st["ticks"] and len(st["ticks"]) >= 10:
-                        now_ts = time.time()
-                        t3 = [v for t, v in st["ticks"] if t > now_ts - 3]
-                        t10 = [v for t, v in st["ticks"] if t > now_ts - 10]
-                        if t3 and t10:
-                            spot = t3[-1]  # latest tick
-                            avg10 = sum(t10) / len(t10)
-                            momentum = spot - avg10
-
-                            # Thresholds: BTC $5, ETH $0.30
-                            threshold = 5.0 if st["strike"] > 10000 else 0.30
-                            adverse = (inv > 0 and momentum < -threshold) or (inv < 0 and momentum > threshold)
-
-                            if adverse:
-                                prices_ae = self.ws_prices.get(ticker, {})
-                                yb = prices_ae.get("yes_bid", 0)
-                                ya = prices_ae.get("yes_ask", 0)
-                                if yb > 0 and ya > 0:
-                                    sell_side = "yes" if inv > 0 else "no"
-                                    held_count = abs(inv)
-                                    # Cross the spread — sell at market (bid for YES, 100-ask for NO)
-                                    exit_val = yb if sell_side == "yes" else (100 - ya)
-                                    avg_cost = ms["avg_yes_cost"] if inv > 0 else ms["avg_no_cost"]
-
-                                    # Cancel all resting quotes first
-                                    await self.mm_cancel_all_quotes(coin, "active exit")
-
-                                    if self.client and not DRY_RUN:
-                                        try:
-                                            ae_id = f"mm-aexit-{coin.lower()}-{int(time.time()*1000)}"
-                                            await asyncio.to_thread(
-                                                self.client.create_order,
-                                                ticker=ticker, client_order_id=ae_id,
-                                                side=sell_side, action="sell", count=held_count, type="limit",
-                                                yes_price=yb if sell_side == "yes" else None,
-                                                no_price=(100 - ya) if sell_side == "no" else None,
-                                            )
-                                            pnl = exit_val - avg_cost
-                                            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔥 {coin} MM ACTIVE EXIT: {sell_side.upper()} {held_count}x @ {exit_val}c (entry:{avg_cost:.0f}c pnl:{pnl:+.0f}c) | momentum {momentum:+.1f}")
-                                            ms["inventory"] = 0
-                                            ms["total_yes_bought"] = 0
-                                            ms["total_no_bought"] = 0
-                                            ms["avg_yes_cost"] = 0.0
-                                            ms["avg_no_cost"] = 0.0
-                                            self.ticker_contracts[ticker] = 0
-                                        except Exception as e:
-                                            print(f"  → {coin} MM active exit error: {e}")
-                                    continue
+                    # Active exit disabled — thresholds too sensitive, caused whipsawing losses
+                    # TODO: paper trade with higher thresholds (BTC $15+, ETH $1.00+) before re-enabling
 
                     # Settlement guard: pull quotes N seconds before settlement
                     # Positions are NOT exited — they settle naturally at 0 or 100
