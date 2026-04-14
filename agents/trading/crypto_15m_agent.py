@@ -306,7 +306,7 @@ class Crypto15mAgent:
                 print("🔥 LIVE Kalshi client ready")
                 try:
                     bal = self.client.get_balance()
-                    self.mm_cycle_balance = float(bal.get("balance_dollars", 55.0))
+                    self.mm_cycle_balance = float(bal.get("balance", 5000)) / 100.0  # balance is in cents
                     print(f"  💰 Starting balance: ${self.mm_cycle_balance:.2f}")
                 except Exception:
                     self.mm_cycle_balance = 55.0
@@ -512,7 +512,7 @@ class Crypto15mAgent:
                 if self.client and not DRY_RUN:
                     try:
                         bal = self.client.get_balance()
-                        self.mm_cycle_balance = float(bal.get("balance_dollars", 55.0))
+                        self.mm_cycle_balance = float(bal.get("balance", 5000)) / 100.0  # balance is in cents
                         print(f"  💰 Cycle balance: ${self.mm_cycle_balance:.2f} | max exposure: ${self.mm_cycle_balance * 0.25:.2f} ({int(self.mm_cycle_balance * 0.25 / 0.50)} contracts)")
                     except Exception:
                         self.mm_cycle_balance = getattr(self, 'mm_cycle_balance', 55.0)
@@ -1073,8 +1073,8 @@ class Crypto15mAgent:
 
         # No hard inventory caps — A-S skew manages inventory naturally:
         # inv_term = q·γ·σ²·T pushes reservation price away from the loaded side
-        # Emergency brake per coin — half of global cap (14 per coin)
-        if abs(q) >= 14:
+        # Emergency brake per coin — hard limit regardless of balance
+        if abs(q) >= 12:
             if q > 0:
                 yes_bid = 0
             else:
@@ -1097,12 +1097,19 @@ class Crypto15mAgent:
         if yes_bid == 0 and no_bid == 0:
             return None
 
-        # Clamp to time-tiered quote range — tight early (avoid adverse selection), wide late
+        # Clamp to quote range
         tier_min, tier_max = get_tiered_price_bounds(cycle_sec)
         if not (tier_min <= yes_bid <= tier_max):
             yes_bid = 0
         if not (tier_min <= no_bid <= tier_max):
             no_bid = 0
+
+        # Exposure cap: at cap, only allow unwind side — suppress the accumulating side
+        if ms.get("_exposure_capped", False):
+            if q > 0:
+                yes_bid = 0  # long YES, only quote NO to unwind
+            elif q < 0:
+                no_bid = 0   # long NO, only quote YES to unwind
 
         if yes_bid == 0 and no_bid == 0:
             return None
@@ -1161,19 +1168,26 @@ class Crypto15mAgent:
     async def _mm_place_quotes_inner(self, coin, ticker, ms):
         """Inner implementation — separated so quoting_in_flight guard wraps everything."""
         # Step 0: Global exposure cap — don't risk more than 25% of account balance
-        # Balance is cached at cycle start (self.mm_cycle_balance), not queried per tick
-        total_contracts = sum(self.ticker_contracts.values())
-        cycle_bal = getattr(self, 'mm_cycle_balance', 55.0)
+        # Use BOTH ticker_contracts AND mm_state inventory — whichever is higher
+        # ticker_contracts can be stale (cleared on rotation), inventory tracks fills in real-time
+        total_from_ticker = sum(self.ticker_contracts.values())
+        total_from_inventory = sum(abs(self.mm_state[c].get("inventory", 0)) for c in BRTI_COIN_CONFIG)
+        total_contracts = max(total_from_ticker, total_from_inventory)
+        cycle_bal = getattr(self, 'mm_cycle_balance', 50.0)
         max_exposure_dollars = cycle_bal * 0.25
-        max_exposure_contracts = max(4, int(max_exposure_dollars / 0.50))  # avg 50c per contract
+        max_exposure_contracts = max(4, int(max_exposure_dollars / 0.50))
         if total_contracts >= max_exposure_contracts:
-            # Only allow quotes that REDUCE inventory, not increase it
             q = ms.get("inventory", 0)
             if q == 0:
                 # Flat — don't open new positions until exposure drops
                 if ms["quotes_active"]:
                     await self.mm_cancel_all_quotes(coin, f"exposure cap ({total_contracts} contracts)")
                 return
+            # Loaded — let the model run but we'll suppress the accumulating side below
+            # (flag checked after quote computation to zero out the wrong side)
+            ms["_exposure_capped"] = True
+        else:
+            ms["_exposure_capped"] = False
 
         # Step 1: Cancel existing quotes FIRST (cancel-before-replace — safety critical)
         if ms["quotes_active"]:
