@@ -491,7 +491,10 @@ class Crypto15mAgent:
                 print(f"  Open market lookup error {coin}: {e}")
 
         # Reset cooldowns and avg-down state on cycle rotation
-        if rotated:
+        # ONLY reset if the ticker actually changed — not on every 30s refresh
+        # The 30s refresh can return the same ticker, which was falsely resetting inventory
+        if rotated and not getattr(self, '_last_rotation_tickers', None) == set(self.current_tickers.values()):
+            self._last_rotation_tickers = set(self.current_tickers.values())
             self.last_buy_ts.clear()
             self.last_buy_price.clear()
             # Clear settled positions — old cycle contracts must not carry into new cycle
@@ -1053,9 +1056,13 @@ class Crypto15mAgent:
         yes_bid = int(round(r_yes - half))
         no_bid = int(round(r_no - half))
 
-        # Both sides stay live — pure A-S market making for round trips
-        # sBRTI speed shifts fair value tick-by-tick, skewing quotes toward the winning side
-        # 10-contract cap + 95c TP are the safety rails
+        # 80/20 suppression: don't quote the losing side when direction is clear
+        # Pure both-sides A-S lost money on trending cycles — wrong side accumulates
+        # Oscillation detector will replace this with smarter regime-based logic
+        if s >= 80:
+            no_bid = 0
+        if s <= 20:
+            yes_bid = 0
 
         # Settlement guard: no quotes in last 60-90s (tiered_max returns 0)
         tiered_max = get_tiered_max_inventory(cycle_sec, MM_MAX_INVENTORY.get(coin, 8))
