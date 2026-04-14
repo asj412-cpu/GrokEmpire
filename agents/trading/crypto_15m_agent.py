@@ -41,11 +41,9 @@ MM_MODE = os.getenv('MM_MODE', 'false').lower() == 'true'
 MM_EDGE_C = 6                  # edge below fair value per side (cents)
 MM_REQUOTE_THRESHOLD_C = 3     # re-quote if model moved ≥3c
 MM_SETTLE_GUARD_SEC = 60       # cancel all quotes 60s before settlement
-MM_LATE_CYCLE_SNIPE_THRESHOLD_C = 11  # |edge_c| threshold to trigger late-cycle sniper mode
-MM_STRONG_EDGE_THRESHOLD_C = 15       # raised from 12 — less jumpy sniper
-MM_SUPPRESSION_FLOOR_C = 18           # never quote losing side if |edge| > 18c
-MM_UNWIND_BONUS_C = 15                # raised from 12 for more attractive unwind
-MM_FLATTEN_DELAY_SEC = 30             # only flatten after sustained wrong-side edge
+MM_EARLY_MAX_INV = 1                   # first 5 min — force round-tripping, max 1 contract
+MM_STRONG_EDGE_THRESHOLD_C = 12        # |edge| > 12c → sniper mode
+MM_UNWIND_BONUS_C = 12                 # extra cents on unwind side when holding inventory
 MM_MAX_CONTRACTS = 1           # max contracts per quote side
 MM_QUOTE_MIN_C = 15            # don't quote below 15c — extreme prices = pure adverse selection
 MM_QUOTE_MAX_C = 93            # allow quoting up to 93c — winning side needs to participate late cycle
@@ -54,7 +52,7 @@ MM_SIGMA = {"BTC": 2.20, "ETH": 0.071}   # calibrated σ/sec from backtest
 MM_SMOOTHING = 0.55            # CF BRTI 1-min average smoothing factor
 
 # ─── Avellaneda-Stoikov MM Parameters ───
-MM_GAMMA = {"BTC": 0.8, "ETH": 0.8}        # risk aversion — 0.3 filled to max every cycle, wider spreads = fewer but better fills
+MM_GAMMA = {"BTC": 1.2, "ETH": 1.2}        # strong skew — force round-trip behavior, less aggressive accumulation
 MM_KAPPA_DEFAULT = 0.5                        # fills/sec bootstrap — 0.02 made spread too wide, only 1 side quoted
 MM_KAPPA_WINDOW_SEC = 60                     # rolling window for κ estimation
 MM_SPREAD_FLOOR_C = 3                        # minimum half-spread per side (cents)
@@ -62,12 +60,13 @@ MM_MAX_INVENTORY = {"BTC": 8, "ETH": 8}     # max net contracts per coin — eve
 
 
 def get_tiered_max_inventory(cycle_sec: float, max_inv_cap: int) -> int:
-    if cycle_sec < 240:
-        return min(2, max_inv_cap)
+    """Ultra-conservative early ramp to force round-tripping."""
+    if cycle_sec < 300:      # first 5 minutes — only 1 contract max
+        return min(MM_EARLY_MAX_INV, max_inv_cap)
     elif cycle_sec < 420:
-        return min(4, max_inv_cap)
+        return min(3, max_inv_cap)
     elif cycle_sec < 600:
-        return min(6, max_inv_cap)
+        return min(5, max_inv_cap)
     elif cycle_sec < 840:
         return min(max_inv_cap, 8)
     else:
@@ -76,15 +75,19 @@ def get_tiered_max_inventory(cycle_sec: float, max_inv_cap: int) -> int:
 
 def get_tiered_price_bounds(cycle_sec: float) -> tuple:
     if cycle_sec < 300:
-        return 38, 62
+        return 35, 65
     elif cycle_sec < 600:
-        return 25, 75
+        return 20, 80
     else:
-        return 15, 93
+        return 10, 95
 
 
-def is_late_cycle_snipe(cycle_sec: float, edge_c: float) -> bool:
-    return cycle_sec > 720 and abs(edge_c) > MM_LATE_CYCLE_SNIPE_THRESHOLD_C
+def get_edge_driven_size(edge_c: float, cycle_sec: float, base_size: int) -> int:
+    """Reduce size when edge is weak (promote round trips)."""
+    abs_edge = abs(edge_c)
+    if cycle_sec < 300 and abs_edge < MM_STRONG_EDGE_THRESHOLD_C:
+        return 1
+    return base_size
 
 
 def get_tiered_edge(cycle_sec: float) -> int:
@@ -1110,38 +1113,32 @@ class Crypto15mAgent:
         if yes_bid == 0 and no_bid == 0:
             return None
 
-        # ── Unwind bonus: lift bid on unwind side to accelerate inventory reduction ──
-        if q > 0:
-            no_bid += MM_UNWIND_BONUS_C   # long YES, boost NO bid to attract unwind
-        elif q < 0:
-            yes_bid += MM_UNWIND_BONUS_C  # long NO, boost YES bid to attract unwind
+        # ── Unwind bonus + edge-driven sniper ──
+        if q != 0:
+            if q > 0:   # holding YES
+                no_bid += MM_UNWIND_BONUS_C
+                yes_bid += MM_UNWIND_BONUS_C if edge_c < 0 else 0  # extra if edge says unwind
+            else:        # holding NO
+                yes_bid += MM_UNWIND_BONUS_C
+                no_bid += MM_UNWIND_BONUS_C if edge_c > 0 else 0
 
-        # ─── EDGE-DRIVEN SNIPER + HARD SUPPRESSION ───
+        # ─── EDGE-DRIVEN SNIPER OVERRIDE ───
         abs_edge = abs(edge_c)
-        favored = "yes" if edge_c > 0 else "no"
-
-        # Hard suppression: never quote losing side on strong edge (prevents adverse fills)
-        if abs_edge > MM_SUPPRESSION_FLOOR_C:
-            if favored == "yes":
-                no_bid = 0
-            else:
-                yes_bid = 0
-
-        # Sniper override only on very strong sustained edge, respects ±6 cap
         if abs_edge > MM_STRONG_EDGE_THRESHOLD_C and abs(q) < 6:
-            sniper_size = get_edge_driven_size(edge_c, cycle_sec, tiered_max) if 'get_edge_driven_size' in dir() else 1
+            favored = "yes" if edge_c > 0 else "no"
+            sniper_size = get_edge_driven_size(edge_c, cycle_sec, tiered_max)
             if favored == "yes":
                 yes_bid = min(98, int(s - 2))
                 no_bid = 0
             else:
                 no_bid = min(98, int((100 - s) - 2))
                 yes_bid = 0
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 EDGE SNIPER {coin}: {favored.upper()} @ {yes_bid if favored=='yes' else no_bid}c | edge={edge_c:+.1f}c")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 EDGE SNIPER {coin}: {favored.upper()} @ {yes_bid if favored=='yes' else no_bid}c | size={sniper_size} | edge={edge_c:+.1f}c")
 
         # ─── ACTIVE FLATTEN ON WRONG-SIDE ───
-        if q != 0:
+        if q != 0 and abs_edge > MM_STRONG_EDGE_THRESHOLD_C:
             wrong_side = (q > 0 and edge_c < 0) or (q < 0 and edge_c > 0)
-            if wrong_side and abs_edge > MM_STRONG_EDGE_THRESHOLD_C:
+            if wrong_side:
                 if q > 0:
                     no_bid = min(98, int((100 - s) + MM_UNWIND_BONUS_C))
                     yes_bid = 0
@@ -1456,7 +1453,8 @@ class Crypto15mAgent:
                     else:
                         _s_sg = 50.0
                     edge_c_sg = _s_sg - 50
-                    if not is_late_cycle_snipe(cycle_sec, edge_c_sg) and cycle_sec >= (900 - settle_guard):
+                    # Settle guard: skip if edge is strong (sniper should still operate)
+                    if abs(edge_c_sg) <= MM_STRONG_EDGE_THRESHOLD_C and cycle_sec >= (900 - settle_guard):
                         if ms["quotes_active"]:
                             inv = ms["inventory"]
                             avg_y = ms["avg_yes_cost"]
