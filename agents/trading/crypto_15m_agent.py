@@ -51,15 +51,15 @@ MM_MAX_CONTRACTS = 1           # max contracts per quote side
 MM_QUOTE_MIN_C = 15            # don't quote below 15c — extreme prices = pure adverse selection
 MM_QUOTE_MAX_C = 93            # allow quoting up to 93c — winning side needs to participate late cycle
 MM_RECONCILE_INTERVAL_SEC = 10 # safety reconciliation frequency
-MM_SIGMA = {"BTC": 2.20, "ETH": 0.071}   # calibrated σ/sec from backtest
+MM_SIGMA = {"BTC": 2.20, "ETH": 0.071, "SOL": 0.065}   # calibrated σ/sec
 MM_SMOOTHING = 0.55            # CF BRTI 1-min average smoothing factor
 
 # ─── Avellaneda-Stoikov MM Parameters ───
-MM_GAMMA = {"BTC": 1.0, "ETH": 1.0}        # tighter spreads for more round-trip volume
+MM_GAMMA = {"BTC": 1.0, "ETH": 1.0, "SOL": 1.0}   # tighter spreads for more round-trip volume
 MM_KAPPA_DEFAULT = 0.5                        # fills/sec bootstrap — 0.02 made spread too wide, only 1 side quoted
 MM_KAPPA_WINDOW_SEC = 60                     # rolling window for κ estimation
 MM_SPREAD_FLOOR_C = 3                        # minimum half-spread per side (cents)
-MM_MAX_INVENTORY = {"BTC": 12, "ETH": 12}    # max net contracts per coin
+MM_MAX_INVENTORY = {"BTC": 12, "ETH": 12, "SOL": 12}   # max net contracts per coin
 
 
 def get_tiered_max_inventory(cycle_sec: float, max_inv_cap: int) -> int:
@@ -190,6 +190,37 @@ BRTI_COIN_CONFIG = {
         "mm_settle_guard_sec": 60,     # cancel MM quotes 60s before settlement (ETH: keep current)
         "mm_momentum_threshold": 0.25, # ETH: only apply momentum adj if |momentum| >= $0.25 (filters noise)
         "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD"},
+    },
+    "SOL": {
+        "series": "KXSOL15M",
+        "flip_cooldown_sec": 90,
+        "trailing_stop_c": 5,
+        "trailing_stop_far_c": 15,
+        "trailing_stop_mid_c": 10,
+        "trailing_stop_near_c": 5,
+        "trailing_stop_far_dist": 0.50,   # SOL: $0.50 — SOL oscillates $0.20-0.40 routinely
+        "trailing_stop_mid_dist": 0.25,   # SOL: $0.25
+        "stop_loss_hard_c": 35,           # SOL: same as ETH — thin book, wide swings
+        "momentum_flip_distance": 0.15,   # SOL: $0.15+ wrong side to flip
+        "conviction_min_distance": 0.30,  # SOL: $0.30+ past strike to add
+        "conviction_min_cycle_sec": 180,
+        "conviction_max_adds": 2,
+        "conviction_cooldown_sec": 60,
+        "conviction_max_price": 75,
+        "take_profit_c": 93,              # SOL: same as ETH — thin book, TP at 93c
+        "reentry_max_price": 59,
+        "tier1_max": 45,
+        "tier1_end_sec": 420,
+        "tier2_max": 65,
+        "tier2_end_sec": 600,
+        "tier3_max": 85,
+        "entry_contracts": 3,
+        "momentum_window": 8,
+        "sigma_per_sec": 0.065,           # SOL volatility: ~$84 price, similar vol profile to ETH
+        "mm_edge_c": 7,                   # same as ETH — thin book
+        "mm_settle_guard_sec": 60,
+        "mm_momentum_threshold": 0.10,    # SOL: filter noise at $0.10
+        "ws_pairs": {"coinbase": "SOL-USD", "kraken": "SOL/USD", "bitstamp": "solusd", "gemini": "SOLUSD"},
     },
 }
 
