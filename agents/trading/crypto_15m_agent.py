@@ -1163,15 +1163,13 @@ class Crypto15mAgent:
 
     async def _mm_place_quotes_inner(self, coin, ticker, ms):
         """Inner implementation — separated so quoting_in_flight guard wraps everything."""
-        # Step 0: Global exposure cap — don't risk more than 25% of account balance
-        # Use BOTH ticker_contracts AND mm_state inventory — whichever is higher
-        # ticker_contracts can be stale (cleared on rotation), inventory tracks fills in real-time
+        # Step 0: Global exposure cap — HARD LIMIT 10 contracts total, no exceptions
+        # Previous attempts at % balance caps failed because inventory tracking drifts.
+        # This is the nuclear option: count EVERYTHING and hard stop at 10.
         total_from_ticker = sum(self.ticker_contracts.values())
         total_from_inventory = sum(abs(self.mm_state[c].get("inventory", 0)) for c in BRTI_COIN_CONFIG)
         total_contracts = max(total_from_ticker, total_from_inventory)
-        cycle_bal = getattr(self, 'mm_cycle_balance', 50.0)
-        max_exposure_dollars = cycle_bal * 0.25
-        max_exposure_contracts = max(4, int(max_exposure_dollars / 0.50))
+        max_exposure_contracts = 10  # hard cap, ~$5 max risk
         if total_contracts >= max_exposure_contracts:
             q = ms.get("inventory", 0)
             if q == 0:
