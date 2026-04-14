@@ -1372,6 +1372,43 @@ class Crypto15mAgent:
 
                     cycle_sec = (datetime.now().minute % 15) * 60 + datetime.now().second
 
+                    # ── MM Take Profit: if position value hits 95c, sell all and re-quote ──
+                    inv = ms.get("inventory", 0)
+                    if inv != 0:
+                        prices = self.ws_prices.get(ticker, {})
+                        yes_bid_tp = prices.get("yes_bid", 0)
+                        yes_ask_tp = prices.get("yes_ask", 0)
+                        if yes_bid_tp > 0 and yes_ask_tp > 0:
+                            if inv > 0:
+                                current_val = yes_bid_tp  # YES position value
+                            else:
+                                current_val = 100 - yes_ask_tp  # NO position value
+                            if current_val >= 95:
+                                held_count = abs(inv)
+                                sell_side = "yes" if inv > 0 else "no"
+                                if self.client and not DRY_RUN:
+                                    try:
+                                        tp_id = f"mm-tp-{coin.lower()}-{int(time.time()*1000)}"
+                                        await asyncio.to_thread(
+                                            self.client.create_order,
+                                            ticker=ticker, client_order_id=tp_id,
+                                            side=sell_side, action="sell", count=held_count, type="limit",
+                                            yes_price=yes_bid_tp if sell_side == "yes" else None,
+                                            no_price=(100 - yes_ask_tp) if sell_side == "no" else None,
+                                        )
+                                        avg_cost = ms["avg_yes_cost"] if inv > 0 else ms["avg_no_cost"]
+                                        print(f"[{datetime.now().strftime('%H:%M:%S')}] 💰 {coin} MM TAKE PROFIT: {sell_side.upper()} {held_count}x @ {current_val}c (avg entry: {avg_cost:.0f}c) — re-quoting")
+                                        # Reset inventory and let MM re-quote fresh
+                                        ms["inventory"] = 0
+                                        ms["total_yes_bought"] = 0
+                                        ms["total_no_bought"] = 0
+                                        ms["avg_yes_cost"] = 0.0
+                                        ms["avg_no_cost"] = 0.0
+                                        self.ticker_contracts[ticker] = 0
+                                    except Exception as e:
+                                        print(f"  → {coin} MM TP error: {e}")
+                                continue  # skip to next tick — re-quote on next iteration
+
                     # Settlement guard: pull quotes N seconds before settlement
                     # Positions are NOT exited — they settle naturally at 0 or 100
                     settle_guard = cfg.get("mm_settle_guard_sec", MM_SETTLE_GUARD_SEC)
