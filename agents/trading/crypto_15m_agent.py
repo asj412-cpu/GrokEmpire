@@ -41,7 +41,7 @@ MM_MODE = os.getenv('MM_MODE', 'false').lower() == 'true'
 MM_EDGE_C = 6                  # edge below fair value per side (cents)
 MM_REQUOTE_THRESHOLD_C = 3     # re-quote if model moved ≥3c
 MM_SETTLE_GUARD_SEC = 60       # cancel all quotes 60s before settlement
-MM_EARLY_MAX_INV = 1                   # first 5 min — force round-tripping, max 1 contract
+MM_EARLY_MAX_INV = 2                   # first 5 min — 2 contracts for more round-trip pairs
 MM_STRONG_EDGE_THRESHOLD_C = 12        # |edge| > 12c → sniper mode
 MM_UNWIND_BONUS_C = 8                  # lowered from 12 — restore breakeven/positive round-trip spreads
 MM_DYNAMIC_TP_C = 12                   # trigger partial TP at +12c unrealized
@@ -55,7 +55,7 @@ MM_SIGMA = {"BTC": 2.20, "ETH": 0.071}   # calibrated σ/sec from backtest
 MM_SMOOTHING = 0.55            # CF BRTI 1-min average smoothing factor
 
 # ─── Avellaneda-Stoikov MM Parameters ───
-MM_GAMMA = {"BTC": 1.2, "ETH": 1.2}        # strong skew — force round-trip behavior, less aggressive accumulation
+MM_GAMMA = {"BTC": 1.0, "ETH": 1.0}        # tighter spreads for more round-trip volume
 MM_KAPPA_DEFAULT = 0.5                        # fills/sec bootstrap — 0.02 made spread too wide, only 1 side quoted
 MM_KAPPA_WINDOW_SEC = 60                     # rolling window for κ estimation
 MM_SPREAD_FLOOR_C = 3                        # minimum half-spread per side (cents)
