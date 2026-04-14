@@ -948,14 +948,33 @@ class Crypto15mAgent:
         # Fair value: smoothed sBRTI + time-scaled momentum projection
         # Early cycle: stable 10s mid (no momentum — noise causes wrong-side fills)
         # Late cycle: 3s spot + momentum projection (direction is real, accumulate winner)
+        recent_1s = [v for t, v in st["ticks"] if t > now_ts - 1]
+        recent_2s = [v for t, v in st["ticks"] if t > now_ts - 2]
         recent_3s = [v for t, v in st["ticks"] if t > now_ts - 3]
         recent_10s = [v for t, v in st["ticks"] if t > now_ts - 10]
+        if not recent_1s:
+            recent_1s = [st["ticks"][-1][1]]
+        if not recent_2s:
+            recent_2s = recent_1s
         if not recent_3s:
-            recent_3s = [st["ticks"][-1][1]]
+            recent_3s = recent_2s
         if not recent_10s:
             recent_10s = recent_3s
+        avg_1s = sum(recent_1s) / len(recent_1s)
+        avg_2s = sum(recent_2s) / len(recent_2s)
         avg_3s = sum(recent_3s) / len(recent_3s)
         avg_10s = sum(recent_10s) / len(recent_10s)
+
+        # Shadow log: compare what 1s/2s/3s windows see (every 30s to avoid spam)
+        if int(now_ts) % 30 == 0 and st.get("_last_window_log", 0) != int(now_ts):
+            st["_last_window_log"] = int(now_ts)
+            d1 = avg_1s - st["strike"]
+            d2 = avg_2s - st["strike"]
+            d3 = avg_3s - st["strike"]
+            m1 = avg_1s - avg_10s
+            m2 = avg_2s - avg_10s
+            m3 = avg_3s - avg_10s
+            print(f"  🔬 {coin} WINDOW: 1s=${avg_1s:,.2f}(Δ{d1:+,.0f} m{m1:+,.1f}) 2s=${avg_2s:,.2f}(Δ{d2:+,.0f} m{m2:+,.1f}) 3s=${avg_3s:,.2f}(Δ{d3:+,.0f} m{m3:+,.1f}) 10s=${avg_10s:,.2f}")
 
         # Momentum projection: full strength mid-cycle, zero in last 3 minutes
         # The skew was profitable throughout (helped accumulate winning side),
@@ -1027,6 +1046,15 @@ class Crypto15mAgent:
 
         yes_bid = int(round(r_yes - half))
         no_bid = int(round(r_no - half))
+
+        # Suppress the losing side when fair value is extreme
+        # If fair YES is 85c+, NO is the losing side — don't bid it
+        # If fair YES is 15c-, YES is the losing side — don't bid it
+        # This is what was causing 13-18c fills on the wrong side
+        if s >= 80:
+            no_bid = 0   # YES is winning, NO is losing — don't buy NO
+        if s <= 20:
+            yes_bid = 0  # NO is winning, YES is losing — don't buy YES
 
         # Settlement guard: no quotes in last 60-90s (tiered_max returns 0)
         tiered_max = get_tiered_max_inventory(cycle_sec, MM_MAX_INVENTORY.get(coin, 8))
