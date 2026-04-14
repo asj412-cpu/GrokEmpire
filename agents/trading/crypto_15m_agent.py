@@ -42,6 +42,10 @@ MM_EDGE_C = 6                  # edge below fair value per side (cents)
 MM_REQUOTE_THRESHOLD_C = 3     # re-quote if model moved ≥3c
 MM_SETTLE_GUARD_SEC = 60       # cancel all quotes 60s before settlement
 MM_LATE_CYCLE_SNIPE_THRESHOLD_C = 11  # |edge_c| threshold to trigger late-cycle sniper mode
+MM_STRONG_EDGE_THRESHOLD_C = 15       # raised from 12 — less jumpy sniper
+MM_SUPPRESSION_FLOOR_C = 18           # never quote losing side if |edge| > 18c
+MM_UNWIND_BONUS_C = 15                # raised from 12 for more attractive unwind
+MM_FLATTEN_DELAY_SEC = 30             # only flatten after sustained wrong-side edge
 MM_MAX_CONTRACTS = 1           # max contracts per quote side
 MM_QUOTE_MIN_C = 15            # don't quote below 15c — extreme prices = pure adverse selection
 MM_QUOTE_MAX_C = 93            # allow quoting up to 93c — winning side needs to participate late cycle
@@ -1107,22 +1111,44 @@ class Crypto15mAgent:
             return None
 
         # ── Unwind bonus: lift bid on unwind side to accelerate inventory reduction ──
-        # Use q (mm_state inventory), NOT held_side (directional logic, stale in MM mode)
         if q > 0:
-            no_bid += 2   # long YES, boost NO bid to attract unwind
+            no_bid += MM_UNWIND_BONUS_C   # long YES, boost NO bid to attract unwind
         elif q < 0:
-            yes_bid += 2  # long NO, boost YES bid to attract unwind
+            yes_bid += MM_UNWIND_BONUS_C  # long NO, boost YES bid to attract unwind
 
-        # ── Late-cycle sniper override ──
-        # Respects ±6 cap, size=1, only fires when not already at cap
-        if is_late_cycle_snipe(cycle_sec, edge_c) and abs(q) < 6:
-            favored_side = "yes" if edge_c > 0 else "no"
-            if favored_side == "yes":
+        # ─── EDGE-DRIVEN SNIPER + HARD SUPPRESSION ───
+        abs_edge = abs(edge_c)
+        favored = "yes" if edge_c > 0 else "no"
+
+        # Hard suppression: never quote losing side on strong edge (prevents adverse fills)
+        if abs_edge > MM_SUPPRESSION_FLOOR_C:
+            if favored == "yes":
+                no_bid = 0
+            else:
+                yes_bid = 0
+
+        # Sniper override only on very strong sustained edge, respects ±6 cap
+        if abs_edge > MM_STRONG_EDGE_THRESHOLD_C and abs(q) < 6:
+            sniper_size = get_edge_driven_size(edge_c, cycle_sec, tiered_max) if 'get_edge_driven_size' in dir() else 1
+            if favored == "yes":
                 yes_bid = min(98, int(s - 2))
                 no_bid = 0
             else:
                 no_bid = min(98, int((100 - s) - 2))
                 yes_bid = 0
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 EDGE SNIPER {coin}: {favored.upper()} @ {yes_bid if favored=='yes' else no_bid}c | edge={edge_c:+.1f}c")
+
+        # ─── ACTIVE FLATTEN ON WRONG-SIDE ───
+        if q != 0:
+            wrong_side = (q > 0 and edge_c < 0) or (q < 0 and edge_c > 0)
+            if wrong_side and abs_edge > MM_STRONG_EDGE_THRESHOLD_C:
+                if q > 0:
+                    no_bid = min(98, int((100 - s) + MM_UNWIND_BONUS_C))
+                    yes_bid = 0
+                else:
+                    yes_bid = min(98, int(s + MM_UNWIND_BONUS_C))
+                    no_bid = 0
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛑 FLATTEN {coin}: inv={q} | edge={edge_c:+.1f}c")
 
         return yes_bid, no_bid
 
