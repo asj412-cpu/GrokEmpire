@@ -38,9 +38,10 @@ DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 MM_MODE = os.getenv('MM_MODE', 'false').lower() == 'true'
 
 # ─── Market-Making Config ───
-MM_EDGE_C = 7                  # edge below fair value per side (cents) — widened from 3, adverse selection was eating us
-MM_REQUOTE_THRESHOLD_C = 5     # re-quote if model moved ≥5c (was 2c, caused churn)
+MM_EDGE_C = 6                  # edge below fair value per side (cents)
+MM_REQUOTE_THRESHOLD_C = 3     # re-quote if model moved ≥3c
 MM_SETTLE_GUARD_SEC = 60       # cancel all quotes 60s before settlement
+MM_LATE_CYCLE_SNIPE_THRESHOLD_C = 11  # |edge_c| threshold to trigger late-cycle sniper mode
 MM_MAX_CONTRACTS = 1           # max contracts per quote side
 MM_QUOTE_MIN_C = 15            # don't quote below 15c — extreme prices = pure adverse selection
 MM_QUOTE_MAX_C = 93            # allow quoting up to 93c — winning side needs to participate late cycle
@@ -49,7 +50,7 @@ MM_SIGMA = {"BTC": 2.20, "ETH": 0.071}   # calibrated σ/sec from backtest
 MM_SMOOTHING = 0.55            # CF BRTI 1-min average smoothing factor
 
 # ─── Avellaneda-Stoikov MM Parameters ───
-MM_GAMMA = {"BTC": 0.5, "ETH": 0.5}        # risk aversion — 0.3 filled to max every cycle, wider spreads = fewer but better fills
+MM_GAMMA = {"BTC": 0.8, "ETH": 0.8}        # risk aversion — 0.3 filled to max every cycle, wider spreads = fewer but better fills
 MM_KAPPA_DEFAULT = 0.5                        # fills/sec bootstrap — 0.02 made spread too wide, only 1 side quoted
 MM_KAPPA_WINDOW_SEC = 60                     # rolling window for κ estimation
 MM_SPREAD_FLOOR_C = 3                        # minimum half-spread per side (cents)
@@ -57,18 +58,9 @@ MM_MAX_INVENTORY = {"BTC": 8, "ETH": 8}     # max net contracts per coin — eve
 
 
 def get_tiered_max_inventory(cycle_sec: float, max_inv_cap: int) -> int:
-    """Return inventory cap based on how far into the 15-min cycle we are.
-    Ramps up as we get deeper into the cycle (more info, less adverse-selection risk),
-    then drops to 0 near settlement to avoid last-second gamma exposure.
-      0–120s : 4  (42-58c bounds protect against AS, let model accumulate/unwind)
-      120–300s: 4  (40-60c round trip zone — room to work both sides)
-      300–600s: 6  (mid-cycle main book)
-      600–840s: 8  (full book — direction established)
-      840s+   : 0  (settle guard — belt-and-suspenders)
-    """
-    if cycle_sec < 120:
-        return min(4, max_inv_cap)
-    elif cycle_sec < 300:
+    if cycle_sec < 240:
+        return min(2, max_inv_cap)
+    elif cycle_sec < 420:
         return min(4, max_inv_cap)
     elif cycle_sec < 600:
         return min(6, max_inv_cap)
@@ -79,18 +71,16 @@ def get_tiered_max_inventory(cycle_sec: float, max_inv_cap: int) -> int:
 
 
 def get_tiered_price_bounds(cycle_sec: float) -> tuple:
-    """Return (min_price, max_price) for quotes based on cycle phase.
-    Early cycle: restrict to near-50 range (avoid adverse selection at extremes).
-    Late cycle: widen to allow quoting on established direction.
-      0–120s : no quotes (handled by inventory tier returning 0)
-      120–300s: 30–70c  (tight — only near-strike, both sides live)
-      300–600s: 20–80c  (mid — direction forming, still cautious)
-      600–780s: 15–93c  (wide — direction established, information rich)
-      780–840s: 15–93c  (same — last quoting window before guard)
-    """
-    # No hard bounds — the A-S model + 80/20 suppression handles adverse selection
-    # Hard bounds were blocking the unwind side from quoting when inventory was loaded
-    return 1, 99
+    if cycle_sec < 300:
+        return 38, 62
+    elif cycle_sec < 600:
+        return 25, 75
+    else:
+        return 15, 93
+
+
+def is_late_cycle_snipe(cycle_sec: float, edge_c: float) -> bool:
+    return cycle_sec > 720 and abs(edge_c) > MM_LATE_CYCLE_SNIPE_THRESHOLD_C
 
 
 def get_tiered_edge(cycle_sec: float) -> int:
@@ -1014,6 +1004,7 @@ class Crypto15mAgent:
 
         p_yes = _norm_cdf(distance / effective_sigma)
         s = max(1.0, min(99.0, p_yes * 100.0))  # fair YES price in cents
+        edge_c = s - 50  # signed directional edge in cents (+ = YES favored, - = NO favored)
 
         # σ_contract: volatility of contract price (cents/√sec-ish)
         # Derived from delta of binary option: dP/dBRTI = 100·φ(z) / (σ·√T)
@@ -1114,6 +1105,24 @@ class Crypto15mAgent:
 
         if yes_bid == 0 and no_bid == 0:
             return None
+
+        # ── Unwind bonus: lift bid on unwind side to accelerate inventory reduction ──
+        # Use q (mm_state inventory), NOT held_side (directional logic, stale in MM mode)
+        if q > 0:
+            no_bid += 2   # long YES, boost NO bid to attract unwind
+        elif q < 0:
+            yes_bid += 2  # long NO, boost YES bid to attract unwind
+
+        # ── Late-cycle sniper override ──
+        # Respects ±6 cap, size=1, only fires when not already at cap
+        if is_late_cycle_snipe(cycle_sec, edge_c) and abs(q) < 6:
+            favored_side = "yes" if edge_c > 0 else "no"
+            if favored_side == "yes":
+                yes_bid = min(98, int(s - 2))
+                no_bid = 0
+            else:
+                no_bid = min(98, int((100 - s) - 2))
+                yes_bid = 0
 
         return yes_bid, no_bid
 
@@ -1409,7 +1418,19 @@ class Crypto15mAgent:
                     # Settlement guard: pull quotes N seconds before settlement
                     # Positions are NOT exited — they settle naturally at 0 or 100
                     settle_guard = cfg.get("mm_settle_guard_sec", MM_SETTLE_GUARD_SEC)
-                    if cycle_sec >= (900 - settle_guard):
+                    # Compute edge_c for sniper gate
+                    _st_sg = self.brti_state[coin]
+                    if _st_sg["ticks"]:
+                        _latest_sg = _st_sg["ticks"][-1][1]
+                        _ticks_10s_sg = [v for t, v in _st_sg["ticks"] if t > time.time() - 10]
+                        _avg10_sg = sum(_ticks_10s_sg) / len(_ticks_10s_sg) if _ticks_10s_sg else _latest_sg
+                        _dist_sg = (_latest_sg + (_latest_sg - _avg10_sg) * min(30.0, max(1.0, 900 - cycle_sec)) * 0.3) - _st_sg["strike"]
+                        _sigma_sg = MM_SIGMA.get(coin, 2.20) * (max(1.0, 900 - cycle_sec) ** 0.5) * MM_SMOOTHING
+                        _s_sg = max(1.0, min(99.0, _norm_cdf(_dist_sg / _sigma_sg) * 100.0)) if _sigma_sg > 0 else 50.0
+                    else:
+                        _s_sg = 50.0
+                    edge_c_sg = _s_sg - 50
+                    if not is_late_cycle_snipe(cycle_sec, edge_c_sg) and cycle_sec >= (900 - settle_guard):
                         if ms["quotes_active"]:
                             inv = ms["inventory"]
                             avg_y = ms["avg_yes_cost"]
