@@ -982,16 +982,11 @@ class Crypto15mAgent:
             m3 = avg_3s - avg_10s
             print(f"  🔬 {coin} WINDOW: 1s=${avg_1s:,.2f}(Δ{d1:+,.0f} m{m1:+,.1f}) 2s=${avg_2s:,.2f}(Δ{d2:+,.0f} m{m2:+,.1f}) 3s=${avg_3s:,.2f}(Δ{d3:+,.0f} m{m3:+,.1f}) 10s=${avg_10s:,.2f}")
 
-        # Full momentum all cycle — 80/20 losing-side suppression handles AS risk
-        # Min 10-14 (sec 600+): use latest tick (no window) for fastest possible reaction
-        # Earlier: 3s average for stability during round-trip accumulation phase
+        # Full momentum all cycle — pure latest tick, fastest possible reaction
+        # Each sBRTI tick is already a 4-exchange volume-weighted median — no need to smooth
         latest_tick = st["ticks"][-1][1] if st["ticks"] else avg_3s
-        if cycle_sec >= 600:
-            spot = latest_tick
-            momentum = latest_tick - avg_10s
-        else:
-            spot = avg_3s
-            momentum = avg_3s - avg_10s
+        spot = latest_tick
+        momentum = latest_tick - avg_10s
         momentum_proj = momentum * min(30.0, secs_remaining) * 0.3
         distance = (spot + momentum_proj) - st["strike"]
 
