@@ -964,8 +964,15 @@ class Crypto15mAgent:
         phi_z = _norm_pdf(z)
         sigma_c = 100.0 * phi_z / math.sqrt(secs_remaining)
 
-        # A-S parameters
-        q = ms["inventory"]
+        # A-S parameters — use real position count as ground truth for inventory
+        # mm_state["inventory"] can drift from actual; ticker_contracts is authoritative
+        ticker = self.current_tickers.get(coin, "")
+        real_held = self.ticker_contracts.get(ticker, 0)
+        held_side = self.brti_state[coin].get("held_side", "")
+        if real_held > 0 and held_side:
+            q = real_held if held_side == "yes" else -real_held
+        else:
+            q = ms["inventory"]  # fallback to tracked inventory if no held position
         gamma = MM_GAMMA.get(coin, 0.1)
         kappa = self.mm_estimate_kappa(coin)
 
@@ -1228,9 +1235,13 @@ class Crypto15mAgent:
         # can still fill. Cancel them the moment we hit the limit.
         cycle_sec_now = (datetime.now().minute % 15) * 60 + datetime.now().second
         max_inv = get_tiered_max_inventory(cycle_sec_now, MM_MAX_INVENTORY.get(coin, 5))
-        if abs(ms["inventory"]) >= max_inv and max_inv >= 0:
+        # Use real position count for cap enforcement, not just internal counter
+        ticker_now = self.current_tickers.get(coin, "")
+        real_pos = self.ticker_contracts.get(ticker_now, 0)
+        effective_inv = max(abs(ms["inventory"]), real_pos)  # whichever is larger
+        if effective_inv >= max_inv and max_inv >= 0:
             capped_side = "no" if ms["inventory"] <= -max_inv else "yes"
-            print(f"  🛑 INV CAP: {coin} inventory={ms['inventory']:+d} (max {max_inv}) — canceling resting {capped_side.upper()} order")
+            print(f"  🛑 INV CAP: {coin} inv={ms['inventory']:+d} real={real_pos} (max {max_inv}) — canceling resting {capped_side.upper()} order")
             asyncio.create_task(self.mm_cancel_all_quotes(coin, f"inv_cap_{capped_side}"))
             ms["requote_pending"] = False
             return
@@ -1390,7 +1401,10 @@ class Crypto15mAgent:
                 st["peak_value"] = entry_price
                 self.ticker_contracts[ticker] = count
                 self.current_tickers[coin] = ticker
-                print(f"  📌 {coin} INHERITED: {held_side.upper()} {count}x @ ~{entry_price}c (ticker: {ticker}) — actively managing")
+                # Sync MM inventory with real position so Stoikov model knows true exposure
+                if self.mm_mode and coin in self.mm_state:
+                    self.mm_state[coin]["inventory"] = count if held_side == "yes" else -count
+                print(f"  📌 {coin} INHERITED: {held_side.upper()} {count}x @ ~{entry_price}c (ticker: {ticker}) — actively managing (inv={self.mm_state.get(coin, {}).get('inventory', 0):+d})")
         except Exception as e:
             print(f"  Position seed error: {e}")
 
