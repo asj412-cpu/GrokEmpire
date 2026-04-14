@@ -945,36 +945,39 @@ class Crypto15mAgent:
         secs_remaining = max(float(settle_guard), float(900 - cycle_sec))
         T_t = secs_remaining / 900.0  # fraction of cycle remaining
 
-        # Fair value: sBRTI spot with momentum projection
-        # Use 3s average for responsiveness (not 10s which lags during fast moves)
+        # Fair value: smoothed sBRTI + time-scaled momentum projection
+        # Early cycle: stable 10s mid (no momentum — noise causes wrong-side fills)
+        # Late cycle: 3s spot + momentum projection (direction is real, accumulate winner)
         recent_3s = [v for t, v in st["ticks"] if t > now_ts - 3]
         recent_10s = [v for t, v in st["ticks"] if t > now_ts - 10]
         if not recent_3s:
             recent_3s = [st["ticks"][-1][1]]
         if not recent_10s:
             recent_10s = recent_3s
-        spot_brti = sum(recent_3s) / len(recent_3s)
-
-        # Momentum: how fast is sBRTI moving RIGHT NOW (3s vs 10s)
-        avg_3s = spot_brti
+        avg_3s = sum(recent_3s) / len(recent_3s)
         avg_10s = sum(recent_10s) / len(recent_10s)
-        momentum = avg_3s - avg_10s  # positive = price rising
 
-        # Project forward: spot + momentum * dampened time
-        momentum_proj = momentum * min(30.0, secs_remaining) * 0.3
-        projected_brti = spot_brti + momentum_proj
-        distance = projected_brti - st["strike"]
+        # Momentum projection: full strength mid-cycle, zero in last 3 minutes
+        # The skew was profitable throughout (helped accumulate winning side),
+        # but in the last 2-3 min informed traders exploit brief bounces to dump
+        # losing-side contracts on us. Cut momentum when AS risk is highest.
+        momentum = avg_3s - avg_10s
+        if secs_remaining <= 180:
+            mom_weight = 0.0  # last 3 min: pure stable fair value, no momentum
+        else:
+            mom_weight = 1.0  # full momentum projection
 
-        # Realized volatility from actual tick data (not calibrated constant)
-        # Use last 30s of ticks to measure how choppy the market is RIGHT NOW
+        momentum_proj = momentum * min(30.0, secs_remaining) * 0.3 * mom_weight
+        spot = avg_3s if mom_weight > 0 else avg_10s  # responsive when projecting, stable when not
+        distance = (spot + momentum_proj) - st["strike"]
+
+        # Realized volatility from tick data — adapts spread dynamically
         sigma_brti = cfg.get("sigma_per_sec", MM_SIGMA.get(coin, 2.20))
         ticks_30s = [v for t, v in st["ticks"] if t > now_ts - 30]
         if len(ticks_30s) >= 5:
-            # Compute realized vol from tick returns
             diffs = [ticks_30s[i] - ticks_30s[i-1] for i in range(1, len(ticks_30s))]
             if diffs:
                 realized_std = (sum(d*d for d in diffs) / len(diffs)) ** 0.5
-                # Blend: 50% calibrated + 50% realized (realized adapts, calibrated anchors)
                 sigma_brti = 0.5 * sigma_brti + 0.5 * realized_std
 
         effective_sigma = sigma_brti * math.sqrt(secs_remaining) * MM_SMOOTHING
@@ -1015,12 +1018,12 @@ class Crypto15mAgent:
         tiered_floor = float(get_tiered_edge(cycle_sec))
         half = max(tiered_floor, as_delta / 2.0)
 
-        # Additional momentum skew: if sBRTI is moving fast, widen the side that's being hit
-        # This is on top of the inventory skew — protects against informed momentum traders
-        if abs(momentum) > 0:
-            mom_skew = momentum * 2.0  # scale momentum to cents
-            r_yes -= mom_skew  # if price rising, lower our YES bid (don't buy into rally)
-            r_no += mom_skew   # if price rising, raise our NO bid (sell into rally)
+        # Momentum widens spread symmetrically — fast moves = more uncertainty = back off
+        # In last 3 min: EXTRA spread widening since we're not projecting momentum on fair value
+        abs_mom = abs(momentum)
+        if abs_mom > 0:
+            mom_spread = abs_mom * (3.0 if secs_remaining <= 180 else 1.5)
+            half += mom_spread
 
         yes_bid = int(round(r_yes - half))
         no_bid = int(round(r_no - half))
