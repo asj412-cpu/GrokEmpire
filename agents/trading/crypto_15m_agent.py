@@ -994,11 +994,15 @@ class Crypto15mAgent:
             m3 = avg_3s - avg_10s
             print(f"  🔬 {coin} WINDOW: 1s=${avg_1s:,.2f}(Δ{d1:+,.0f} m{m1:+,.1f}) 2s=${avg_2s:,.2f}(Δ{d2:+,.0f} m{m2:+,.1f}) 3s=${avg_3s:,.2f}(Δ{d3:+,.0f} m{m3:+,.1f}) 10s=${avg_10s:,.2f}")
 
-        # Full momentum all cycle — pure latest tick, fastest possible reaction
-        # Each sBRTI tick is already a 4-exchange volume-weighted median — no need to smooth
-        latest_tick = st["ticks"][-1][1] if st["ticks"] else avg_3s
-        spot = latest_tick
-        momentum = latest_tick - avg_10s
+        # BTC: latest tick (high exchange volume, stable median)
+        # ETH: 2s average (lower exchange volume, 1-tick noise caused 94c→18c→94c bid swings)
+        latest_tick = st["ticks"][-1][1] if st["ticks"] else avg_2s
+        if coin == "BTC":
+            spot = latest_tick
+            momentum = latest_tick - avg_10s
+        else:
+            spot = avg_2s
+            momentum = avg_2s - avg_10s
         momentum_proj = momentum * min(30.0, secs_remaining) * 0.3
         distance = (spot + momentum_proj) - st["strike"]
 
