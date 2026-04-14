@@ -502,6 +502,9 @@ class Crypto15mAgent:
         if rotated:
             self.last_buy_ts.clear()
             self.last_buy_price.clear()
+            # Clear settled positions — old cycle contracts must not carry into new cycle
+            self.ticker_contracts.clear()
+            self.positions.clear()
             # Cancel all MM quotes on rotation — never carry quotes into new market
             if self.mm_mode:
                 asyncio.create_task(self.mm_cancel_all_coins("cycle rotation"))
