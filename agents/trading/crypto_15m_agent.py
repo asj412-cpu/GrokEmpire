@@ -41,7 +41,7 @@ MM_MODE = os.getenv('MM_MODE', 'false').lower() == 'true'
 MM_EDGE_C = 6                  # edge below fair value per side (cents)
 MM_REQUOTE_THRESHOLD_C = 3     # re-quote if model moved ≥3c
 MM_SETTLE_GUARD_SEC = 60       # cancel all quotes 60s before settlement
-MM_EARLY_MAX_INV = 2                   # first 5 min — 2 contracts for more round-trip pairs
+MM_EARLY_MAX_INV = 4                   # first 5 min — more round-trip pairs
 MM_STRONG_EDGE_THRESHOLD_C = 12        # |edge| > 12c → sniper mode
 MM_UNWIND_BONUS_C = 8                  # lowered from 12 — restore breakeven/positive round-trip spreads
 MM_DYNAMIC_TP_C = 12                   # trigger partial TP at +12c unrealized
@@ -59,19 +59,19 @@ MM_GAMMA = {"BTC": 1.0, "ETH": 1.0}        # tighter spreads for more round-trip
 MM_KAPPA_DEFAULT = 0.5                        # fills/sec bootstrap — 0.02 made spread too wide, only 1 side quoted
 MM_KAPPA_WINDOW_SEC = 60                     # rolling window for κ estimation
 MM_SPREAD_FLOOR_C = 3                        # minimum half-spread per side (cents)
-MM_MAX_INVENTORY = {"BTC": 10, "ETH": 10}    # max net contracts per coin
+MM_MAX_INVENTORY = {"BTC": 12, "ETH": 12}    # max net contracts per coin
 
 
 def get_tiered_max_inventory(cycle_sec: float, max_inv_cap: int) -> int:
-    """Conservative early ramp, scales to max of 10."""
-    if cycle_sec < 300:      # first 5 minutes — force round-tripping
+    """Ramp 4→6→8→12."""
+    if cycle_sec < 300:
         return min(MM_EARLY_MAX_INV, max_inv_cap)
     elif cycle_sec < 420:
-        return min(4, max_inv_cap)
-    elif cycle_sec < 600:
         return min(6, max_inv_cap)
+    elif cycle_sec < 600:
+        return min(8, max_inv_cap)
     elif cycle_sec < 840:
-        return min(max_inv_cap, 10)
+        return min(max_inv_cap, 12)
     else:
         return 0
 
@@ -1076,7 +1076,7 @@ class Crypto15mAgent:
         # No hard inventory caps — A-S skew manages inventory naturally:
         # inv_term = q·γ·σ²·T pushes reservation price away from the loaded side
         # Per-coin brake — redundant with fill handler cap but defense in depth
-        if abs(q) >= 10:
+        if abs(q) >= 12:
             if q > 0:
                 yes_bid = 0
             else:
@@ -1107,7 +1107,7 @@ class Crypto15mAgent:
             no_bid = 0
 
         # Per-coin cap: at ±6, suppress accumulating side, keep unwind live
-        if abs(q) >= 10:
+        if abs(q) >= 12:
             if q > 0:
                 yes_bid = 0  # long YES at cap, only quote NO to unwind
             else:
@@ -1391,7 +1391,7 @@ class Crypto15mAgent:
         # PER-COIN HARD CAP — runs on EVERY fill, cannot be bypassed
         # At cap: cancel accumulating side, keep unwind side live for round trips
         coin_inv = abs(ms.get("inventory", 0))
-        if coin_inv >= 10:
+        if coin_inv >= 12:
             q = ms.get("inventory", 0)
             accumulating_side = "no" if q < 0 else "yes"
             # Cancel the accumulating side's resting order only
