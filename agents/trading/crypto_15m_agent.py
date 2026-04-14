@@ -49,7 +49,7 @@ MM_SIGMA = {"BTC": 2.20, "ETH": 0.071}   # calibrated σ/sec from backtest
 MM_SMOOTHING = 0.55            # CF BRTI 1-min average smoothing factor
 
 # ─── Avellaneda-Stoikov MM Parameters ───
-MM_GAMMA = {"BTC": 0.3, "ETH": 0.3}        # risk aversion — 0.1 was too low, inventory ran to ±10
+MM_GAMMA = {"BTC": 0.5, "ETH": 0.5}        # risk aversion — 0.3 filled to max every cycle, wider spreads = fewer but better fills
 MM_KAPPA_DEFAULT = 0.5                        # fills/sec bootstrap — 0.02 made spread too wide, only 1 side quoted
 MM_KAPPA_WINDOW_SEC = 60                     # rolling window for κ estimation
 MM_SPREAD_FLOOR_C = 3                        # minimum half-spread per side (cents)
@@ -491,9 +491,12 @@ class Crypto15mAgent:
                 print(f"  Open market lookup error {coin}: {e}")
 
         # Reset cooldowns and avg-down state on cycle rotation
-        # ONLY reset if the ticker actually changed — not on every 30s refresh
-        # The 30s refresh can return the same ticker, which was falsely resetting inventory
-        if rotated and not getattr(self, '_last_rotation_tickers', None) == set(self.current_tickers.values()):
+        # ONLY reset ONCE per cycle — the 30s refresh can trigger rotated=True multiple times
+        # when the new ticker first appears (bad data on first refresh, real data on second)
+        current_ticker_set = frozenset(self.current_tickers.values())
+        already_rotated = getattr(self, '_rotated_for_tickers', frozenset()) == current_ticker_set
+        if rotated and not already_rotated:
+            self._rotated_for_tickers = current_ticker_set
             self._last_rotation_tickers = set(self.current_tickers.values())
             self.last_buy_ts.clear()
             self.last_buy_price.clear()
@@ -511,14 +514,14 @@ class Crypto15mAgent:
                         print(f"  💰 Cycle balance: ${self.mm_cycle_balance:.2f} | max exposure: ${self.mm_cycle_balance * 0.25:.2f} ({int(self.mm_cycle_balance * 0.25 / 0.50)} contracts)")
                     except Exception:
                         self.mm_cycle_balance = getattr(self, 'mm_cycle_balance', 55.0)
-                # Reset per-cycle MM inventory (positions from prior cycle settled)
+                # DO NOT reset mm_state inventory here — the fill handler counts correctly.
+                # Resetting on rotation was the root cause of the 12-contract bug:
+                # 30s refresh triggered rotation twice, reset inventory to 0 mid-cycle,
+                # letting another 6 fills through on top of the first 6.
+                # Only reset fill tracking stats, not the inventory counter.
                 for _coin in BRTI_COIN_CONFIG:
                     ms = self.mm_state[_coin]
-                    ms["inventory"] = 0
-                    ms["total_yes_bought"] = 0
-                    ms["total_no_bought"] = 0
-                    ms["avg_yes_cost"] = 0.0
-                    ms["avg_no_cost"] = 0.0
+                    # ms["inventory"] = 0  ← REMOVED: this was breaking the cap
                     ms["fill_times"] = []
             # Reset BRTI cycle state for all coins
             for _coin in BRTI_COIN_CONFIG:
@@ -989,15 +992,10 @@ class Crypto15mAgent:
             m3 = avg_3s - avg_10s
             print(f"  🔬 {coin} WINDOW: 1s=${avg_1s:,.2f}(Δ{d1:+,.0f} m{m1:+,.1f}) 2s=${avg_2s:,.2f}(Δ{d2:+,.0f} m{m2:+,.1f}) 3s=${avg_3s:,.2f}(Δ{d3:+,.0f} m{m3:+,.1f}) 10s=${avg_10s:,.2f}")
 
-        # BTC: latest tick (high exchange volume, stable median)
-        # ETH: 2s average (lower exchange volume, 1-tick noise caused 94c→18c→94c bid swings)
-        latest_tick = st["ticks"][-1][1] if st["ticks"] else avg_2s
-        if coin == "BTC":
-            spot = latest_tick
-            momentum = latest_tick - avg_10s
-        else:
-            spot = avg_2s
-            momentum = avg_2s - avg_10s
+        # Both coins on latest tick — 80/20 suppression handles the wild bid issue now
+        latest_tick = st["ticks"][-1][1] if st["ticks"] else avg_3s
+        spot = latest_tick
+        momentum = latest_tick - avg_10s
         momentum_proj = momentum * min(30.0, secs_remaining) * 0.3
         distance = (spot + momentum_proj) - st["strike"]
 
@@ -1057,11 +1055,16 @@ class Crypto15mAgent:
         no_bid = int(round(r_no - half))
 
         # 80/20 suppression: don't quote the losing side when direction is clear
-        # Pure both-sides A-S lost money on trending cycles — wrong side accumulates
-        # Oscillation detector will replace this with smarter regime-based logic
-        if s >= 80:
+        # In last 3 min: use raw 10s fair (no momentum) for suppression check
+        # so brief sBRTI bounces don't lift the suppression and create losing-side fills
+        if secs_remaining <= 180:
+            raw_p = _norm_cdf((avg_10s - st["strike"]) / effective_sigma) if effective_sigma > 0 else 0.5
+            s_check = max(1.0, min(99.0, raw_p * 100.0))
+        else:
+            s_check = s
+        if s_check >= 80:
             no_bid = 0
-        if s <= 20:
+        if s_check <= 20:
             yes_bid = 0
 
         # Settlement guard: no quotes in last 60-90s (tiered_max returns 0)
@@ -1373,7 +1376,8 @@ class Crypto15mAgent:
                                 current_val = yes_bid_tp  # YES position value
                             else:
                                 current_val = 100 - yes_ask_tp  # NO position value
-                            if current_val >= 95:
+                            tp_threshold = 93 if coin == "ETH" else 95  # ETH lower — WS bid lags on thin book
+                            if current_val >= tp_threshold:
                                 held_count = abs(inv)
                                 sell_side = "yes" if inv > 0 else "no"
                                 if self.client and not DRY_RUN:
