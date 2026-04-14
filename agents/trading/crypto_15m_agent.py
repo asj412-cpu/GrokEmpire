@@ -44,6 +44,9 @@ MM_SETTLE_GUARD_SEC = 60       # cancel all quotes 60s before settlement
 MM_EARLY_MAX_INV = 1                   # first 5 min — force round-tripping, max 1 contract
 MM_STRONG_EDGE_THRESHOLD_C = 12        # |edge| > 12c → sniper mode
 MM_UNWIND_BONUS_C = 12                 # extra cents on unwind side when holding inventory
+MM_DYNAMIC_TP_C = 12                   # trigger partial TP at +12c unrealized
+MM_TRAILING_PULLBACK_C = 5             # if profit falls 5c from peak, fully flatten
+MM_PARTIAL_TP_SIZE = 2                 # reduce by this many contracts on first TP hit
 MM_MAX_CONTRACTS = 1           # max contracts per quote side
 MM_QUOTE_MIN_C = 15            # don't quote below 15c — extreme prices = pure adverse selection
 MM_QUOTE_MAX_C = 93            # allow quoting up to 93c — winning side needs to participate late cycle
@@ -1146,6 +1149,38 @@ class Crypto15mAgent:
                     yes_bid = min(98, int(s + MM_UNWIND_BONUS_C))
                     no_bid = 0
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛑 FLATTEN {coin}: inv={q} | edge={edge_c:+.1f}c")
+
+        # ─── TRAILING DYNAMIC TAKE-PROFIT (independent of edge flip) ───
+        if q != 0:
+            avg_cost = ms["avg_yes_cost"] if q > 0 else ms["avg_no_cost"]
+            if avg_cost > 0:
+                unrealized = (s - avg_cost) if q > 0 else ((100 - s) - avg_cost)
+
+                # Track peak profit per coin
+                if not hasattr(self, '_mm_peak_profit'):
+                    self._mm_peak_profit = {}
+                self._mm_peak_profit[coin] = max(self._mm_peak_profit.get(coin, 0), unrealized)
+
+                # TP trigger: lock partial profit at threshold
+                if unrealized >= MM_DYNAMIC_TP_C:
+                    tp_size = min(abs(q), MM_PARTIAL_TP_SIZE)
+                    if q > 0:
+                        yes_bid = 0
+                        no_bid = min(98, int((100 - s) + MM_UNWIND_BONUS_C))
+                    else:
+                        no_bid = 0
+                        yes_bid = min(98, int(s + MM_UNWIND_BONUS_C))
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 💰 TRAILING TP {coin}: inv={q} → reduce {tp_size} | unrealized={unrealized:.1f}c | peak={self._mm_peak_profit[coin]:.1f}c")
+
+                # Trailing pullback: if profit falls from peak, fully flatten
+                elif unrealized <= self._mm_peak_profit.get(coin, 0) - MM_TRAILING_PULLBACK_C and self._mm_peak_profit.get(coin, 0) > 0:
+                    if q > 0:
+                        no_bid = min(98, int((100 - s) + MM_UNWIND_BONUS_C))
+                        yes_bid = 0
+                    else:
+                        yes_bid = min(98, int(s + MM_UNWIND_BONUS_C))
+                        no_bid = 0
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛑 PULLBACK FLATTEN {coin}: inv={q} | unrealized={unrealized:.1f}c (from peak {self._mm_peak_profit[coin]:.1f}c)")
 
         return yes_bid, no_bid
 
