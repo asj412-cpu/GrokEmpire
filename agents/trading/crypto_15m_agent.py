@@ -304,6 +304,12 @@ class Crypto15mAgent:
                     exchange_api_base=KALSHI_API_BASE
                 )
                 print("🔥 LIVE Kalshi client ready")
+                try:
+                    bal = self.client.get_balance()
+                    self.mm_cycle_balance = float(bal.get("balance_dollars", 55.0))
+                    print(f"  💰 Starting balance: ${self.mm_cycle_balance:.2f}")
+                except Exception:
+                    self.mm_cycle_balance = 55.0
             except Exception as e:
                 print(f"Kalshi client init failed ({e}) – dry-run mode")
         else:
