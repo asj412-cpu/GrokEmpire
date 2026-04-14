@@ -1053,14 +1053,9 @@ class Crypto15mAgent:
         yes_bid = int(round(r_yes - half))
         no_bid = int(round(r_no - half))
 
-        # Suppress the losing side when fair value is extreme
-        # If fair YES is 85c+, NO is the losing side — don't bid it
-        # If fair YES is 15c-, YES is the losing side — don't bid it
-        # This is what was causing 13-18c fills on the wrong side
-        if s >= 80:
-            no_bid = 0   # YES is winning, NO is losing — don't buy NO
-        if s <= 20:
-            yes_bid = 0  # NO is winning, YES is losing — don't buy YES
+        # Both sides stay live — pure A-S market making for round trips
+        # sBRTI speed shifts fair value tick-by-tick, skewing quotes toward the winning side
+        # 10-contract cap + 95c TP are the safety rails
 
         # Settlement guard: no quotes in last 60-90s (tiered_max returns 0)
         tiered_max = get_tiered_max_inventory(cycle_sec, MM_MAX_INVENTORY.get(coin, 8))
