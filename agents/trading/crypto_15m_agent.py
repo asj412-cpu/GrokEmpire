@@ -1064,8 +1064,8 @@ class Crypto15mAgent:
 
         # No hard inventory caps — A-S skew manages inventory naturally:
         # inv_term = q·γ·σ²·T pushes reservation price away from the loaded side
-        # Emergency brake per coin — hard limit regardless of balance
-        if abs(q) >= 12:
+        # Per-coin brake — redundant with fill handler cap but defense in depth
+        if abs(q) >= 6:
             if q > 0:
                 yes_bid = 0
             else:
@@ -1095,12 +1095,7 @@ class Crypto15mAgent:
         if not (tier_min <= no_bid <= tier_max):
             no_bid = 0
 
-        # Exposure cap: at cap, only allow unwind side — suppress the accumulating side
-        if ms.get("_exposure_capped", False):
-            if q > 0:
-                yes_bid = 0  # long YES, only quote NO to unwind
-            elif q < 0:
-                no_bid = 0   # long NO, only quote YES to unwind
+        # Exposure cap handled at entry to _mm_place_quotes_inner — we never reach here if capped
 
         if yes_bid == 0 and no_bid == 0:
             return None
@@ -1166,17 +1161,10 @@ class Crypto15mAgent:
         total_contracts = max(total_from_ticker, total_from_inventory)
         max_exposure_contracts = 10  # hard cap, ~$5 max risk
         if total_contracts >= max_exposure_contracts:
-            q = ms.get("inventory", 0)
-            if q == 0:
-                # Flat — don't open new positions until exposure drops
-                if ms["quotes_active"]:
-                    await self.mm_cancel_all_quotes(coin, f"exposure cap ({total_contracts} contracts)")
-                return
-            # Loaded — let the model run but we'll suppress the accumulating side below
-            # (flag checked after quote computation to zero out the wrong side)
-            ms["_exposure_capped"] = True
-        else:
-            ms["_exposure_capped"] = False
+            # AT CAP: cancel all quotes, don't place new ones. Period.
+            if ms["quotes_active"]:
+                await self.mm_cancel_all_quotes(coin, f"hard cap ({total_contracts})")
+            return
 
         # Step 1: Cancel existing quotes FIRST (cancel-before-replace — safety critical)
         if ms["quotes_active"]:
@@ -1327,16 +1315,17 @@ class Crypto15mAgent:
             rt_emoji = "💚" if spread >= 0 else "🔴"
             print(f"  {rt_emoji} {coin} ROUND-TRIP: {pairs}x pairs | avg spread captured={spread:.1f}c (YES@{ms['avg_yes_cost']:.1f}c + NO@{ms['avg_no_cost']:.1f}c)")
 
-        # Inventory management: A-S skew handles it — no hard caps.
-        # On next requote, the model widens the loaded side and tightens the unwind side.
-        # Emergency brake only at 20 contracts (in mm_compute_quotes_as).
-        # Force immediate requote so skew adjusts to new inventory level
-        ms["requote_pending"] = True
+        # HARD CAP ENFORCEMENT — runs on EVERY fill, cannot be bypassed
+        # Cancel ALL resting orders across ALL coins the moment we hit 10 total
+        total_inv = sum(abs(self.mm_state[c].get("inventory", 0)) for c in BRTI_COIN_CONFIG)
+        if total_inv >= 10:
+            print(f"  🛑 HARD CAP: total inventory {total_inv} >= 10 — canceling ALL quotes ALL coins")
+            for c in BRTI_COIN_CONFIG:
+                asyncio.create_task(self.mm_cancel_all_quotes(c, f"hard cap {total_inv}"))
+                self.mm_state[c]["requote_pending"] = False  # don't re-quote
+            return  # don't trigger requote
 
-        # DO NOT cancel the other side — keep it live for spread capture + inventory flattening
-        # DO NOT set brti_state["held_side"] — that would trigger directional exit logic
-
-        # Trigger immediate requote so inventory skew updates both live quotes
+        # Force immediate requote so inventory skew updates both live quotes
         ms["requote_pending"] = True
 
     async def mm_requote_loop(self):
