@@ -1095,7 +1095,12 @@ class Crypto15mAgent:
         if not (tier_min <= no_bid <= tier_max):
             no_bid = 0
 
-        # Exposure cap handled at entry to _mm_place_quotes_inner — we never reach here if capped
+        # Per-coin cap: at ±6, suppress accumulating side, keep unwind live
+        if abs(q) >= 6:
+            if q > 0:
+                yes_bid = 0  # long YES at cap, only quote NO to unwind
+            else:
+                no_bid = 0   # long NO at cap, only quote YES to unwind
 
         if yes_bid == 0 and no_bid == 0:
             return None
@@ -1154,11 +1159,8 @@ class Crypto15mAgent:
     async def _mm_place_quotes_inner(self, coin, ticker, ms):
         """Inner implementation — separated so quoting_in_flight guard wraps everything."""
         # Step 0: Per-coin cap — 6 contracts max per coin
-        coin_inv = abs(ms.get("inventory", 0))
-        if coin_inv >= 6:
-            if ms["quotes_active"]:
-                await self.mm_cancel_all_quotes(coin, f"cap ({coin_inv})")
-            return
+        # At cap: still compute quotes but zero out the accumulating side
+        # Unwind side stays live so we can get back under the cap
 
         # Step 1: Cancel existing quotes FIRST (cancel-before-replace — safety critical)
         if ms["quotes_active"]:
@@ -1310,13 +1312,23 @@ class Crypto15mAgent:
             print(f"  {rt_emoji} {coin} ROUND-TRIP: {pairs}x pairs | avg spread captured={spread:.1f}c (YES@{ms['avg_yes_cost']:.1f}c + NO@{ms['avg_no_cost']:.1f}c)")
 
         # PER-COIN HARD CAP — runs on EVERY fill, cannot be bypassed
-        # Cancel THIS coin's quotes when it hits 6. Other coin keeps trading independently.
+        # At cap: cancel accumulating side, keep unwind side live for round trips
         coin_inv = abs(ms.get("inventory", 0))
         if coin_inv >= 6:
-            print(f"  🛑 HARD CAP: {coin} inventory {ms['inventory']:+d} (±6 max) — canceling {coin} quotes")
-            asyncio.create_task(self.mm_cancel_all_quotes(coin, f"hard cap {coin_inv}"))
-            ms["requote_pending"] = False
-            return  # don't trigger requote for this coin
+            q = ms.get("inventory", 0)
+            accumulating_side = "no" if q < 0 else "yes"
+            # Cancel the accumulating side's resting order only
+            oid_key = f"{accumulating_side}_order_id"
+            acc_oid = ms.get(oid_key)
+            if acc_oid and self.client and not DRY_RUN:
+                try:
+                    await asyncio.to_thread(self.client.cancel_order, acc_oid)
+                except Exception:
+                    pass
+                ms[oid_key] = None
+            print(f"  🛑 CAP: {coin} inv={q:+d} (±6) — blocked {accumulating_side.upper()}, unwind side live")
+            ms["requote_pending"] = True  # requote to keep unwind side active
+            return
 
         # Force immediate requote so inventory skew updates both live quotes
         ms["requote_pending"] = True
