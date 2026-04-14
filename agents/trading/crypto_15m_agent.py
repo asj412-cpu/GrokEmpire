@@ -976,19 +976,10 @@ class Crypto15mAgent:
             m3 = avg_3s - avg_10s
             print(f"  🔬 {coin} WINDOW: 1s=${avg_1s:,.2f}(Δ{d1:+,.0f} m{m1:+,.1f}) 2s=${avg_2s:,.2f}(Δ{d2:+,.0f} m{m2:+,.1f}) 3s=${avg_3s:,.2f}(Δ{d3:+,.0f} m{m3:+,.1f}) 10s=${avg_10s:,.2f}")
 
-        # Momentum projection: full strength mid-cycle, zero in last 3 minutes
-        # The skew was profitable throughout (helped accumulate winning side),
-        # but in the last 2-3 min informed traders exploit brief bounces to dump
-        # losing-side contracts on us. Cut momentum when AS risk is highest.
+        # Full momentum all cycle — 80/20 losing-side suppression handles AS risk
         momentum = avg_3s - avg_10s
-        if secs_remaining <= 180:
-            mom_weight = 0.0  # last 3 min: pure stable fair value, no momentum
-        else:
-            mom_weight = 1.0  # full momentum projection
-
-        momentum_proj = momentum * min(30.0, secs_remaining) * 0.3 * mom_weight
-        spot = avg_3s if mom_weight > 0 else avg_10s  # responsive when projecting, stable when not
-        distance = (spot + momentum_proj) - st["strike"]
+        momentum_proj = momentum * min(30.0, secs_remaining) * 0.3
+        distance = (avg_3s + momentum_proj) - st["strike"]
 
         # Realized volatility from tick data — adapts spread dynamically
         sigma_brti = cfg.get("sigma_per_sec", MM_SIGMA.get(coin, 2.20))
@@ -1038,11 +1029,9 @@ class Crypto15mAgent:
         half = max(tiered_floor, as_delta / 2.0)
 
         # Momentum widens spread symmetrically — fast moves = more uncertainty = back off
-        # In last 3 min: EXTRA spread widening since we're not projecting momentum on fair value
         abs_mom = abs(momentum)
         if abs_mom > 0:
-            mom_spread = abs_mom * (3.0 if secs_remaining <= 180 else 1.5)
-            half += mom_spread
+            half += abs_mom * 1.5
 
         yes_bid = int(round(r_yes - half))
         no_bid = int(round(r_no - half))
