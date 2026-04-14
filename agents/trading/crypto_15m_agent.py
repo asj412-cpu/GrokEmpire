@@ -88,14 +88,9 @@ def get_tiered_price_bounds(cycle_sec: float) -> tuple:
       600–780s: 15–93c  (wide — direction established, information rich)
       780–840s: 15–93c  (same — last quoting window before guard)
     """
-    if cycle_sec < 120:
-        return 42, 58
-    elif cycle_sec < 300:
-        return 40, 60
-    elif cycle_sec < 600:
-        return 20, 80
-    else:
-        return 15, 93
+    # No hard bounds — the A-S model + 80/20 suppression handles adverse selection
+    # Hard bounds were blocking the unwind side from quoting when inventory was loaded
+    return 1, 99
 
 
 def get_tiered_edge(cycle_sec: float) -> int:
