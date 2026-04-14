@@ -45,7 +45,7 @@ MM_EARLY_MAX_INV = 4                   # first 5 min — more round-trip pairs
 MM_STRONG_EDGE_THRESHOLD_C = 12        # |edge| > 12c → sniper mode
 MM_UNWIND_BONUS_C = 8                  # lowered from 12 — restore breakeven/positive round-trip spreads
 MM_DYNAMIC_TP_C = 12                   # trigger partial TP at +12c unrealized
-MM_TRAILING_PULLBACK_C = 5             # if profit falls 5c from peak, fully flatten
+MM_TRAILING_PULLBACK_C = 8             # 5c was too tight — normal oscillation triggered premature flattens
 MM_PARTIAL_TP_SIZE = 2                 # reduce by this many contracts on first TP hit
 MM_MAX_CONTRACTS = 1           # max contracts per quote side
 MM_QUOTE_MIN_C = 15            # don't quote below 15c — extreme prices = pure adverse selection
@@ -154,8 +154,8 @@ BRTI_COIN_CONFIG = {
         "entry_contracts": 3,
         "momentum_window": 8,          # 8s detection — catch sBRTI lead before Kalshi reprices
         "sigma_per_sec": 2.20,         # calibrated BTC volatility for probability model
-        "mm_edge_c": 10,               # MM edge per side (cents) — widened from 7 for BTC adverse selection
-        "mm_settle_guard_sec": 90,     # cancel MM quotes 90s before settlement (BTC: wider guard)
+        "mm_edge_c": 7,                # aligned with ETH/SOL — 80/20 + flatten handle AS now
+        "mm_settle_guard_sec": 60,     # aligned with ETH/SOL — sniper bypasses on strong edge anyway
         "mm_momentum_threshold": 0.5,  # $0.50 BTC momentum threshold for adverse-fill filter
         "ws_pairs": {"coinbase": "BTC-USD", "kraken": "XBT/USD", "bitstamp": "btcusd", "gemini": "BTCUSD"},
     },
