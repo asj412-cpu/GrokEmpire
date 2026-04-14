@@ -109,16 +109,8 @@ def get_tiered_edge(cycle_sec: float) -> int:
 
 
 def get_tiered_contracts(cycle_sec: float) -> int:
-    """More size in the safe zone to increase fill probability.
-      0–120s  : 2 contracts  (42-58 zone — coin flip, safe to be aggressive)
-      120–300s: 2 contracts  (40-60 zone — aggressive, fills are safe)
-      300–600s: 1 contract   (transitional)
-      600+    : 1 contract   (directional, keep size small)
-    """
-    if cycle_sec < 300:
-        return 2
-    else:
-        return MM_MAX_CONTRACTS
+    """1 contract everywhere — speed makes multi-contract unnecessary."""
+    return 1
 
 
 def _norm_cdf(x):
