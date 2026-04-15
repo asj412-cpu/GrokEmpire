@@ -43,9 +43,9 @@ MM_REQUOTE_THRESHOLD_C = 3     # re-quote if model moved ≥3c
 MM_SETTLE_GUARD_SEC = 60       # cancel all quotes 60s before settlement
 MM_EARLY_MAX_INV = 4                   # first 5 min — more round-trip pairs
 MM_STRONG_EDGE_THRESHOLD_C = 8         # |edge| > 8c → sniper mode — fires more often
-MM_UNWIND_BONUS_C = 8                  # lowered from 12 — restore breakeven/positive round-trip spreads
-MM_DYNAMIC_TP_C = 10                   # trigger partial TP at +10c unrealized — lock profits sooner
-MM_TRAILING_PULLBACK_C = 8             # 5c was too tight — normal oscillation triggered premature flattens
+MM_UNWIND_BONUS_C = 5                  # lowered from 8 — make round trips net positive
+MM_DYNAMIC_TP_C = 18                   # raised — only lock real profit, not noise
+MM_TRAILING_PULLBACK_C = 15            # wide — tolerate normal volatility, only flatten on real reversals
 MM_PARTIAL_TP_SIZE = 2                 # reduce by this many contracts on first TP hit
 MM_MAX_CONTRACTS = 1           # max contracts per quote side
 MM_QUOTE_MIN_C = 15            # don't quote below 15c — extreme prices = pure adverse selection
@@ -1099,6 +1099,13 @@ class Crypto15mAgent:
         if s_check <= 20:
             yes_bid = 0
 
+        # Hard suppression on strong edge (prevents buying losing side at 93c+)
+        if abs(edge_c) > 20:
+            if edge_c > 0:
+                no_bid = 0
+            else:
+                yes_bid = 0
+
         # Settlement guard: no quotes in last 60-90s (tiered_max returns 0)
         tiered_max = get_tiered_max_inventory(cycle_sec, MM_MAX_INVENTORY.get(coin, 8))
         if tiered_max == 0:
@@ -1160,7 +1167,7 @@ class Crypto15mAgent:
         abs_edge = abs(edge_c)
         if abs_edge > MM_STRONG_EDGE_THRESHOLD_C and abs(q) < 6:
             favored = "yes" if edge_c > 0 else "no"
-            sniper_size = get_edge_driven_size(edge_c, cycle_sec, tiered_max)
+            sniper_size = min(2, get_edge_driven_size(edge_c, cycle_sec, tiered_max))  # hard cap sniper at 2
             if favored == "yes":
                 yes_bid = min(98, int(s - 2))
                 no_bid = 0
