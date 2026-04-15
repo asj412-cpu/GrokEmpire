@@ -512,14 +512,15 @@ class Crypto15mAgent:
                     self.current_tickers[coin] = ticker
                     self.ticker_refreshed_ts[ticker] = now_ms
                     tickers.append(ticker)
-                    # Capture strike for BRTI strategy — no fallbacks, API must provide exact value
+                    # Capture strike — only from API, no fallbacks. Once set, locked for the cycle.
                     if coin in BRTI_COIN_CONFIG:
-                        strike = m.get("floor_strike")
-                        if strike:
-                            self.brti_state[coin]["strike"] = float(strike)
-                            print(f"  📍 {coin} strike: ${self.brti_state[coin]['strike']:,.2f}")
-                        else:
-                            print(f"  ⛔ {coin} floor_strike missing — NOT trading (Kalshi API bug)")
+                        if self.brti_state[coin]["strike"] <= 0:  # not yet set this cycle
+                            strike = m.get("floor_strike")
+                            if strike:
+                                self.brti_state[coin]["strike"] = float(strike)
+                                print(f"  📍 {coin} strike: ${self.brti_state[coin]['strike']:,.2f} (locked)")
+                            else:
+                                print(f"  ⛔ {coin} floor_strike missing — waiting for API")
             except Exception as e:
                 print(f"  Open market lookup error {coin}: {e}")
 
