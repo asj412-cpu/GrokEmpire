@@ -426,6 +426,7 @@ class Crypto15mAgent:
                 "yes_fill_times": [],     # per-side fill timestamps for sweep detection
                 "no_fill_times": [],
                 "sweep_pause_until": {"yes": 0.0, "no": 0.0},
+                "active_exit_cooldown_until": 0,  # cooldown for active exit panic button
             }
 
         # Exchange price feeds for synthetic index — keyed by (exchange, coin)
@@ -1059,6 +1060,7 @@ class Crypto15mAgent:
         p_yes = _norm_cdf(distance / effective_sigma)
         s = max(1.0, min(99.0, p_yes * 100.0))  # fair YES price in cents
         edge_c = s - 50  # signed directional edge in cents (+ = YES favored, - = NO favored)
+        ms["_last_edge_c"] = edge_c  # store for active exit check in _mm_place_quotes_inner
 
         # σ_contract: volatility of contract price (cents/√sec-ish)
         # Derived from delta of binary option: dP/dBRTI = 100·φ(z) / (σ·√T)
@@ -1202,6 +1204,18 @@ class Crypto15mAgent:
             if st.get(_sniper_key, 0) < _now_int - 5:
                 st[_sniper_key] = _now_int
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 EDGE SNIPER {coin}: {favored.upper()} @ {yes_bid if favored=='yes' else no_bid}c | size={sniper_size} | edge={edge_c:+.1f}c")
+            ms["_quote_count"] = sniper_size  # store sniper size for placement
+
+        # ─── WINNER ACCUMULATION (leverage directional superiority) ───
+        # When already on winning side with strong continued edge, allow larger sniper size
+        if abs_edge > strong_edge_c and abs(q) < 6 and ((edge_c > 0 and q > 0) or (edge_c < 0 and q < 0)):
+            winner_size = min(4, tiered_max)
+            ms["_quote_count"] = winner_size  # override sniper size with winner size
+            _winner_key = f"_winner_log_{coin}"
+            _now_int2 = int(now_ts)
+            if st.get(_winner_key, 0) < _now_int2 - 5:
+                st[_winner_key] = _now_int2
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 🎯 WINNER ACCUM {coin}: size={winner_size} | edge={edge_c:+.1f}c | inv={q:+d}")
 
         # ─── ACTIVE FLATTEN ON WRONG-SIDE ───
         if q != 0 and abs_edge > strong_edge_c:
@@ -1343,6 +1357,35 @@ class Crypto15mAgent:
             return
         yes_bid, no_bid = quotes
 
+        # ─── ACTIVE EXIT on extreme regime shift (panic button, not a replacement) ───
+        inv_now = self.ticker_contracts.get(ticker, 0)
+        active_exit_cooldown = ms.get("active_exit_cooldown_until", 0)
+        if inv_now != 0 and time.time() > active_exit_cooldown:
+            _exit_edge_c = ms.get("_last_edge_c", 0)
+            wrong_side = (inv_now > 0 and _exit_edge_c < 0) or (inv_now < 0 and _exit_edge_c > 0)
+            if wrong_side and abs(_exit_edge_c) > 15:  # extreme regime reversal only
+                sell_side = "yes" if inv_now > 0 else "no"
+                cross_price = 1
+                if self.client and not DRY_RUN:
+                    try:
+                        exit_id = f"active-exit-{coin}-{int(time.time()*1000)}"
+                        await asyncio.to_thread(
+                            self.client.create_order,
+                            ticker=ticker,
+                            client_order_id=exit_id,
+                            side=sell_side,
+                            action="sell",
+                            count=abs(inv_now),
+                            type="limit",
+                            yes_price=cross_price if sell_side == "yes" else None,
+                            no_price=cross_price if sell_side == "no" else None,
+                        )
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔥 ACTIVE EXIT {coin}: {sell_side.upper()} {abs(inv_now)}x (limit@{cross_price}c cross) | edge={_exit_edge_c:+.1f}c")
+                        ms["active_exit_cooldown_until"] = time.time() + 10  # 10s cooldown to prevent thrash
+                        # Don't zero ticker_contracts here — let WS fill handler update it authoritatively
+                    except Exception as e:
+                        print(f"  → Active exit error: {e}")
+
         # Step 3b: Taker-fill guard — ensure bids sit BELOW the current ask (passive maker only)
         # If our bid >= best ask, we'd immediately cross and fill as a taker (not a maker).
         # Reduce to ask - 1 so the order rests. If that drops below MM_QUOTE_MIN_C, skip it.
@@ -1369,7 +1412,7 @@ class Crypto15mAgent:
         if self.client and not DRY_RUN:
             ts_ms = int(time.time() * 1000)
             cycle_sec = (datetime.now().minute % 15) * 60 + datetime.now().second
-            quote_count = get_tiered_contracts(cycle_sec)
+            quote_count = ms.get("_quote_count", get_tiered_contracts(cycle_sec))
             batch = []
             yes_cid = None
             no_cid = None
