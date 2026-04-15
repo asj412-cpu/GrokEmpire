@@ -37,22 +37,23 @@ RATCHET_PERCENT = 0.80
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 MM_MODE = os.getenv('MM_MODE', 'false').lower() == 'true'
 
-# ─── Market-Making Config ───
-MM_EDGE_C = 6                  # edge below fair value per side (cents)
-MM_REQUOTE_THRESHOLD_C = 3     # re-quote if model moved ≥3c
-MM_SETTLE_GUARD_SEC = 60       # cancel all quotes 60s before settlement
-MM_EARLY_MAX_INV = 4                   # first 5 min — more round-trip pairs
-MM_STRONG_EDGE_THRESHOLD_C = 8         # |edge| > 8c → sniper mode — fires more often
-MM_UNWIND_BONUS_C = 5                  # lowered from 8 — make round trips net positive
-MM_DYNAMIC_TP_C = 12                   # tightened — clean signal means 12c unrealized is real profit
-MM_TRAILING_PULLBACK_C = 6             # tight — clean signal, 6c pullback from peak = take the money
-MM_PARTIAL_TP_SIZE = 2                 # reduce by this many contracts on first TP hit
-MM_MAX_CONTRACTS = 1           # max contracts per quote side
-MM_QUOTE_MIN_C = 15            # don't quote below 15c — extreme prices = pure adverse selection
-MM_QUOTE_MAX_C = 93            # allow quoting up to 93c — winning side needs to participate late cycle
-MM_RECONCILE_INTERVAL_SEC = 10 # safety reconciliation frequency
-MM_SIGMA = {"BTC": 2.20, "ETH": 0.071, "SOL": 0.015}   # SOL recalibrated: 0.065 implied $2.15 range, actual is $0.30
-MM_SMOOTHING = 0.55            # CF BRTI 1-min average smoothing factor
+# ─── Market-Making Config ─── (CF RTI optimized – profit maximized)
+MM_EDGE_C = 5                          # tighter base edge → more two-sided fills
+MM_REQUOTE_THRESHOLD_C = 2             # faster response to fills
+MM_SETTLE_GUARD_SEC = 60
+MM_EARLY_MAX_INV = 6                   # increased safely – clean signal allows more round-trips early
+MM_STRONG_EDGE_THRESHOLD_C = 9         # lowered from 11 – snipe on real conviction sooner
+MM_UNWIND_BONUS_C = 3                  # lowered – round-trips now strongly +EV
+MM_DYNAMIC_TP_C = 13                   # balanced – lock real profit without chopping winners
+MM_TRAILING_PULLBACK_C = 10            # tolerates normal order-book volatility
+MM_PARTIAL_TP_SIZE = 2
+MM_MAX_CONTRACTS = 1
+MM_QUOTE_MIN_C = 15
+MM_QUOTE_MAX_C = 93
+MM_RECONCILE_INTERVAL_SEC = 10
+MM_SIGMA = {"BTC": 2.20, "ETH": 0.071, "SOL": 0.065}   # unchanged (settlement-calibrated)
+MM_SMOOTHING = 0.55                    # unchanged (matches Kalshi VWAP)
+MM_SUPPRESSION_FLOOR_C = 14            # strong suppression on losing side
 
 # ─── Avellaneda-Stoikov MM Parameters ───
 MM_GAMMA = {"BTC": 1.0, "ETH": 1.0, "SOL": 1.0}   # 0.8 was too tight — high volume but settlement losses ate spread gains
