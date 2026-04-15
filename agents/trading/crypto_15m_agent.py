@@ -1192,17 +1192,43 @@ class Crypto15mAgent:
                 yes_bid = 0
             print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 EDGE SNIPER {coin}: {favored.upper()} @ {yes_bid if favored=='yes' else no_bid}c | size={sniper_size} | edge={edge_c:+.1f}c")
 
-        # ─── ACTIVE FLATTEN ON WRONG-SIDE ───
+        # ─── ACTIVE FLATTEN — orderbook momentum driven ───
+        # Uses CF RTI orderbook data to detect wrong-side BEFORE trade data confirms
+        # When edge is strongly against us, cross the spread to exit NOW
         if q != 0 and abs_edge > MM_STRONG_EDGE_THRESHOLD_C:
             wrong_side = (q > 0 and edge_c < 0) or (q < 0 and edge_c > 0)
             if wrong_side:
-                if q > 0:
-                    no_bid = min(98, int((100 - s) + MM_UNWIND_BONUS_C))
-                    yes_bid = 0
+                # Check CF RTI momentum: is the orderbook accelerating against us?
+                rti_val = self.cf_rti[coin].compute() if coin in self.cf_rti else None
+                rti_confirms = False
+                if rti_val and st["strike"] > 0:
+                    rti_dist = rti_val - st["strike"]
+                    rti_confirms = (q > 0 and rti_dist < 0) or (q < 0 and rti_dist > 0)
+
+                if rti_confirms:
+                    # Orderbook confirms we're wrong — flag for active exit in requote loop
+                    sell_side = "yes" if q > 0 else "no"
+                    ticker_now = self.current_tickers.get(coin, "")
+                    prices_now = self.ws_prices.get(ticker_now, {})
+                    yb = prices_now.get("yes_bid", 0)
+                    ya = prices_now.get("yes_ask", 0)
+                    exit_val = yb if sell_side == "yes" else (100 - ya)
+                    # Set flag for async execution in requote loop
+                    ms["_ob_flatten_pending"] = {
+                        "side": sell_side, "count": abs(q), "ticker": ticker_now,
+                        "yes_bid": yb, "yes_ask": ya, "exit_val": exit_val, "edge": edge_c
+                    }
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 📕 OB-FLATTEN {coin}: SELL {sell_side.upper()} {abs(q)}x @ {exit_val}c | edge={edge_c:+.1f}c | RTI confirms wrong side")
+                    return yes_bid, no_bid  # skip further quote logic
                 else:
-                    yes_bid = min(98, int(s + MM_UNWIND_BONUS_C))
-                    no_bid = 0
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛑 FLATTEN {coin}: inv={q} | edge={edge_c:+.1f}c")
+                    # Edge says wrong side but orderbook not confirming yet — passive unwind
+                    if q > 0:
+                        no_bid = min(98, int((100 - s) + MM_UNWIND_BONUS_C))
+                        yes_bid = 0
+                    else:
+                        yes_bid = min(98, int(s + MM_UNWIND_BONUS_C))
+                        no_bid = 0
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛑 FLATTEN {coin}: inv={q} | edge={edge_c:+.1f}c (passive — RTI not confirming yet)")
 
         # ─── TRAILING DYNAMIC TAKE-PROFIT (independent of edge flip) ───
         if q != 0:
@@ -1571,6 +1597,33 @@ class Crypto15mAgent:
                         no_moved = abs(no_bid - ms["no_price"]) >= MM_REQUOTE_THRESHOLD_C if no_bid > 0 and ms["no_price"] > 0 else no_bid != ms["no_price"]
                         if not yes_moved and not no_moved:
                             continue  # prices haven't moved enough
+
+                    # Execute pending OB-flatten (async sell order)
+                    ob_flatten = ms.get("_ob_flatten_pending")
+                    if ob_flatten:
+                        ms["_ob_flatten_pending"] = None
+                        await self.mm_cancel_all_quotes(coin, "ob-flatten")
+                        if self.client and not DRY_RUN:
+                            try:
+                                ae_id = f"mm-obflatten-{coin.lower()}-{int(time.time()*1000)}"
+                                await asyncio.to_thread(
+                                    self.client.create_order,
+                                    ticker=ob_flatten["ticker"], client_order_id=ae_id,
+                                    side=ob_flatten["side"], action="sell", count=ob_flatten["count"], type="limit",
+                                    yes_price=ob_flatten["yes_bid"] if ob_flatten["side"] == "yes" else None,
+                                    no_price=(100 - ob_flatten["yes_ask"]) if ob_flatten["side"] == "no" else None,
+                                )
+                                ms["inventory"] = 0
+                                ms["total_yes_bought"] = 0
+                                ms["total_no_bought"] = 0
+                                ms["avg_yes_cost"] = 0.0
+                                ms["avg_no_cost"] = 0.0
+                                self.ticker_contracts[ob_flatten["ticker"]] = 0
+                                if hasattr(self, '_mm_peak_profit'):
+                                    self._mm_peak_profit[coin] = 0
+                            except Exception as e:
+                                print(f"  → {coin} OB-flatten exec error: {e}")
+                        continue
 
                     await self.mm_place_quotes(coin)
                 except Exception as e:
