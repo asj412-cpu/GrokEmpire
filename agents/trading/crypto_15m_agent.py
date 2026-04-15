@@ -396,6 +396,12 @@ class Crypto15mAgent:
 
         # ─── Market-Making State ───
         self.mm_mode = MM_MODE
+
+        # CF RTI engines — orderbook-based index computation (fallback for strike + better fair value)
+        from agents.trading.cf_rti_engine import CFRealTimeIndex
+        self.cf_rti = {}
+        for _coin in BRTI_COIN_CONFIG:
+            self.cf_rti[_coin] = CFRealTimeIndex(_coin)
         self.mm_state: Dict[str, dict] = {}
         for _coin in BRTI_COIN_CONFIG:
             self.mm_state[_coin] = {
@@ -512,13 +518,20 @@ class Crypto15mAgent:
                     self.current_tickers[coin] = ticker
                     self.ticker_refreshed_ts[ticker] = now_ms
                     tickers.append(ticker)
-                    # Capture strike — only from API, no fallbacks. Once set, locked for the cycle.
+                    # Capture strike — API first, CF RTI engine as fallback. Once set, locked for the cycle.
                     if coin in BRTI_COIN_CONFIG:
                         if self.brti_state[coin]["strike"] <= 0:  # not yet set this cycle
                             strike = m.get("floor_strike")
                             if strike:
                                 self.brti_state[coin]["strike"] = float(strike)
-                                print(f"  📍 {coin} strike: ${self.brti_state[coin]['strike']:,.2f} (locked)")
+                                print(f"  📍 {coin} strike: ${self.brti_state[coin]['strike']:,.2f} (locked, API)")
+                            elif hasattr(self, 'cf_rti') and coin in self.cf_rti:
+                                rti_val = self.cf_rti[coin].compute()
+                                if rti_val and rti_val > 0:
+                                    self.brti_state[coin]["strike"] = rti_val
+                                    print(f"  📍 {coin} strike: ${rti_val:,.2f} (locked, CF RTI fallback)")
+                                else:
+                                    print(f"  ⛔ {coin} floor_strike missing, RTI not ready")
                             else:
                                 print(f"  ⛔ {coin} floor_strike missing — waiting for API")
             except Exception as e:
@@ -2306,6 +2319,172 @@ class Crypto15mAgent:
 
     # ─── Main ─────────────────────────────────────────────────
 
+    async def _cf_orderbook_feeds(self):
+        """Launch orderbook WS feeds for CF RTI computation (strike fallback + fair value)."""
+        import websockets as ws_lib
+
+        async def coinbase_l2():
+            url = "wss://ws-feed.exchange.coinbase.com"
+            pairs = {"BTC-USD": "BTC", "ETH-USD": "ETH", "SOL-USD": "SOL"}
+            books = {c: {"bids": {}, "asks": {}} for c in pairs.values()}
+            while self.running:
+                try:
+                    async with ws_lib.connect(url, ping_interval=30, max_size=10_000_000) as ws:
+                        await ws.send(json.dumps({"type": "subscribe", "channels": [{"name": "level2_batch", "product_ids": list(pairs.keys())}]}))
+                        async for msg in ws:
+                            data = json.loads(msg)
+                            product = data.get("product_id", "")
+                            coin = pairs.get(product)
+                            if not coin:
+                                continue
+                            book = books[coin]
+                            if data.get("type") == "snapshot":
+                                book["bids"] = {float(p): float(s) for p, s in data.get("bids", [])}
+                                book["asks"] = {float(p): float(s) for p, s in data.get("asks", [])}
+                            elif data.get("type") == "l2update":
+                                for side, price, size in data.get("changes", []):
+                                    p, s = float(price), float(size)
+                                    target = book["bids"] if side == "buy" else book["asks"]
+                                    if s == 0:
+                                        target.pop(p, None)
+                                    else:
+                                        target[p] = s
+                            if coin in self.cf_rti:
+                                bids = sorted(book["bids"].items(), key=lambda x: -x[0])[:50]
+                                asks = sorted(book["asks"].items(), key=lambda x: x[0])[:50]
+                                self.cf_rti[coin].update_orderbook("coinbase", bids, asks)
+                except Exception as e:
+                    await asyncio.sleep(3)
+
+        async def kraken_book():
+            url = "wss://ws.kraken.com"
+            pairs = {"XBT/USD": "BTC", "ETH/USD": "ETH", "SOL/USD": "SOL"}
+            books = {c: {"bids": {}, "asks": {}} for c in pairs.values()}
+            while self.running:
+                try:
+                    async with ws_lib.connect(url, ping_interval=30) as ws:
+                        await ws.send(json.dumps({"event": "subscribe", "pair": list(pairs.keys()), "subscription": {"name": "book", "depth": 25}}))
+                        async for msg in ws:
+                            data = json.loads(msg)
+                            if isinstance(data, list) and len(data) >= 4:
+                                pair_name = data[-1]
+                                coin = pairs.get(pair_name)
+                                if not coin:
+                                    continue
+                                book = books[coin]
+                                for part in data[1:-1]:
+                                    if isinstance(part, dict):
+                                        for key in ["bs", "b"]:
+                                            if key in part:
+                                                for e in part[key]:
+                                                    p, s = float(e[0]), float(e[1])
+                                                    if s == 0: book["bids"].pop(p, None)
+                                                    else: book["bids"][p] = s
+                                        for key in ["as", "a"]:
+                                            if key in part:
+                                                for e in part[key]:
+                                                    p, s = float(e[0]), float(e[1])
+                                                    if s == 0: book["asks"].pop(p, None)
+                                                    else: book["asks"][p] = s
+                                if coin in self.cf_rti:
+                                    bids = sorted(book["bids"].items(), key=lambda x: -x[0])[:50]
+                                    asks = sorted(book["asks"].items(), key=lambda x: x[0])[:50]
+                                    self.cf_rti[coin].update_orderbook("kraken", bids, asks)
+                except Exception as e:
+                    await asyncio.sleep(3)
+
+        async def bitstamp_book():
+            url = "wss://ws.bitstamp.net"
+            pairs = {"btcusd": "BTC", "ethusd": "ETH", "solusd": "SOL", "xrpusd": "XRP"}
+            while self.running:
+                try:
+                    async with ws_lib.connect(url, ping_interval=30) as ws:
+                        for pair in pairs:
+                            await ws.send(json.dumps({"event": "bts:subscribe", "data": {"channel": f"order_book_{pair}"}}))
+                        async for msg in ws:
+                            data = json.loads(msg)
+                            if data.get("event") == "data":
+                                channel = data.get("channel", "")
+                                for pair, coin in pairs.items():
+                                    if pair in channel and coin in self.cf_rti:
+                                        bd = data.get("data", {})
+                                        bids = [(float(b[0]), float(b[1])) for b in bd.get("bids", [])][:50]
+                                        asks = [(float(a[0]), float(a[1])) for a in bd.get("asks", [])][:50]
+                                        self.cf_rti[coin].update_orderbook("bitstamp", bids, asks)
+                                        break
+                except Exception as e:
+                    await asyncio.sleep(3)
+
+        async def gemini_book(coin, symbol):
+            url = f"wss://api.gemini.com/v1/marketdata/{symbol}?top_of_book=false"
+            book = {"bids": {}, "asks": {}}
+            while self.running:
+                try:
+                    async with ws_lib.connect(url, ping_interval=30) as ws:
+                        async for msg in ws:
+                            data = json.loads(msg)
+                            for event in data.get("events", []):
+                                if event.get("type") == "change":
+                                    side = event.get("side")
+                                    p = float(event.get("price", 0))
+                                    r = float(event.get("remaining", 0))
+                                    target = book["bids"] if side == "bid" else book["asks"]
+                                    if r == 0: target.pop(p, None)
+                                    else: target[p] = r
+                            if coin in self.cf_rti:
+                                bids = sorted(book["bids"].items(), key=lambda x: -x[0])[:50]
+                                asks = sorted(book["asks"].items(), key=lambda x: x[0])[:50]
+                                self.cf_rti[coin].update_orderbook("gemini", bids, asks)
+                except Exception as e:
+                    await asyncio.sleep(3)
+
+        async def crypto_com_book():
+            url = "wss://stream.crypto.com/exchange/v1/market"
+            pairs = {"BTC_USD": "BTC", "ETH_USD": "ETH", "SOL_USD": "SOL", "XRP_USD": "XRP"}
+            books = {c: {"bids": {}, "asks": {}} for c in pairs.values()}
+            while self.running:
+                try:
+                    async with ws_lib.connect(url, ping_interval=30) as ws:
+                        await ws.send(json.dumps({"id": 1, "method": "subscribe", "params": {"channels": [f"book.{p}.50" for p in pairs.keys()]}}))
+                        async for msg in ws:
+                            data = json.loads(msg)
+                            result = data.get("result", {})
+                            channel = result.get("channel", "")
+                            if not channel.startswith("book."): continue
+                            instrument = channel.split(".")[1]
+                            coin = pairs.get(instrument)
+                            if not coin: continue
+                            bd = result.get("data", [{}])
+                            if isinstance(bd, list) and bd: bd = bd[0]
+                            book = books[coin]
+                            for b in bd.get("bids", []):
+                                p, s = float(b[0]), float(b[1])
+                                if s == 0: book["bids"].pop(p, None)
+                                else: book["bids"][p] = s
+                            for a in bd.get("asks", []):
+                                p, s = float(a[0]), float(a[1])
+                                if s == 0: book["asks"].pop(p, None)
+                                else: book["asks"][p] = s
+                            if coin in self.cf_rti:
+                                bids = sorted(book["bids"].items(), key=lambda x: -x[0])[:50]
+                                asks = sorted(book["asks"].items(), key=lambda x: x[0])[:50]
+                                self.cf_rti[coin].update_orderbook("crypto_com", bids, asks)
+                except Exception as e:
+                    await asyncio.sleep(3)
+
+        # Launch all orderbook feeds
+        gemini_pairs = {"BTC": "BTCUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}
+        tasks = [
+            asyncio.create_task(coinbase_l2()),
+            asyncio.create_task(kraken_book()),
+            asyncio.create_task(bitstamp_book()),
+            asyncio.create_task(crypto_com_book()),
+        ]
+        for coin, symbol in gemini_pairs.items():
+            tasks.append(asyncio.create_task(gemini_book(coin, symbol)))
+        print("📊 CF RTI orderbook feeds launching (5 exchanges: Coinbase, Kraken, Bitstamp, Gemini, Crypto.com)")
+        await asyncio.gather(*tasks)
+
     async def run(self):
         coins_str = ", ".join(BRTI_COIN_CONFIG.keys())
         mode_str = "MARKET MAKER" if self.mm_mode else "DIRECTIONAL"
@@ -2336,8 +2515,10 @@ class Crypto15mAgent:
         if self.mm_mode:
             asyncio.create_task(self.mm_requote_loop())
             asyncio.create_task(self.mm_safety_reconcile_loop())
+        # CF RTI orderbook feeds (for strike fallback + accurate fair value)
+        asyncio.create_task(self._cf_orderbook_feeds())
         brti_coins_str = "+".join(BRTI_COIN_CONFIG.keys())
-        print(f"📡 Synthetic index feeds launching ({brti_coins_str}, 4 exchanges) + fast flip loop + {'MM quoting' if self.mm_mode else 'directional entry'}")
+        print(f"📡 Synthetic index feeds launching ({brti_coins_str}, 4+ exchanges) + CF RTI orderbook feeds + fast flip loop + {'MM quoting' if self.mm_mode else 'directional entry'}")
 
         # Keep main alive
         while self.running:
