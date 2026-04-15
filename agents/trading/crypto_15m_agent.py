@@ -41,7 +41,7 @@ MM_MODE = os.getenv('MM_MODE', 'false').lower() == 'true'
 MM_EDGE_C = 6                  # edge below fair value per side (cents)
 MM_REQUOTE_THRESHOLD_C = 3     # re-quote if model moved ≥3c
 MM_SETTLE_GUARD_SEC = 60       # cancel all quotes 60s before settlement
-MM_EARLY_MAX_INV = 5                   # less AS risk with accurate CF RTI data
+MM_EARLY_MAX_INV = 2                   # CF RTI is faster/more confident — limit early accumulation
 MM_STRONG_EDGE_THRESHOLD_C = 11        # cleaner signal from CF RTI → can snipe earlier
 MM_UNWIND_BONUS_C = 4                  # round trips are strongly +EV with CF RTI accuracy
 MM_DYNAMIC_TP_C = 14                   # winners reliably identified with CF RTI, lock earlier
@@ -1499,6 +1499,10 @@ class Crypto15mAgent:
                     ms = self.mm_state[coin]
                     st = self.brti_state[coin]
 
+                    # Skip if in post-flatten cooldown (prevent re-accumulating the losing side)
+                    if ms.get("_ob_flatten_cooldown_until", 0) > time.time():
+                        continue
+
                     # Skip if no pending tick (event-driven — avoids needless API calls)
                     if not ms["requote_pending"]:
                         continue
@@ -1621,6 +1625,8 @@ class Crypto15mAgent:
                                 self.ticker_contracts[ob_flatten["ticker"]] = 0
                                 if hasattr(self, '_mm_peak_profit'):
                                     self._mm_peak_profit[coin] = 0
+                                # Cooldown: don't re-quote this coin for 30s after flatten
+                                ms["_ob_flatten_cooldown_until"] = time.time() + 30
                             except Exception as e:
                                 print(f"  → {coin} OB-flatten exec error: {e}")
                         continue
