@@ -515,6 +515,19 @@ class Crypto15mAgent:
                     # Capture strike for BRTI strategy
                     if coin in BRTI_COIN_CONFIG:
                         strike = m.get("floor_strike")
+                        # Fallback 1: parse from yes_sub_title
+                        if not strike:
+                            sub = m.get("yes_sub_title", "") or ""
+                            if "$" in sub and "TBD" not in sub:
+                                try:
+                                    strike_str = sub.split("$")[1].replace(",", "").strip()
+                                    strike = float(strike_str)
+                                except (IndexError, ValueError):
+                                    pass
+                        # Fallback 2: use current sBRTI as strike (Kalshi API floor_strike bug)
+                        if not strike and self.brti_state[coin]["ticks"]:
+                            strike = self.brti_state[coin]["ticks"][-1][1]
+                            print(f"  ⚠️ {coin} floor_strike missing — using sBRTI ${strike:,.2f} as strike")
                         if strike:
                             self.brti_state[coin]["strike"] = float(strike)
                             print(f"  📍 {coin} strike: ${self.brti_state[coin]['strike']:,.2f}")
