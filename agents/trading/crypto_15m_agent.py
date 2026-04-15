@@ -155,8 +155,8 @@ BRTI_COIN_CONFIG = {
         "mm_edge_c": 6,                # BTC: RTI noise <1c → tight edge is safe
         "mm_strong_edge_c": 8,          # BTC: back to proven threshold — exit speed > noise avoidance
         "mm_requote_threshold_c": 3,   # BTC: standard requote
-        "mm_suppress_high": 80,        # BTC: standard 80/20
-        "mm_suppress_low": 20,
+        "mm_suppress_high": 65,        # BTC: tighter — stop quoting NO when >65% YES likely (Task B)
+        "mm_suppress_low": 35,
         "mm_settle_guard_sec": 60,     # aligned with ETH/SOL — sniper bypasses on strong edge anyway
         "mm_momentum_threshold": 0.5,  # $0.50 BTC momentum threshold for adverse-fill filter
         "ws_pairs": {"coinbase": "BTC-USD", "kraken": "XBT/USD", "bitstamp": "btcusd", "gemini": "BTCUSD"},
@@ -191,8 +191,8 @@ BRTI_COIN_CONFIG = {
         "mm_edge_c": 8,                # ETH: RTI noise 3-7c near strike — wider than BTC
         "mm_strong_edge_c": 8,          # ETH: back to proven threshold
         "mm_requote_threshold_c": 3,   # ETH: standard requote
-        "mm_suppress_high": 80,        # ETH: back to standard 80/20
-        "mm_suppress_low": 20,
+        "mm_suppress_high": 70,        # ETH: tighter — suppress MM at 30/70 extremes (Task B)
+        "mm_suppress_low": 30,
         "mm_settle_guard_sec": 60,     # cancel MM quotes 60s before settlement (ETH: keep current)
         "mm_momentum_threshold": 0.25, # ETH: only apply momentum adj if |momentum| >= $0.25 (filters noise)
         "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD"},
@@ -226,8 +226,8 @@ BRTI_COIN_CONFIG = {
         "mm_edge_c": 10,                  # SOL: RTI noise 6-16c near strike — widest edge
         "mm_strong_edge_c": 8,            # SOL: back to proven threshold — exit speed matters
         "mm_requote_threshold_c": 3,      # SOL: back to standard
-        "mm_suppress_high": 80,           # SOL: back to standard 80/20
-        "mm_suppress_low": 20,
+        "mm_suppress_high": 75,           # SOL: tighter — suppress MM at 25/75 extremes (Task B)
+        "mm_suppress_low": 25,
         "mm_settle_guard_sec": 60,
         "mm_momentum_threshold": 0.10,    # SOL: filter noise at $0.10
         "ws_pairs": {"coinbase": "SOL-USD", "kraken": "SOL/USD", "bitstamp": "solusd", "gemini": "SOLUSD"},
@@ -1191,10 +1191,10 @@ class Crypto15mAgent:
             favored = "yes" if edge_c > 0 else "no"
             sniper_size = min(2, get_edge_driven_size(edge_c, cycle_sec, tiered_max, strong_edge_c))  # hard cap sniper at 2
             if favored == "yes":
-                yes_bid = min(98, int(s - 2))
+                yes_bid = min(MM_QUOTE_MAX_C, int(s - 2))   # never above quote max — TP can't exit above cap
                 no_bid = 0
             else:
-                no_bid = min(98, int((100 - s) - 2))
+                no_bid = min(MM_QUOTE_MAX_C, int((100 - s) - 2))   # never above quote max
                 yes_bid = 0
             # Throttle sniper logs: once per 5s per coin
             _sniper_key = f"_sniper_log_{coin}"
