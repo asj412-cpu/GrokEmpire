@@ -55,7 +55,7 @@ MM_SIGMA = {"BTC": 2.20, "ETH": 0.071, "SOL": 0.065}   # calibrated σ/sec
 MM_SMOOTHING = 0.55            # CF BRTI 1-min average smoothing factor
 
 # ─── Avellaneda-Stoikov MM Parameters ───
-MM_GAMMA = {"BTC": 1.0, "ETH": 1.0, "SOL": 1.0}   # tighter spreads for more round-trip volume
+MM_GAMMA = {"BTC": 0.8, "ETH": 0.8, "SOL": 0.8}   # tighter spreads — more fills, more round trips
 MM_KAPPA_DEFAULT = 0.5                        # fills/sec bootstrap — 0.02 made spread too wide, only 1 side quoted
 MM_KAPPA_WINDOW_SEC = 60                     # rolling window for κ estimation
 MM_SPREAD_FLOOR_C = 3                        # minimum half-spread per side (cents)
@@ -1094,11 +1094,9 @@ class Crypto15mAgent:
             s_check = max(1.0, min(99.0, raw_p * 100.0))
         else:
             s_check = s
-        # 90/10 suppression — wider than 80/20, allows more round trips in 80-90 zone
-        # WATCH: if adverse fills appear in this zone, revert to 80/20
-        if s_check >= 90:
+        if s_check >= 80:
             no_bid = 0
-        if s_check <= 10:
+        if s_check <= 20:
             yes_bid = 0
 
         # Settlement guard: no quotes in last 60-90s (tiered_max returns 0)
