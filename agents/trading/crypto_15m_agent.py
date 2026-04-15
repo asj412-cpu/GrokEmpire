@@ -1237,7 +1237,8 @@ class Crypto15mAgent:
                 if ticker and self.client and not DRY_RUN:
                     try:
                         ae_id = f"ae-{coin.lower()}-{int(time.time()*1000)}"
-                        self.client.create_order(
+                        await asyncio.to_thread(
+                            self.client.create_order,
                             ticker=ticker, client_order_id=ae_id,
                             side="yes" if q > 0 else "no",
                             action="sell", count=abs(q),
@@ -1373,7 +1374,7 @@ class Crypto15mAgent:
             await self._mm_cancel_stacking_side(coin, ms)
 
         # Step 2: Compute A-S quotes (inventory-skewed, both sides stay open after fills)
-        quotes = self.mm_compute_quotes_as(coin)
+        quotes = await self.mm_compute_quotes_as(coin)
         if not quotes:
             return
         yes_bid, no_bid = quotes
@@ -1668,7 +1669,7 @@ class Crypto15mAgent:
                         continue
 
                     # Compute A-S quotes (inventory-skewed)
-                    quotes = self.mm_compute_quotes_as(coin)
+                    quotes = await self.mm_compute_quotes_as(coin)
                     if not quotes:
                         if ms["quotes_active"]:
                             await self.mm_cancel_all_quotes(coin, "no valid quote")
