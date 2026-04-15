@@ -980,7 +980,7 @@ class Crypto15mAgent:
             return MM_KAPPA_DEFAULT
         return max(MM_KAPPA_DEFAULT, n / window)
 
-    def mm_compute_quotes_as(self, coin):
+    async def mm_compute_quotes_as(self, coin):
         """Avellaneda-Stoikov quote computation.
         Returns (yes_bid, no_bid) in cents, or None if no valid quote can be placed.
 
@@ -1379,13 +1379,15 @@ class Crypto15mAgent:
         yes_bid, no_bid = quotes
 
         # ─── ACTIVE EXIT on extreme regime shift (panic button, not a replacement) ───
-        inv_now = self.ticker_contracts.get(ticker, 0)
+        # Use ms["inventory"] (signed: + = long YES, - = long NO) not ticker_contracts (always ≥0)
+        inv_signed = ms.get("inventory", 0)
         active_exit_cooldown = ms.get("active_exit_cooldown_until", 0)
-        if inv_now != 0 and time.time() > active_exit_cooldown:
+        if inv_signed != 0 and time.time() > active_exit_cooldown:
             _exit_edge_c = ms.get("_last_edge_c", 0)
-            wrong_side = (inv_now > 0 and _exit_edge_c < 0) or (inv_now < 0 and _exit_edge_c > 0)
+            wrong_side = (inv_signed > 0 and _exit_edge_c < 0) or (inv_signed < 0 and _exit_edge_c > 0)
             if wrong_side and abs(_exit_edge_c) > 15:  # extreme regime reversal only
-                sell_side = "yes" if inv_now > 0 else "no"
+                sell_side = "yes" if inv_signed > 0 else "no"
+                exit_count = abs(inv_signed)
                 cross_price = 1
                 if self.client and not DRY_RUN:
                     try:
@@ -1396,12 +1398,12 @@ class Crypto15mAgent:
                             client_order_id=exit_id,
                             side=sell_side,
                             action="sell",
-                            count=abs(inv_now),
+                            count=exit_count,
                             type="limit",
                             yes_price=cross_price if sell_side == "yes" else None,
                             no_price=cross_price if sell_side == "no" else None,
                         )
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔥 ACTIVE EXIT {coin}: {sell_side.upper()} {abs(inv_now)}x (limit@{cross_price}c cross) | edge={_exit_edge_c:+.1f}c")
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔥 ACTIVE EXIT {coin}: {sell_side.upper()} {exit_count}x (limit@{cross_price}c cross) | edge={_exit_edge_c:+.1f}c")
                         ms["active_exit_cooldown_until"] = time.time() + 10  # 10s cooldown to prevent thrash
                         # Don't zero ticker_contracts here — let WS fill handler update it authoritatively
                     except Exception as e:
