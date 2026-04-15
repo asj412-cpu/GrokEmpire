@@ -41,17 +41,17 @@ MM_MODE = os.getenv('MM_MODE', 'false').lower() == 'true'
 MM_EDGE_C = 6                  # edge below fair value per side (cents)
 MM_REQUOTE_THRESHOLD_C = 3     # re-quote if model moved ≥3c
 MM_SETTLE_GUARD_SEC = 60       # cancel all quotes 60s before settlement
-MM_EARLY_MAX_INV = 2                   # CF RTI is faster/more confident — limit early accumulation
-MM_STRONG_EDGE_THRESHOLD_C = 11        # cleaner signal from CF RTI → can snipe earlier
-MM_UNWIND_BONUS_C = 4                  # round trips are strongly +EV with CF RTI accuracy
-MM_DYNAMIC_TP_C = 14                   # winners reliably identified with CF RTI, lock earlier
-MM_TRAILING_PULLBACK_C = 11            # tighter — real reversals show up faster with clean data
+MM_EARLY_MAX_INV = 4                   # first 5 min — more round-trip pairs
+MM_STRONG_EDGE_THRESHOLD_C = 8         # |edge| > 8c → sniper mode — fires more often
+MM_UNWIND_BONUS_C = 5                  # lowered from 8 — make round trips net positive
+MM_DYNAMIC_TP_C = 12                   # tightened — clean signal means 12c unrealized is real profit
+MM_TRAILING_PULLBACK_C = 6             # tight — clean signal, 6c pullback from peak = take the money
 MM_PARTIAL_TP_SIZE = 2                 # reduce by this many contracts on first TP hit
 MM_MAX_CONTRACTS = 1           # max contracts per quote side
 MM_QUOTE_MIN_C = 15            # don't quote below 15c — extreme prices = pure adverse selection
 MM_QUOTE_MAX_C = 93            # allow quoting up to 93c — winning side needs to participate late cycle
 MM_RECONCILE_INTERVAL_SEC = 10 # safety reconciliation frequency
-MM_SIGMA = {"BTC": 2.20, "ETH": 0.071, "SOL": 0.065}   # calibrated σ/sec
+MM_SIGMA = {"BTC": 2.20, "ETH": 0.071, "SOL": 0.015}   # SOL recalibrated: 0.065 implied $2.15 range, actual is $0.30
 MM_SMOOTHING = 0.55            # CF BRTI 1-min average smoothing factor
 
 # ─── Avellaneda-Stoikov MM Parameters ───
@@ -77,18 +77,15 @@ def get_tiered_max_inventory(cycle_sec: float, max_inv_cap: int) -> int:
 
 
 def get_tiered_price_bounds(cycle_sec: float) -> tuple:
-    if cycle_sec < 300:
-        return 35, 65
-    elif cycle_sec < 600:
-        return 20, 80
-    else:
-        return 10, 95
+    """Fixed 35-65 bounds: MM in the round-trip zone, sniper handles directional outside."""
+    return 35, 65
 
 
-def get_edge_driven_size(edge_c: float, cycle_sec: float, base_size: int) -> int:
+def get_edge_driven_size(edge_c: float, cycle_sec: float, base_size: int, strong_edge_c: float = None) -> int:
     """Reduce size when edge is weak (promote round trips)."""
+    threshold = strong_edge_c if strong_edge_c is not None else MM_STRONG_EDGE_THRESHOLD_C
     abs_edge = abs(edge_c)
-    if cycle_sec < 300 and abs_edge < MM_STRONG_EDGE_THRESHOLD_C:
+    if cycle_sec < 300 and abs_edge < threshold:
         return 1
     return base_size
 
@@ -154,7 +151,11 @@ BRTI_COIN_CONFIG = {
         "entry_contracts": 3,
         "momentum_window": 8,          # 8s detection — catch sBRTI lead before Kalshi reprices
         "sigma_per_sec": 2.20,         # calibrated BTC volatility for probability model
-        "mm_edge_c": 7,                # aligned with ETH/SOL — 80/20 + flatten handle AS now
+        "mm_edge_c": 6,                # BTC: RTI noise <1c → tight edge is safe
+        "mm_strong_edge_c": 8,          # BTC: back to proven threshold — exit speed > noise avoidance
+        "mm_requote_threshold_c": 3,   # BTC: standard requote
+        "mm_suppress_high": 80,        # BTC: standard 80/20
+        "mm_suppress_low": 20,
         "mm_settle_guard_sec": 60,     # aligned with ETH/SOL — sniper bypasses on strong edge anyway
         "mm_momentum_threshold": 0.5,  # $0.50 BTC momentum threshold for adverse-fill filter
         "ws_pairs": {"coinbase": "BTC-USD", "kraken": "XBT/USD", "bitstamp": "btcusd", "gemini": "BTCUSD"},
@@ -186,7 +187,11 @@ BRTI_COIN_CONFIG = {
         "entry_contracts": 3,
         "momentum_window": 8,          # 8s detection — catch sBRTI lead before Kalshi reprices
         "sigma_per_sec": 0.071,        # calibrated ETH volatility for probability model
-        "mm_edge_c": 7,                # MM edge per side (cents)
+        "mm_edge_c": 8,                # ETH: RTI noise 3-7c near strike — wider than BTC
+        "mm_strong_edge_c": 8,          # ETH: back to proven threshold
+        "mm_requote_threshold_c": 3,   # ETH: standard requote
+        "mm_suppress_high": 80,        # ETH: back to standard 80/20
+        "mm_suppress_low": 20,
         "mm_settle_guard_sec": 60,     # cancel MM quotes 60s before settlement (ETH: keep current)
         "mm_momentum_threshold": 0.25, # ETH: only apply momentum adj if |momentum| >= $0.25 (filters noise)
         "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD"},
@@ -216,8 +221,12 @@ BRTI_COIN_CONFIG = {
         "tier3_max": 85,
         "entry_contracts": 3,
         "momentum_window": 8,
-        "sigma_per_sec": 0.065,           # SOL volatility: ~$84 price, similar vol profile to ETH
-        "mm_edge_c": 7,                   # same as ETH — thin book
+        "sigma_per_sec": 0.015,           # SOL recalibrated: actual 15-min range ~$0.30, not $2.15
+        "mm_edge_c": 10,                  # SOL: RTI noise 6-16c near strike — widest edge
+        "mm_strong_edge_c": 8,            # SOL: back to proven threshold — exit speed matters
+        "mm_requote_threshold_c": 3,      # SOL: back to standard
+        "mm_suppress_high": 80,           # SOL: back to standard 80/20
+        "mm_suppress_low": 20,
         "mm_settle_guard_sec": 60,
         "mm_momentum_threshold": 0.10,    # SOL: filter noise at $0.10
         "ws_pairs": {"coinbase": "SOL-USD", "kraken": "SOL/USD", "bitstamp": "solusd", "gemini": "SOLUSD"},
@@ -396,12 +405,6 @@ class Crypto15mAgent:
 
         # ─── Market-Making State ───
         self.mm_mode = MM_MODE
-
-        # CF RTI engines — orderbook-based index computation (fallback for strike + better fair value)
-        from agents.trading.cf_rti_engine import CFRealTimeIndex
-        self.cf_rti = {}
-        for _coin in BRTI_COIN_CONFIG:
-            self.cf_rti[_coin] = CFRealTimeIndex(_coin)
         self.mm_state: Dict[str, dict] = {}
         for _coin in BRTI_COIN_CONFIG:
             self.mm_state[_coin] = {
@@ -518,20 +521,13 @@ class Crypto15mAgent:
                     self.current_tickers[coin] = ticker
                     self.ticker_refreshed_ts[ticker] = now_ms
                     tickers.append(ticker)
-                    # Capture strike — API first, CF RTI engine as fallback. Once set, locked for the cycle.
+                    # Capture strike — only from API, no fallbacks. Once set, locked for the cycle.
                     if coin in BRTI_COIN_CONFIG:
                         if self.brti_state[coin]["strike"] <= 0:  # not yet set this cycle
                             strike = m.get("floor_strike")
                             if strike:
                                 self.brti_state[coin]["strike"] = float(strike)
-                                print(f"  📍 {coin} strike: ${self.brti_state[coin]['strike']:,.2f} (locked, API)")
-                            elif hasattr(self, 'cf_rti') and coin in self.cf_rti:
-                                rti_val = self.cf_rti[coin].compute()
-                                if rti_val and rti_val > 0:
-                                    self.brti_state[coin]["strike"] = rti_val
-                                    print(f"  📍 {coin} strike: ${rti_val:,.2f} (locked, CF RTI fallback)")
-                                else:
-                                    print(f"  ⛔ {coin} floor_strike missing, RTI not ready")
+                                print(f"  📍 {coin} strike: ${self.brti_state[coin]['strike']:,.2f} (locked)")
                             else:
                                 print(f"  ⛔ {coin} floor_strike missing — waiting for API")
             except Exception as e:
@@ -1043,8 +1039,8 @@ class Crypto15mAgent:
         latest_tick = st["ticks"][-1][1] if st["ticks"] else avg_3s
         spot = latest_tick
         momentum = latest_tick - avg_10s
-        momentum_proj = momentum * min(30.0, secs_remaining) * 0.3
-        distance = (spot + momentum_proj) - st["strike"]
+        # Momentum off — CF RTI orderbook signal IS the edge, no projection needed
+        distance = spot - st["strike"]
 
         # Realized volatility from tick data — adapts spread dynamically
         sigma_brti = cfg.get("sigma_per_sec", MM_SIGMA.get(coin, 2.20))
@@ -1053,7 +1049,7 @@ class Crypto15mAgent:
             diffs = [ticks_30s[i] - ticks_30s[i-1] for i in range(1, len(ticks_30s))]
             if diffs:
                 realized_std = (sum(d*d for d in diffs) / len(diffs)) ** 0.5
-                sigma_brti = 0.5 * sigma_brti + 0.5 * realized_std
+                sigma_brti = 0.3 * sigma_brti + 0.7 * realized_std
 
         effective_sigma = sigma_brti * math.sqrt(secs_remaining) * MM_SMOOTHING
         if effective_sigma <= 0:
@@ -1102,21 +1098,24 @@ class Crypto15mAgent:
         yes_bid = int(round(r_yes - half))
         no_bid = int(round(r_no - half))
 
-        # 80/20 suppression: don't quote the losing side when direction is clear
+        # Per-coin suppression: don't quote the losing side when direction is clear
+        # SOL uses tighter 75/25 (RTI noise largest relative to price)
         # In last 3 min: use raw 10s fair (no momentum) for suppression check
         # so brief sBRTI bounces don't lift the suppression and create losing-side fills
+        suppress_high = cfg.get("mm_suppress_high", 80)
+        suppress_low = cfg.get("mm_suppress_low", 20)
         if secs_remaining <= 180:
             raw_p = _norm_cdf((avg_10s - st["strike"]) / effective_sigma) if effective_sigma > 0 else 0.5
             s_check = max(1.0, min(99.0, raw_p * 100.0))
         else:
             s_check = s
-        if s_check >= 80:
+        if s_check >= suppress_high:
             no_bid = 0
-        if s_check <= 20:
+        if s_check <= suppress_low:
             yes_bid = 0
 
         # Hard suppression on strong edge (prevents buying losing side at 93c+)
-        if abs(edge_c) > 14:  # suppression floor — more confident with CF RTI
+        if abs(edge_c) > 20:
             if edge_c > 0:
                 no_bid = 0
             else:
@@ -1166,6 +1165,11 @@ class Crypto15mAgent:
                 yes_bid = 0  # long YES at cap, only quote NO to unwind
             else:
                 no_bid = 0   # long NO at cap, only quote YES to unwind
+        elif abs(q) >= MM_MAX_INVENTORY.get(coin, 12) - 1:
+            if q > 0:
+                yes_bid = 0  # one away from YES cap — don't accumulate further
+            else:
+                no_bid = 0   # one away from NO cap — don't accumulate further
 
         if yes_bid == 0 and no_bid == 0:
             return None
@@ -1174,61 +1178,41 @@ class Crypto15mAgent:
         if q != 0:
             if q > 0:   # holding YES
                 no_bid += MM_UNWIND_BONUS_C
-                yes_bid += MM_UNWIND_BONUS_C if edge_c < 0 else 0  # extra if edge says unwind
+                no_bid += MM_UNWIND_BONUS_C if edge_c < 0 else 0  # extra if edge says unwind
             else:        # holding NO
                 yes_bid += MM_UNWIND_BONUS_C
-                no_bid += MM_UNWIND_BONUS_C if edge_c > 0 else 0
+                yes_bid += MM_UNWIND_BONUS_C if edge_c > 0 else 0
 
         # ─── EDGE-DRIVEN SNIPER OVERRIDE ───
+        strong_edge_c = cfg.get("mm_strong_edge_c", MM_STRONG_EDGE_THRESHOLD_C)
         abs_edge = abs(edge_c)
-        if abs_edge > MM_STRONG_EDGE_THRESHOLD_C and abs(q) < 6:
+        if abs_edge > strong_edge_c and abs(q) < 6:
             favored = "yes" if edge_c > 0 else "no"
-            sniper_size = min(2, get_edge_driven_size(edge_c, cycle_sec, tiered_max))  # hard cap sniper at 2
+            sniper_size = min(2, get_edge_driven_size(edge_c, cycle_sec, tiered_max, strong_edge_c))  # hard cap sniper at 2
             if favored == "yes":
                 yes_bid = min(98, int(s - 2))
                 no_bid = 0
             else:
                 no_bid = min(98, int((100 - s) - 2))
                 yes_bid = 0
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 EDGE SNIPER {coin}: {favored.upper()} @ {yes_bid if favored=='yes' else no_bid}c | size={sniper_size} | edge={edge_c:+.1f}c")
+            # Throttle sniper logs: once per 5s per coin
+            _sniper_key = f"_sniper_log_{coin}"
+            _now_int = int(now_ts)
+            if st.get(_sniper_key, 0) < _now_int - 5:
+                st[_sniper_key] = _now_int
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 EDGE SNIPER {coin}: {favored.upper()} @ {yes_bid if favored=='yes' else no_bid}c | size={sniper_size} | edge={edge_c:+.1f}c")
 
-        # ─── ACTIVE FLATTEN — orderbook momentum driven ───
-        # Uses CF RTI orderbook data to detect wrong-side BEFORE trade data confirms
-        # When edge is strongly against us, cross the spread to exit NOW
-        if q != 0 and abs_edge > MM_STRONG_EDGE_THRESHOLD_C:
+        # ─── ACTIVE FLATTEN ON WRONG-SIDE ───
+        if q != 0 and abs_edge > strong_edge_c:
             wrong_side = (q > 0 and edge_c < 0) or (q < 0 and edge_c > 0)
             if wrong_side:
-                # Check CF RTI momentum: is the orderbook accelerating against us?
-                rti_val = self.cf_rti[coin].compute() if coin in self.cf_rti else None
-                rti_confirms = False
-                if rti_val and st["strike"] > 0:
-                    rti_dist = rti_val - st["strike"]
-                    rti_confirms = (q > 0 and rti_dist < 0) or (q < 0 and rti_dist > 0)
-
-                if rti_confirms:
-                    # Orderbook confirms we're wrong — flag for active exit in requote loop
-                    sell_side = "yes" if q > 0 else "no"
-                    ticker_now = self.current_tickers.get(coin, "")
-                    prices_now = self.ws_prices.get(ticker_now, {})
-                    yb = prices_now.get("yes_bid", 0)
-                    ya = prices_now.get("yes_ask", 0)
-                    exit_val = yb if sell_side == "yes" else (100 - ya)
-                    # Set flag for async execution in requote loop
-                    ms["_ob_flatten_pending"] = {
-                        "side": sell_side, "count": abs(q), "ticker": ticker_now,
-                        "yes_bid": yb, "yes_ask": ya, "exit_val": exit_val, "edge": edge_c
-                    }
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 📕 OB-FLATTEN {coin}: SELL {sell_side.upper()} {abs(q)}x @ {exit_val}c | edge={edge_c:+.1f}c | RTI confirms wrong side")
-                    return yes_bid, no_bid  # skip further quote logic
+                if q > 0:
+                    no_bid = min(98, int((100 - s) + MM_UNWIND_BONUS_C))
+                    yes_bid = 0
                 else:
-                    # Edge says wrong side but orderbook not confirming yet — passive unwind
-                    if q > 0:
-                        no_bid = min(98, int((100 - s) + MM_UNWIND_BONUS_C))
-                        yes_bid = 0
-                    else:
-                        yes_bid = min(98, int(s + MM_UNWIND_BONUS_C))
-                        no_bid = 0
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛑 FLATTEN {coin}: inv={q} | edge={edge_c:+.1f}c (passive — RTI not confirming yet)")
+                    yes_bid = min(98, int(s + MM_UNWIND_BONUS_C))
+                    no_bid = 0
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛑 FLATTEN {coin}: inv={q} | edge={edge_c:+.1f}c")
 
         # ─── TRAILING DYNAMIC TAKE-PROFIT (independent of edge flip) ───
         if q != 0:
@@ -1261,6 +1245,12 @@ class Crypto15mAgent:
                         yes_bid = min(98, int(s + MM_UNWIND_BONUS_C))
                         no_bid = 0
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛑 PULLBACK FLATTEN {coin}: inv={q} | unrealized={unrealized:.1f}c (from peak {self._mm_peak_profit[coin]:.1f}c)")
+
+        # Sweep pause: if a sweep was detected on a side, skip quoting that side for 30s
+        if now_ts < ms.get("sweep_pause_yes_until", 0):
+            yes_bid = 0
+        if now_ts < ms.get("sweep_pause_no_until", 0):
+            no_bid = 0
 
         return yes_bid, no_bid
 
@@ -1299,6 +1289,24 @@ class Crypto15mAgent:
         for coin in BRTI_COIN_CONFIG:
             await self.mm_cancel_all_quotes(coin, reason)
 
+    async def _mm_cancel_stacking_side(self, coin, ms):
+        """Cancel the accumulating-side resting order — fires at cap-1 to prevent breaching cap."""
+        q = ms.get("inventory", 0)
+        if q == 0:
+            return
+        stacking_side = "yes" if q > 0 else "no"
+        oid_key = f"{stacking_side}_order_id"
+        acc_oid = ms.get(oid_key)
+        if acc_oid:
+            if self.client and not DRY_RUN:
+                try:
+                    await asyncio.to_thread(self.client.cancel_order, acc_oid)
+                except Exception:
+                    pass
+            ms[oid_key] = None
+            ms[f"{stacking_side}_price"] = 0
+            print(f"  ⚠️  CAP-1: {coin} inv={q:+d} — cancelled {stacking_side.upper()} side proactively")
+
     async def mm_place_quotes(self, coin):
         """Place 2-sided quotes. ALWAYS cancel-before-replace to prevent accumulation."""
         ms = self.mm_state[coin]
@@ -1322,6 +1330,11 @@ class Crypto15mAgent:
         # Step 1: Cancel existing quotes FIRST (cancel-before-replace — safety critical)
         if ms["quotes_active"]:
             await self.mm_cancel_all_quotes(coin, "requote")
+
+        # Cap-1 guard (preventive): cancel stacking side before requoting
+        _q_now = ms.get("inventory", 0)
+        if abs(_q_now) >= MM_MAX_INVENTORY.get(coin, 12) - 1 and _q_now != 0:
+            await self._mm_cancel_stacking_side(coin, ms)
 
         # Step 2: Compute A-S quotes (inventory-skewed, both sides stay open after fills)
         quotes = self.mm_compute_quotes_as(coin)
@@ -1442,9 +1455,10 @@ class Crypto15mAgent:
         # Sweep detection: log only, don't pause — price bounds handle AS, not cooldowns
         side_times = ms[f"{filled_side}_fill_times"]
         side_times.append(now)
-        side_times[:] = [t for t in side_times if now - t <= 2.0]
-        if len(side_times) >= 5:
-            print(f"  ⚡ RAPID FILLS: {len(side_times)} in 2s on {filled_side.upper()} (no pause — bounds protect)")
+        side_times[:] = [t for t in side_times if now - t <= 1.0]
+        if len(side_times) >= 3:
+            print(f"  ⚡ SWEEP DETECTED: {len(side_times)} fills in 1s on {filled_side} — pausing that side 30s")
+            ms[f"sweep_pause_{filled_side}_until"] = now + 30
 
         # Update inventory and VWAP tracking
         if filled_side == "yes":
@@ -1470,8 +1484,9 @@ class Crypto15mAgent:
 
         # PER-COIN HARD CAP — runs on EVERY fill, cannot be bypassed
         # At cap: cancel accumulating side, keep unwind side live for round trips
-        coin_inv = abs(ms.get("inventory", 0))
-        if coin_inv >= 12:
+        ticker = self.current_tickers.get(coin, "")
+        coin_inv = max(abs(ms.get("inventory", 0)), abs(self.ticker_contracts.get(ticker, 0)))
+        if coin_inv >= MM_MAX_INVENTORY.get(coin, 12):
             q = ms.get("inventory", 0)
             accumulating_side = "no" if q < 0 else "yes"
             # Cancel the accumulating side's resting order only
@@ -1486,6 +1501,8 @@ class Crypto15mAgent:
             print(f"  🛑 CAP: {coin} inv={q:+d} (±6) — blocked {accumulating_side.upper()}, unwind side live")
             ms["requote_pending"] = True  # requote to keep unwind side active
             return
+        elif coin_inv >= MM_MAX_INVENTORY.get(coin, 12) - 1:
+            await self._mm_cancel_stacking_side(coin, ms)
 
         # Force immediate requote so inventory skew updates both live quotes
         ms["requote_pending"] = True
@@ -1498,10 +1515,6 @@ class Crypto15mAgent:
                 try:
                     ms = self.mm_state[coin]
                     st = self.brti_state[coin]
-
-                    # Skip if in post-flatten cooldown (prevent re-accumulating the losing side)
-                    if ms.get("_ob_flatten_cooldown_until", 0) > time.time():
-                        continue
 
                     # Skip if no pending tick (event-driven — avoids needless API calls)
                     if not ms["requote_pending"]:
@@ -1573,7 +1586,8 @@ class Crypto15mAgent:
                         _s_sg = 50.0
                     edge_c_sg = _s_sg - 50
                     # Settle guard: skip if edge is strong (sniper should still operate)
-                    if abs(edge_c_sg) <= MM_STRONG_EDGE_THRESHOLD_C and cycle_sec >= (900 - settle_guard):
+                    _strong_edge_sg = BRTI_COIN_CONFIG[coin].get("mm_strong_edge_c", MM_STRONG_EDGE_THRESHOLD_C)
+                    if abs(edge_c_sg) <= _strong_edge_sg and cycle_sec >= (900 - settle_guard):
                         if ms["quotes_active"]:
                             inv = ms["inventory"]
                             avg_y = ms["avg_yes_cost"]
@@ -1596,40 +1610,12 @@ class Crypto15mAgent:
                     yes_bid, no_bid = quotes
 
                     # Only re-quote if price moved enough (avoid churning API)
+                    _requote_c = BRTI_COIN_CONFIG[coin].get("mm_requote_threshold_c", MM_REQUOTE_THRESHOLD_C)
                     if ms["quotes_active"]:
-                        yes_moved = abs(yes_bid - ms["yes_price"]) >= MM_REQUOTE_THRESHOLD_C if yes_bid > 0 and ms["yes_price"] > 0 else yes_bid != ms["yes_price"]
-                        no_moved = abs(no_bid - ms["no_price"]) >= MM_REQUOTE_THRESHOLD_C if no_bid > 0 and ms["no_price"] > 0 else no_bid != ms["no_price"]
+                        yes_moved = abs(yes_bid - ms["yes_price"]) >= _requote_c if yes_bid > 0 and ms["yes_price"] > 0 else yes_bid != ms["yes_price"]
+                        no_moved = abs(no_bid - ms["no_price"]) >= _requote_c if no_bid > 0 and ms["no_price"] > 0 else no_bid != ms["no_price"]
                         if not yes_moved and not no_moved:
                             continue  # prices haven't moved enough
-
-                    # Execute pending OB-flatten (async sell order)
-                    ob_flatten = ms.get("_ob_flatten_pending")
-                    if ob_flatten:
-                        ms["_ob_flatten_pending"] = None
-                        await self.mm_cancel_all_quotes(coin, "ob-flatten")
-                        if self.client and not DRY_RUN:
-                            try:
-                                ae_id = f"mm-obflatten-{coin.lower()}-{int(time.time()*1000)}"
-                                await asyncio.to_thread(
-                                    self.client.create_order,
-                                    ticker=ob_flatten["ticker"], client_order_id=ae_id,
-                                    side=ob_flatten["side"], action="sell", count=ob_flatten["count"], type="limit",
-                                    yes_price=ob_flatten["yes_bid"] if ob_flatten["side"] == "yes" else None,
-                                    no_price=(100 - ob_flatten["yes_ask"]) if ob_flatten["side"] == "no" else None,
-                                )
-                                ms["inventory"] = 0
-                                ms["total_yes_bought"] = 0
-                                ms["total_no_bought"] = 0
-                                ms["avg_yes_cost"] = 0.0
-                                ms["avg_no_cost"] = 0.0
-                                self.ticker_contracts[ob_flatten["ticker"]] = 0
-                                if hasattr(self, '_mm_peak_profit'):
-                                    self._mm_peak_profit[coin] = 0
-                                # Cooldown: don't re-quote this coin for 30s after flatten
-                                ms["_ob_flatten_cooldown_until"] = time.time() + 30
-                            except Exception as e:
-                                print(f"  → {coin} OB-flatten exec error: {e}")
-                        continue
 
                     await self.mm_place_quotes(coin)
                 except Exception as e:
@@ -2378,172 +2364,6 @@ class Crypto15mAgent:
 
     # ─── Main ─────────────────────────────────────────────────
 
-    async def _cf_orderbook_feeds(self):
-        """Launch orderbook WS feeds for CF RTI computation (strike fallback + fair value)."""
-        import websockets as ws_lib
-
-        async def coinbase_l2():
-            url = "wss://ws-feed.exchange.coinbase.com"
-            pairs = {"BTC-USD": "BTC", "ETH-USD": "ETH", "SOL-USD": "SOL"}
-            books = {c: {"bids": {}, "asks": {}} for c in pairs.values()}
-            while self.running:
-                try:
-                    async with ws_lib.connect(url, ping_interval=30, max_size=10_000_000) as ws:
-                        await ws.send(json.dumps({"type": "subscribe", "channels": [{"name": "level2_batch", "product_ids": list(pairs.keys())}]}))
-                        async for msg in ws:
-                            data = json.loads(msg)
-                            product = data.get("product_id", "")
-                            coin = pairs.get(product)
-                            if not coin:
-                                continue
-                            book = books[coin]
-                            if data.get("type") == "snapshot":
-                                book["bids"] = {float(p): float(s) for p, s in data.get("bids", [])}
-                                book["asks"] = {float(p): float(s) for p, s in data.get("asks", [])}
-                            elif data.get("type") == "l2update":
-                                for side, price, size in data.get("changes", []):
-                                    p, s = float(price), float(size)
-                                    target = book["bids"] if side == "buy" else book["asks"]
-                                    if s == 0:
-                                        target.pop(p, None)
-                                    else:
-                                        target[p] = s
-                            if coin in self.cf_rti:
-                                bids = sorted(book["bids"].items(), key=lambda x: -x[0])[:50]
-                                asks = sorted(book["asks"].items(), key=lambda x: x[0])[:50]
-                                self.cf_rti[coin].update_orderbook("coinbase", bids, asks)
-                except Exception as e:
-                    await asyncio.sleep(3)
-
-        async def kraken_book():
-            url = "wss://ws.kraken.com"
-            pairs = {"XBT/USD": "BTC", "ETH/USD": "ETH", "SOL/USD": "SOL"}
-            books = {c: {"bids": {}, "asks": {}} for c in pairs.values()}
-            while self.running:
-                try:
-                    async with ws_lib.connect(url, ping_interval=30) as ws:
-                        await ws.send(json.dumps({"event": "subscribe", "pair": list(pairs.keys()), "subscription": {"name": "book", "depth": 25}}))
-                        async for msg in ws:
-                            data = json.loads(msg)
-                            if isinstance(data, list) and len(data) >= 4:
-                                pair_name = data[-1]
-                                coin = pairs.get(pair_name)
-                                if not coin:
-                                    continue
-                                book = books[coin]
-                                for part in data[1:-1]:
-                                    if isinstance(part, dict):
-                                        for key in ["bs", "b"]:
-                                            if key in part:
-                                                for e in part[key]:
-                                                    p, s = float(e[0]), float(e[1])
-                                                    if s == 0: book["bids"].pop(p, None)
-                                                    else: book["bids"][p] = s
-                                        for key in ["as", "a"]:
-                                            if key in part:
-                                                for e in part[key]:
-                                                    p, s = float(e[0]), float(e[1])
-                                                    if s == 0: book["asks"].pop(p, None)
-                                                    else: book["asks"][p] = s
-                                if coin in self.cf_rti:
-                                    bids = sorted(book["bids"].items(), key=lambda x: -x[0])[:50]
-                                    asks = sorted(book["asks"].items(), key=lambda x: x[0])[:50]
-                                    self.cf_rti[coin].update_orderbook("kraken", bids, asks)
-                except Exception as e:
-                    await asyncio.sleep(3)
-
-        async def bitstamp_book():
-            url = "wss://ws.bitstamp.net"
-            pairs = {"btcusd": "BTC", "ethusd": "ETH", "solusd": "SOL", "xrpusd": "XRP"}
-            while self.running:
-                try:
-                    async with ws_lib.connect(url, ping_interval=30) as ws:
-                        for pair in pairs:
-                            await ws.send(json.dumps({"event": "bts:subscribe", "data": {"channel": f"order_book_{pair}"}}))
-                        async for msg in ws:
-                            data = json.loads(msg)
-                            if data.get("event") == "data":
-                                channel = data.get("channel", "")
-                                for pair, coin in pairs.items():
-                                    if pair in channel and coin in self.cf_rti:
-                                        bd = data.get("data", {})
-                                        bids = [(float(b[0]), float(b[1])) for b in bd.get("bids", [])][:50]
-                                        asks = [(float(a[0]), float(a[1])) for a in bd.get("asks", [])][:50]
-                                        self.cf_rti[coin].update_orderbook("bitstamp", bids, asks)
-                                        break
-                except Exception as e:
-                    await asyncio.sleep(3)
-
-        async def gemini_book(coin, symbol):
-            url = f"wss://api.gemini.com/v1/marketdata/{symbol}?top_of_book=false"
-            book = {"bids": {}, "asks": {}}
-            while self.running:
-                try:
-                    async with ws_lib.connect(url, ping_interval=30) as ws:
-                        async for msg in ws:
-                            data = json.loads(msg)
-                            for event in data.get("events", []):
-                                if event.get("type") == "change":
-                                    side = event.get("side")
-                                    p = float(event.get("price", 0))
-                                    r = float(event.get("remaining", 0))
-                                    target = book["bids"] if side == "bid" else book["asks"]
-                                    if r == 0: target.pop(p, None)
-                                    else: target[p] = r
-                            if coin in self.cf_rti:
-                                bids = sorted(book["bids"].items(), key=lambda x: -x[0])[:50]
-                                asks = sorted(book["asks"].items(), key=lambda x: x[0])[:50]
-                                self.cf_rti[coin].update_orderbook("gemini", bids, asks)
-                except Exception as e:
-                    await asyncio.sleep(3)
-
-        async def crypto_com_book():
-            url = "wss://stream.crypto.com/exchange/v1/market"
-            pairs = {"BTC_USD": "BTC", "ETH_USD": "ETH", "SOL_USD": "SOL", "XRP_USD": "XRP"}
-            books = {c: {"bids": {}, "asks": {}} for c in pairs.values()}
-            while self.running:
-                try:
-                    async with ws_lib.connect(url, ping_interval=30) as ws:
-                        await ws.send(json.dumps({"id": 1, "method": "subscribe", "params": {"channels": [f"book.{p}.50" for p in pairs.keys()]}}))
-                        async for msg in ws:
-                            data = json.loads(msg)
-                            result = data.get("result", {})
-                            channel = result.get("channel", "")
-                            if not channel.startswith("book."): continue
-                            instrument = channel.split(".")[1]
-                            coin = pairs.get(instrument)
-                            if not coin: continue
-                            bd = result.get("data", [{}])
-                            if isinstance(bd, list) and bd: bd = bd[0]
-                            book = books[coin]
-                            for b in bd.get("bids", []):
-                                p, s = float(b[0]), float(b[1])
-                                if s == 0: book["bids"].pop(p, None)
-                                else: book["bids"][p] = s
-                            for a in bd.get("asks", []):
-                                p, s = float(a[0]), float(a[1])
-                                if s == 0: book["asks"].pop(p, None)
-                                else: book["asks"][p] = s
-                            if coin in self.cf_rti:
-                                bids = sorted(book["bids"].items(), key=lambda x: -x[0])[:50]
-                                asks = sorted(book["asks"].items(), key=lambda x: x[0])[:50]
-                                self.cf_rti[coin].update_orderbook("crypto_com", bids, asks)
-                except Exception as e:
-                    await asyncio.sleep(3)
-
-        # Launch all orderbook feeds
-        gemini_pairs = {"BTC": "BTCUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}
-        tasks = [
-            asyncio.create_task(coinbase_l2()),
-            asyncio.create_task(kraken_book()),
-            asyncio.create_task(bitstamp_book()),
-            asyncio.create_task(crypto_com_book()),
-        ]
-        for coin, symbol in gemini_pairs.items():
-            tasks.append(asyncio.create_task(gemini_book(coin, symbol)))
-        print("📊 CF RTI orderbook feeds launching (5 exchanges: Coinbase, Kraken, Bitstamp, Gemini, Crypto.com)")
-        await asyncio.gather(*tasks)
-
     async def run(self):
         coins_str = ", ".join(BRTI_COIN_CONFIG.keys())
         mode_str = "MARKET MAKER" if self.mm_mode else "DIRECTIONAL"
@@ -2574,10 +2394,8 @@ class Crypto15mAgent:
         if self.mm_mode:
             asyncio.create_task(self.mm_requote_loop())
             asyncio.create_task(self.mm_safety_reconcile_loop())
-        # CF RTI orderbook feeds (for strike fallback + accurate fair value)
-        asyncio.create_task(self._cf_orderbook_feeds())
         brti_coins_str = "+".join(BRTI_COIN_CONFIG.keys())
-        print(f"📡 Synthetic index feeds launching ({brti_coins_str}, 4+ exchanges) + CF RTI orderbook feeds + fast flip loop + {'MM quoting' if self.mm_mode else 'directional entry'}")
+        print(f"📡 Synthetic index feeds launching ({brti_coins_str}, 4 exchanges) + fast flip loop + {'MM quoting' if self.mm_mode else 'directional entry'}")
 
         # Keep main alive
         while self.running:
