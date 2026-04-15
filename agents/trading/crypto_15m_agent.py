@@ -1229,6 +1229,27 @@ class Crypto15mAgent:
                     no_bid = 0
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛑 FLATTEN {coin}: inv={q} | edge={edge_c:+.1f}c")
 
+        # ─── ACTIVE EXIT PANIC BUTTON (fire real exit order when FLATTEN quotes may not fill) ───
+        # Fires when wrong-side inventory AND very strong edge (>15c), 10s cooldown prevents thrash
+        if q != 0 and time.time() > ms.get("active_exit_cooldown_until", 0):
+            wrong_side = (q > 0 and edge_c < 0) or (q < 0 and edge_c > 0)
+            if wrong_side and abs(edge_c) > 15:
+                if ticker and self.client and not DRY_RUN:
+                    try:
+                        ae_id = f"ae-{coin.lower()}-{int(time.time()*1000)}"
+                        self.client.create_order(
+                            ticker=ticker, client_order_id=ae_id,
+                            side="yes" if q > 0 else "no",
+                            action="sell", count=abs(q),
+                            type="limit",
+                            yes_price=1 if q > 0 else None,
+                            no_price=1 if q < 0 else None,
+                        )
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚨 ACTIVE EXIT {coin}: SELL {'YES' if q > 0 else 'NO'} {abs(q)}x at market | inv={q:+d} | edge={edge_c:+.1f}c")
+                    except Exception as e:
+                        print(f"  → {coin} Active exit error: {e}")
+                ms["active_exit_cooldown_until"] = time.time() + 10
+
         # ─── TRAILING DYNAMIC TAKE-PROFIT (independent of edge flip) ───
         if q != 0:
             avg_cost = ms["avg_yes_cost"] if q > 0 else ms["avg_no_cost"]
