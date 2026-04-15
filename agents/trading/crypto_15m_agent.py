@@ -512,32 +512,14 @@ class Crypto15mAgent:
                     self.current_tickers[coin] = ticker
                     self.ticker_refreshed_ts[ticker] = now_ms
                     tickers.append(ticker)
-                    # Capture strike for BRTI strategy
+                    # Capture strike for BRTI strategy — no fallbacks, API must provide exact value
                     if coin in BRTI_COIN_CONFIG:
                         strike = m.get("floor_strike")
-                        # Fallback 1: parse from yes_sub_title
-                        if not strike:
-                            sub = m.get("yes_sub_title", "") or ""
-                            if "$" in sub and "TBD" not in sub:
-                                try:
-                                    strike_str = sub.split("$")[1].replace(",", "").strip()
-                                    strike = float(strike_str)
-                                except (IndexError, ValueError):
-                                    pass
-                        # Fallback 2: use current sBRTI as strike (Kalshi API floor_strike bug)
-                        # Note: sBRTI can be $50-100 off from real strike. This is temporary until Kalshi fixes API.
-                        if not strike and self.brti_state[coin]["ticks"]:
-                            # Use smoothed 30s average for better strike estimate (less noise than single tick)
-                            now_ts = time.time()
-                            smooth = [v for t, v in self.brti_state[coin]["ticks"] if t > now_ts - 30]
-                            if smooth:
-                                strike = sum(smooth) / len(smooth)
-                            else:
-                                strike = self.brti_state[coin]["ticks"][-1][1]
-                            print(f"  ⚠️ {coin} floor_strike missing — using sBRTI 30s avg ${strike:,.2f} as strike")
                         if strike:
                             self.brti_state[coin]["strike"] = float(strike)
                             print(f"  📍 {coin} strike: ${self.brti_state[coin]['strike']:,.2f}")
+                        else:
+                            print(f"  ⛔ {coin} floor_strike missing — NOT trading (Kalshi API bug)")
             except Exception as e:
                 print(f"  Open market lookup error {coin}: {e}")
 
