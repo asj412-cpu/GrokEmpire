@@ -55,7 +55,7 @@ MM_SIGMA = {"BTC": 2.20, "ETH": 0.071, "SOL": 0.065}   # calibrated σ/sec
 MM_SMOOTHING = 0.55            # CF BRTI 1-min average smoothing factor
 
 # ─── Avellaneda-Stoikov MM Parameters ───
-MM_GAMMA = {"BTC": 0.8, "ETH": 0.8, "SOL": 0.8}   # tighter spreads — more fills, more round trips
+MM_GAMMA = {"BTC": 1.0, "ETH": 1.0, "SOL": 1.0}   # 0.8 was too tight — high volume but settlement losses ate spread gains
 MM_KAPPA_DEFAULT = 0.5                        # fills/sec bootstrap — 0.02 made spread too wide, only 1 side quoted
 MM_KAPPA_WINDOW_SEC = 60                     # rolling window for κ estimation
 MM_SPREAD_FLOOR_C = 2                        # tighter minimum spread — more fills
