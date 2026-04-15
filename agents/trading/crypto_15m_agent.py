@@ -525,9 +525,16 @@ class Crypto15mAgent:
                                 except (IndexError, ValueError):
                                     pass
                         # Fallback 2: use current sBRTI as strike (Kalshi API floor_strike bug)
+                        # Note: sBRTI can be $50-100 off from real strike. This is temporary until Kalshi fixes API.
                         if not strike and self.brti_state[coin]["ticks"]:
-                            strike = self.brti_state[coin]["ticks"][-1][1]
-                            print(f"  ⚠️ {coin} floor_strike missing — using sBRTI ${strike:,.2f} as strike")
+                            # Use smoothed 30s average for better strike estimate (less noise than single tick)
+                            now_ts = time.time()
+                            smooth = [v for t, v in self.brti_state[coin]["ticks"] if t > now_ts - 30]
+                            if smooth:
+                                strike = sum(smooth) / len(smooth)
+                            else:
+                                strike = self.brti_state[coin]["ticks"][-1][1]
+                            print(f"  ⚠️ {coin} floor_strike missing — using sBRTI 30s avg ${strike:,.2f} as strike")
                         if strike:
                             self.brti_state[coin]["strike"] = float(strike)
                             print(f"  📍 {coin} strike: ${self.brti_state[coin]['strike']:,.2f}")
