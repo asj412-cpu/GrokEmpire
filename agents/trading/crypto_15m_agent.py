@@ -41,11 +41,11 @@ MM_MODE = os.getenv('MM_MODE', 'false').lower() == 'true'
 MM_EDGE_C = 6                  # edge below fair value per side (cents)
 MM_REQUOTE_THRESHOLD_C = 3     # re-quote if model moved ≥3c
 MM_SETTLE_GUARD_SEC = 60       # cancel all quotes 60s before settlement
-MM_EARLY_MAX_INV = 4                   # first 5 min — more round-trip pairs
-MM_STRONG_EDGE_THRESHOLD_C = 8         # |edge| > 8c → sniper mode — fires more often
-MM_UNWIND_BONUS_C = 5                  # lowered from 8 — make round trips net positive
-MM_DYNAMIC_TP_C = 18                   # raised — only lock real profit, not noise
-MM_TRAILING_PULLBACK_C = 15            # wide — tolerate normal volatility, only flatten on real reversals
+MM_EARLY_MAX_INV = 5                   # less AS risk with accurate CF RTI data
+MM_STRONG_EDGE_THRESHOLD_C = 11        # cleaner signal from CF RTI → can snipe earlier
+MM_UNWIND_BONUS_C = 4                  # round trips are strongly +EV with CF RTI accuracy
+MM_DYNAMIC_TP_C = 14                   # winners reliably identified with CF RTI, lock earlier
+MM_TRAILING_PULLBACK_C = 11            # tighter — real reversals show up faster with clean data
 MM_PARTIAL_TP_SIZE = 2                 # reduce by this many contracts on first TP hit
 MM_MAX_CONTRACTS = 1           # max contracts per quote side
 MM_QUOTE_MIN_C = 15            # don't quote below 15c — extreme prices = pure adverse selection
@@ -1116,7 +1116,7 @@ class Crypto15mAgent:
             yes_bid = 0
 
         # Hard suppression on strong edge (prevents buying losing side at 93c+)
-        if abs(edge_c) > 20:
+        if abs(edge_c) > 14:  # suppression floor — more confident with CF RTI
             if edge_c > 0:
                 no_bid = 0
             else:
