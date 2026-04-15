@@ -42,9 +42,9 @@ MM_EDGE_C = 6                  # edge below fair value per side (cents)
 MM_REQUOTE_THRESHOLD_C = 3     # re-quote if model moved ≥3c
 MM_SETTLE_GUARD_SEC = 60       # cancel all quotes 60s before settlement
 MM_EARLY_MAX_INV = 4                   # first 5 min — more round-trip pairs
-MM_STRONG_EDGE_THRESHOLD_C = 12        # |edge| > 12c → sniper mode
+MM_STRONG_EDGE_THRESHOLD_C = 8         # |edge| > 8c → sniper mode — fires more often
 MM_UNWIND_BONUS_C = 8                  # lowered from 12 — restore breakeven/positive round-trip spreads
-MM_DYNAMIC_TP_C = 12                   # trigger partial TP at +12c unrealized
+MM_DYNAMIC_TP_C = 10                   # trigger partial TP at +10c unrealized — lock profits sooner
 MM_TRAILING_PULLBACK_C = 8             # 5c was too tight — normal oscillation triggered premature flattens
 MM_PARTIAL_TP_SIZE = 2                 # reduce by this many contracts on first TP hit
 MM_MAX_CONTRACTS = 1           # max contracts per quote side
@@ -58,7 +58,7 @@ MM_SMOOTHING = 0.55            # CF BRTI 1-min average smoothing factor
 MM_GAMMA = {"BTC": 0.8, "ETH": 0.8, "SOL": 0.8}   # tighter spreads — more fills, more round trips
 MM_KAPPA_DEFAULT = 0.5                        # fills/sec bootstrap — 0.02 made spread too wide, only 1 side quoted
 MM_KAPPA_WINDOW_SEC = 60                     # rolling window for κ estimation
-MM_SPREAD_FLOOR_C = 3                        # minimum half-spread per side (cents)
+MM_SPREAD_FLOOR_C = 2                        # tighter minimum spread — more fills
 MM_MAX_INVENTORY = {"BTC": 12, "ETH": 12, "SOL": 12}   # max net contracts per coin
 
 
@@ -207,7 +207,7 @@ BRTI_COIN_CONFIG = {
         "conviction_max_adds": 2,
         "conviction_cooldown_sec": 60,
         "conviction_max_price": 75,
-        "take_profit_c": 93,              # SOL: same as ETH — thin book, TP at 93c
+        "take_profit_c": 91,              # SOL: lower for more TP scalp cycles
         "reentry_max_price": 59,
         "tier1_max": 45,
         "tier1_end_sec": 420,
@@ -1474,7 +1474,7 @@ class Crypto15mAgent:
                                 current_val = yes_bid_tp  # YES position value
                             else:
                                 current_val = 100 - yes_ask_tp  # NO position value
-                            tp_threshold = 93 if coin == "ETH" else 95  # ETH lower — WS bid lags on thin book
+                            tp_threshold = 91 if coin in ("ETH", "SOL") else 95  # thin books: lower TP for more scalp cycles
                             if current_val >= tp_threshold:
                                 held_count = abs(inv)
                                 sell_side = "yes" if inv > 0 else "no"
