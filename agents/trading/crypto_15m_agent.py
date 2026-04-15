@@ -222,7 +222,7 @@ BRTI_COIN_CONFIG = {
         "tier3_max": 85,
         "entry_contracts": 3,
         "momentum_window": 8,
-        "sigma_per_sec": 0.015,           # SOL recalibrated: actual 15-min range ~$0.30, not $2.15
+        "sigma_per_sec": 0.065,           # SOL: matches MM_SIGMA intent — correct calibration
         "mm_edge_c": 10,                  # SOL: RTI noise 6-16c near strike — widest edge
         "mm_strong_edge_c": 8,            # SOL: back to proven threshold — exit speed matters
         "mm_requote_threshold_c": 3,      # SOL: back to standard
