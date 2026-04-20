@@ -44,22 +44,22 @@ DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 MM_MODE = os.getenv('MM_MODE', 'false').lower() == 'true'
 
 # ─── Market-Making Config ───
-MM_EDGE_C = 7                  # edge below fair value per side (cents) — widened from 3, adverse selection was eating us
-MM_REQUOTE_THRESHOLD_C = 5     # re-quote if model moved >=5c (was 2c, caused churn)
+MM_EDGE_C = 5                          # tighter base edge → more two-sided fills
+MM_REQUOTE_THRESHOLD_C = 2             # faster response to fills
 MM_SETTLE_GUARD_SEC = 60       # cancel all quotes 60s before settlement
 MM_MAX_CONTRACTS = 1           # max contracts per quote side
 MM_QUOTE_MIN_C = 15            # don't quote below 15c — extreme prices = pure adverse selection
-MM_QUOTE_MAX_C = 88            # max 88c — anything higher leaves <7c profit after fees on TP sell
+MM_QUOTE_MAX_C = 93
 MM_RECONCILE_INTERVAL_SEC = 10 # safety reconciliation frequency
 MM_SIGMA = {"BTC": 2.20, "ETH": 0.071, "SOL": 0.015, "XRP": 0.0003, "DOGE": 0.0001, "BNB": 0.09, "HYPE": 0.009}   # calibrated sigma/sec from backtest
 MM_SMOOTHING = 0.55            # CF BRTI 1-min average smoothing factor
 
 # ─── Avellaneda-Stoikov MM Parameters ───
-MM_GAMMA = {"BTC": 0.5, "ETH": 0.5, "SOL": 0.5, "XRP": 0.5, "DOGE": 0.5, "BNB": 0.5, "HYPE": 0.5}        # risk aversion — 0.3 filled to max every cycle, wider spreads = fewer but better fills
+MM_GAMMA = {"BTC": 1.0, "ETH": 1.0, "SOL": 1.0, "XRP": 1.0, "DOGE": 1.0, "BNB": 1.0, "HYPE": 1.0}   # 0.8 was too tight — high volume but settlement losses ate spread gains
 MM_KAPPA_DEFAULT = 0.5                        # fills/sec bootstrap — 0.02 made spread too wide, only 1 side quoted
 MM_KAPPA_WINDOW_SEC = 60                     # rolling window for kappa estimation
-MM_SPREAD_FLOOR_C = 3                        # minimum half-spread per side (cents)
-MM_MAX_INVENTORY = {"BTC": 8, "ETH": 8, "SOL": 8, "XRP": 3, "DOGE": 3, "BNB": 3, "HYPE": 3}     # max net contracts per coin — sniper coins capped at 3
+MM_SPREAD_FLOOR_C = 2                        # tighter minimum spread — more fills
+MM_MAX_INVENTORY = {"BTC": 12, "ETH": 12, "SOL": 12, "XRP": 3, "DOGE": 3, "BNB": 3, "HYPE": 3}   # max net contracts per coin
 
 
 def get_tiered_max_inventory(cycle_sec: float, max_inv_cap: int) -> int:
@@ -85,10 +85,8 @@ def get_tiered_max_inventory(cycle_sec: float, max_inv_cap: int) -> int:
 
 
 def get_tiered_price_bounds(cycle_sec: float) -> tuple:
-    """Return (min_price, max_price) for quotes based on cycle phase.
-    No hard bounds — the A-S model + 80/20 suppression handles adverse selection.
-    """
-    return 1, 99
+    """Return (min_price, max_price) for quotes based on cycle phase."""
+    return 35, 65
 
 
 def get_tiered_edge(cycle_sec: float) -> int:
@@ -147,8 +145,12 @@ BRTI_COIN_CONFIG = {
         "entry_contracts": 3,
         "momentum_window": 8,          # 8s detection — catch sBRTI lead before Kalshi reprices
         "sigma_per_sec": 2.20,         # calibrated BTC volatility for probability model
-        "mm_edge_c": 10,               # MM edge per side (cents) — widened from 7 for BTC adverse selection
-        "mm_settle_guard_sec": 90,     # cancel MM quotes 90s before settlement (BTC: wider guard)
+        "mm_edge_c": 6,                # BTC: RTI noise <1c → tight edge is safe
+        "mm_strong_edge_c": 8,          # BTC: back to proven threshold — exit speed > noise avoidance
+        "mm_requote_threshold_c": 3,   # BTC: standard requote
+        "mm_suppress_high": 65,        # BTC: tighter — stop quoting NO when >65% YES likely (Task B)
+        "mm_suppress_low": 35,
+        "mm_settle_guard_sec": 60,     # aligned with ETH/SOL — sniper bypasses on strong edge anyway
         "mm_momentum_threshold": 0.15, # loosened for sniper — BTC moves $1-5/10s normally, 0.5 too strict
         "ws_pairs": {"coinbase": "BTC-USD", "kraken": "XBT/USD", "bitstamp": "btcusd", "gemini": "BTCUSD", "crypto_com": "BTC_USD"},
         "btc_distance_sniper": True,   # BTC distance-based momentum sniper (probationary)
@@ -180,7 +182,11 @@ BRTI_COIN_CONFIG = {
         "entry_contracts": 3,
         "momentum_window": 8,          # 8s detection — catch sBRTI lead before Kalshi reprices
         "sigma_per_sec": 0.071,        # calibrated ETH volatility for probability model
-        "mm_edge_c": 7,                # MM edge per side (cents)
+        "mm_edge_c": 8,                # ETH: RTI noise 3-7c near strike — wider than BTC
+        "mm_strong_edge_c": 8,          # ETH: back to proven threshold
+        "mm_requote_threshold_c": 3,   # ETH: standard requote
+        "mm_suppress_high": 70,        # ETH: tighter — suppress MM at 30/70 extremes (Task B)
+        "mm_suppress_low": 30,
         "mm_settle_guard_sec": 60,     # cancel MM quotes 60s before settlement (ETH: keep current)
         "mm_momentum_threshold": 0.08, # loosened for sniper (was 0.25)
         "ws_pairs": {"coinbase": "ETH-USD", "kraken": "ETH/USD", "bitstamp": "ethusd", "gemini": "ETHUSD", "crypto_com": "ETH_USD"},
@@ -213,7 +219,11 @@ BRTI_COIN_CONFIG = {
         "entry_contracts": 3,
         "momentum_window": 8,
         "sigma_per_sec": 0.015,           # recalibrated for CF RTI
-        "mm_edge_c": 7,
+        "mm_edge_c": 10,                  # SOL: RTI noise 6-16c near strike — widest edge
+        "mm_strong_edge_c": 8,            # SOL: back to proven threshold — exit speed matters
+        "mm_requote_threshold_c": 3,      # SOL: back to standard
+        "mm_suppress_high": 75,           # SOL: tighter — suppress MM at 25/75 extremes (Task B)
+        "mm_suppress_low": 25,
         "mm_settle_guard_sec": 60,
         "mm_momentum_threshold": 0.03,    # loosened from 0.10 — SOL moves in small absolute $ amounts
         "ws_pairs": {"coinbase": "SOL-USD", "kraken": "SOL/USD", "bitstamp": "solusd", "gemini": "SOLUSD", "crypto_com": "SOL_USD"},
