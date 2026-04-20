@@ -3917,8 +3917,9 @@ class Crypto15mAgent:
         # Legacy directional loop disabled — BTC sniper handles all trading
         # asyncio.create_task(self.brti_fast_flip_loop())
         if self.mm_mode:
-            asyncio.create_task(self.mm_requote_loop())
-            asyncio.create_task(self.mm_safety_reconcile_loop())
+            if False:  # DISABLED: Stoikov MM quoting + safety reconcile — pair MM only
+                asyncio.create_task(self.mm_requote_loop())
+                asyncio.create_task(self.mm_safety_reconcile_loop())
         brti_coins_str = "+".join(BRTI_COIN_CONFIG.keys())
         print(f"Synthetic index feeds launching ({brti_coins_str}, 5 exchanges) + fast flip loop + {'MM quoting' if self.mm_mode else 'directional entry'}")
 
